@@ -1,0 +1,2369 @@
+// @ts-nocheck
+import { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
+import { prisma } from '../config/prisma';
+import { ensureString } from '../utils/request.util';
+import { bunnyStreamService } from '../services/bunny-stream.service';
+import { bunnyStorageService } from '../services/bunny-storage.service';
+import { getIO } from '../sockets';
+import { notificationService } from '../services/notification.service';
+import { recordActivity } from '../services/activity.service';
+
+interface AuthRequest extends Request {
+  user?: { userId: string };
+}
+
+function mapReelResponse(reel: any, currentUserId?: string) {
+  const author = reel.users;
+  const isLiked = currentUserId
+    ? Boolean(reel.reels_likes?.some((like: any) => like.userId === currentUserId))
+    : false;
+  const isSaved = currentUserId
+    ? Boolean(reel.reels_saves?.some((save: any) => save.userId === currentUserId))
+    : false;
+  const userVotedOption = reel.reels_poll_votes?.find((v: any) => v.userId === currentUserId)?.optionId ?? null;
+
+  return {
+    id: reel.id,
+    author: author
+      ? {
+          id: author.id,
+          username: author.username,
+          name: author.name,
+          profileImage: author.profileImage,
+          headline: author.headline,
+          isFollowing: Boolean(author.follows_follows_followingIdTousers?.length),
+        }
+      : null,
+    videoId: reel.videoId,
+    videoUrl: reel.videoUrl,
+    hlsUrl: reel.hlsUrl,
+    thumbnailUrl: reel.thumbnailUrl,
+    previewGifUrl: reel.previewGifUrl,
+    title: reel.title,
+    caption: reel.caption,
+    durationSeconds: reel.durationSeconds,
+    width: reel.width,
+    height: reel.height,
+    aspectRatio: reel.aspectRatio,
+    audio: reel.reel_audio
+      ? {
+          id: reel.reel_audio.id,
+          title: reel.reel_audio.title,
+          artist: reel.reel_audio.artist,
+          albumArt: reel.reel_audio.albumArt,
+        }
+      : null,
+    hashtags: reel.hashtags || [],
+    mentions: reel.mentions || [],
+    skills: reel.skills || [],
+    topics: reel.topics || [],
+    category: reel.category,
+    locationName: reel.locationName,
+    isResponse: reel.isResponse,
+    responseType: reel.responseType,
+    originalReelId: reel.originalReelId,
+    pollQuestion: reel.pollQuestion,
+    pollOptions: reel.pollOptions,
+    pollEndsAt: reel.pollEndsAt,
+    userVotedOption,
+    quizQuestion: reel.quizQuestion,
+    quizOptions: reel.quizOptions,
+    codeSnippet: reel.codeSnippet,
+    codeLanguage: reel.codeLanguage,
+    codeFileName: reel.codeFileName,
+    repoUrl: reel.repoUrl,
+    ctaType: reel.ctaType,
+    ctaText: reel.ctaText,
+    ctaUrl: reel.ctaUrl,
+    visibility: reel.visibility,
+    allowComments: reel.allowComments,
+    allowDuets: reel.allowDuets,
+    allowStitch: reel.allowStitch,
+    allowDownload: reel.allowDownload,
+    allowSharing: reel.allowSharing,
+    status: reel.status,
+    viewsCount: reel.viewsCount || 0,
+    likesCount: reel.likesCount || 0,
+    commentsCount: reel.commentsCount || 0,
+    sharesCount: reel.sharesCount || 0,
+    savesCount: reel.savesCount || 0,
+    isLiked,
+    isSaved,
+    publishedAt: reel.publishedAt,
+    createdAt: reel.createdAt,
+    updatedAt: reel.updatedAt,
+  };
+}
+
+const reelInclude = (currentUserId?: string) => ({
+  users: {
+    select: {
+      id: true,
+      username: true,
+      name: true,
+      profileImage: true,
+      headline: true,
+      ...(currentUserId
+        ? {
+            follows_follows_followingIdTousers: {
+              where: { followerId: currentUserId },
+              take: 1,
+              select: { id: true },
+            },
+          }
+        : {}),
+    },
+  },
+  reel_audio: {
+    select: {
+      id: true,
+      title: true,
+      artist: true,
+      albumArt: true,
+    },
+  },
+  ...(currentUserId
+    ? {
+        reel_likes: { where: { userId: currentUserId }, select: { userId: true } },
+        reel_saves: { where: { userId: currentUserId }, select: { userId: true } },
+        reel_poll_votes: { where: { userId: currentUserId }, select: { optionId: true, userId: true } },
+      }
+    : {}),
+});
+
+export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '10', 10), 1), 30);
+    const mode = ensureString(req.query.mode) as 'foryou' | 'following' | undefined;
+
+    let whereClause: any = {
+      status: 'ready',
+      visibility: 'public',
+      publishedAt: { not: null },
+    };
+
+    if (mode === 'following' && currentUserId) {
+      const following = await prisma.follows.findMany({
+        where: { followerId: currentUserId },
+        select: { followingId: true },
+      });
+      const followingIds = following.map((f) => f.followingId);
+
+      if (followingIds.length > 0) {
+        whereClause.authorId = { in: followingIds };
+      } else {
+        res.json({ reels: [], nextCursor: null, hasMore: false });
+        return;
+      }
+    }
+
+    const reels = await prisma.reels.findMany({
+      where: whereClause,
+      include: reelInclude(currentUserId),
+      orderBy: [{ publishedAt: 'desc' }, { viewsCount: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = reels.length > limit;
+    const pageItems = hasMore ? reels.slice(0, limit) : reels;
+
+    res.json({
+      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getReelsFeed error:', error);
+    res.status(500).json({ error: 'Failed to fetch reels feed' });
+  }
+};
+
+export const getFollowingFeed = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    req.query.mode = 'following';
+    return getReelsFeed(req, res);
+  } catch (error) {
+    console.error('getFollowingFeed error:', error);
+    res.status(500).json({ error: 'Failed to fetch following feed' });
+  }
+};
+
+export const getTrendingReels = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const hours = parseInt(ensureString(req.query.hours) || '24', 10);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+
+    const reels = await prisma.reels.findMany({
+      where: {
+        status: 'ready',
+        visibility: 'public',
+        publishedAt: { gte: since },
+      },
+      include: reelInclude(currentUserId),
+      orderBy: [{ viewsCount: 'desc' }, { likesCount: 'desc' }],
+      take: limit,
+    });
+
+    res.json({
+      reels: reels.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: null,
+      hasMore: false,
+    });
+  } catch (error) {
+    console.error('getTrendingReels error:', error);
+    res.status(500).json({ error: 'Failed to fetch trending reels' });
+  }
+};
+
+export const getReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const reelId = ensureString(req.params.reelId);
+
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      include: reelInclude(currentUserId),
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (reel.visibility === 'private' && reel.authorId !== currentUserId) {
+      res.status(403).json({ error: 'This reel is private' });
+      return;
+    }
+
+    res.json(mapReelResponse(reel, currentUserId));
+  } catch (error) {
+    console.error('getReel error:', error);
+    res.status(500).json({ error: 'Failed to fetch reel' });
+  }
+};
+
+export const getReelPreloadData = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const reelId = ensureString(req.params.reelId);
+
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: {
+        hlsUrl: true,
+        videoUrl: true,
+        thumbnailUrl: true,
+        durationSeconds: true,
+        status: true,
+      },
+    });
+
+    if (!reel || reel.status !== 'ready') {
+      res.status(404).json({ error: 'Reel not found or not ready' });
+      return;
+    }
+
+    res.json({
+      hlsUrl: reel.hlsUrl,
+      videoUrl: reel.videoUrl,
+      thumbnailUrl: reel.thumbnailUrl,
+      durationSeconds: reel.durationSeconds,
+    });
+  } catch (error) {
+    console.error('getReelPreloadData error:', error);
+    res.status(500).json({ error: 'Failed to fetch preload data' });
+  }
+};
+
+/** Get reel's audio for "Use this audio" / Remix flow */
+export const getReelAudio = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: {
+        id: true,
+        status: true,
+        audioId: true,
+        reel_audio: {
+          select: {
+            id: true,
+            title: true,
+            artist: true,
+            albumArt: true,
+            audioUrl: true,
+            durationMs: true,
+            genre: true,
+            originalReelId: true,
+            usageCount: true,
+          },
+        },
+        users: { select: { id: true, username: true, name: true } },
+      },
+    });
+
+    if (!reel || reel.status !== 'ready') {
+      res.status(404).json({ error: 'Reel not found or not ready' });
+      return;
+    }
+
+    const reelWithAudio = reel as typeof reel & { reel_audio: { id: string; title: string; artist: string; albumArt: string | null; audioUrl: string | null; durationMs: number | null; genre: string | null; originalReelId: string | null; usageCount: number } | null; users: { id: string; username: string; name: string } };
+    if (!reelWithAudio.reel_audio) {
+      res.json({
+        hasAudio: false,
+        message: 'This reel uses original audio',
+        audio: null,
+      });
+      return;
+    }
+
+    res.json({
+      hasAudio: true,
+      audio: {
+        id: reelWithAudio.reel_audio.id,
+        title: reelWithAudio.reel_audio.title,
+        artist: reelWithAudio.reel_audio.artist,
+        albumArt: reelWithAudio.reel_audio.albumArt,
+        audioUrl: reelWithAudio.reel_audio.audioUrl,
+        durationMs: reelWithAudio.reel_audio.durationMs,
+        genre: reelWithAudio.reel_audio.genre,
+        usageCount: reelWithAudio.reel_audio.usageCount,
+        sourceReelId: reel.id,
+        originalCreator: reelWithAudio.reel_audio.originalReelId ? reelWithAudio.users : null,
+      },
+    });
+  } catch (error) {
+    console.error('getReelAudio error:', error);
+    res.status(500).json({ error: 'Failed to fetch reel audio' });
+  }
+};
+
+export const getUploadUrl = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const title = `reel_${req.user.userId}_${Date.now()}`;
+    const { videoId, uploadUrl } = await bunnyStreamService.createVideo(title);
+
+    res.json({
+      videoId,
+      uploadUrl,
+      tusUrl: `https://video.bunnycdn.com/tusupload?libraryId=${process.env.BUNNY_STREAM_LIBRARY_ID}&videoId=${videoId}`,
+    });
+  } catch (error) {
+    console.error('getUploadUrl error:', error);
+    res.status(500).json({ error: 'Failed to get upload URL' });
+  }
+};
+
+function safeJsonParse<T>(val: string | undefined, fallback: T): T {
+  if (!val) return fallback;
+  try {
+    return JSON.parse(val) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export const createReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const files = req.files as { video?: Express.Multer.File[]; thumbnail?: Express.Multer.File[] } | undefined;
+    const file = (files?.video?.[0] || (req as any).file) as Express.Multer.File | undefined;
+
+    if (!file) {
+      res.status(400).json({ error: 'Video file is required' });
+      return;
+    }
+
+    let videoId: string;
+    let videoUrl: string;
+    let hlsUrl: string | null;
+    let thumbnailUrl: string;
+    let previewGifUrl: string;
+
+    const useBunnyStream = !!(
+      process.env.BUNNY_STREAM_API_KEY &&
+      process.env.BUNNY_STREAM_LIBRARY_ID &&
+      process.env.BUNNY_STREAM_CDN_HOSTNAME
+    );
+
+    let usedBunnyStream = false;
+
+    if (useBunnyStream) {
+      try {
+        const title = `reel_${userId}_${Date.now()}`;
+        const created = await bunnyStreamService.createVideo(title);
+        videoId = created.videoId;
+        await bunnyStreamService.uploadVideo(videoId, file.buffer);
+        videoUrl = bunnyStreamService.getMp4Url(videoId);
+        hlsUrl = bunnyStreamService.getHlsUrl(videoId);
+        thumbnailUrl = bunnyStreamService.getThumbnailUrl(videoId);
+        previewGifUrl = bunnyStreamService.getPreviewUrl(videoId);
+        usedBunnyStream = true;
+      } catch (streamErr: any) {
+        console.warn('Bunny Stream failed, falling back to Bunny Storage:', streamErr.message);
+        videoId = `storage_${userId}_${Date.now()}`;
+        videoUrl = await bunnyStorageService.uploadPostVideo(file.buffer, userId, file.mimetype);
+        hlsUrl = null;
+        thumbnailUrl = '';
+        previewGifUrl = '';
+      }
+    } else {
+      videoId = `storage_${userId}_${Date.now()}`;
+      videoUrl = await bunnyStorageService.uploadPostVideo(file.buffer, userId, file.mimetype);
+      hlsUrl = null;
+      thumbnailUrl = '';
+      previewGifUrl = '';
+    }
+
+    // Custom thumbnail (overrides Bunny Stream thumbnail when provided)
+    const thumbnailFile = files?.thumbnail?.[0];
+    if (thumbnailFile && thumbnailFile.mimetype.startsWith('image/')) {
+      try {
+        thumbnailUrl = await bunnyStorageService.uploadReelThumbnail(
+          thumbnailFile.buffer,
+          userId,
+          thumbnailFile.mimetype
+        );
+      } catch (err) {
+        console.warn('Failed to upload custom thumbnail:', err);
+      }
+    }
+
+    const isDraft = req.body.saveAsDraft === 'true';
+    const scheduledAt = req.body.scheduledAt ? new Date(req.body.scheduledAt) : null;
+    const originalReelId = req.body.originalReelId || null;
+    const responseType = req.body.responseType || null; // 'duet' | 'stitch'
+
+    const reel = await prisma.reels.create({
+      data: {
+        id: randomUUID(),
+        authorId: userId,
+        videoId,
+        videoUrl,
+        hlsUrl,
+        thumbnailUrl: thumbnailUrl || null,
+        previewGifUrl: previewGifUrl || null,
+        durationSeconds: 0,
+        title: req.body.title || null,
+        caption: req.body.caption || null,
+        hashtags: safeJsonParse<string[]>(req.body.hashtags, []),
+        mentions: safeJsonParse<string[]>(req.body.mentions, []),
+        skills: safeJsonParse<string[]>(req.body.skills, []),
+        topics: safeJsonParse<string[]>(req.body.topics, []),
+        category: req.body.category || null,
+        visibility: req.body.visibility || 'public',
+        allowComments: req.body.allowComments !== 'false',
+        allowDuets: req.body.allowDuets !== 'false',
+        allowStitch: req.body.allowStitch !== 'false',
+        allowDownload: req.body.allowDownload !== 'false',
+        allowSharing: req.body.allowSharing !== 'false',
+        codeSnippet: req.body.codeSnippet || null,
+        codeLanguage: req.body.codeLanguage || null,
+        codeFileName: req.body.codeFileName || null,
+        repoUrl: req.body.repoUrl || null,
+        status: isDraft ? 'draft' : usedBunnyStream ? 'processing' : 'ready',
+        publishedAt: !isDraft && !usedBunnyStream ? new Date() : null,
+        scheduledAt,
+        originalReelId,
+        isResponse: !!originalReelId,
+        responseType,
+        audioId: req.body.audioId || null,
+        audioStartTime: parseInt(req.body.audioStartTime || '0', 10),
+        muteOriginalAudio: req.body.muteOriginalAudio === 'true',
+        updatedAt: new Date(),
+      },
+      include: reelInclude(userId),
+    });
+
+    recordActivity(userId, 'short_video', 1).catch(console.error);
+
+    res.status(201).json(mapReelResponse(reel, userId));
+  } catch (error: any) {
+    console.error('createReel error:', error);
+    const message = error?.response?.data?.message || error?.message || 'Failed to create reel';
+    const status = error?.response?.status;
+    if (status === 401 || status === 403) {
+      res.status(status).json({ error: message });
+    } else if (error?.response?.data?.error) {
+      res.status(status || 500).json({ error: error.response.data.error, message: error.response.data.message });
+    } else {
+      res.status(500).json({ error: 'Failed to create reel', message: process.env.NODE_ENV === 'development' ? message : undefined });
+    }
+  }
+};
+
+export const onUploadComplete = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const { videoId, title, caption, hashtags, visibility, ...metadata } = req.body;
+
+    if (!videoId) {
+      res.status(400).json({ error: 'Video ID is required' });
+      return;
+    }
+
+    const isDraft = metadata.saveAsDraft === true;
+    const scheduledAt = metadata.scheduledAt ? new Date(metadata.scheduledAt as string) : null;
+    const originalReelId = metadata.originalReelId as string | null || null;
+    const responseType = metadata.responseType as string | null || null;
+
+    const reel = await prisma.reels.create({
+      data: {
+        id: randomUUID(),
+        authorId: userId,
+        videoId,
+        videoUrl: bunnyStreamService.getMp4Url(videoId),
+        hlsUrl: bunnyStreamService.getHlsUrl(videoId),
+        thumbnailUrl: bunnyStreamService.getThumbnailUrl(videoId),
+        previewGifUrl: bunnyStreamService.getPreviewUrl(videoId),
+        durationSeconds: metadata.durationSeconds || 0,
+        width: metadata.width || 1080,
+        height: metadata.height || 1920,
+        title: title || null,
+        caption: caption || null,
+        hashtags: hashtags || [],
+        visibility: visibility || 'public',
+        status: isDraft ? 'draft' : 'processing',
+        scheduledAt,
+        originalReelId,
+        isResponse: !!originalReelId,
+        responseType,
+        audioId: metadata.audioId as string | null || null,
+        audioStartTime: parseInt(String(metadata.audioStartTime || 0), 10),
+        muteOriginalAudio: metadata.muteOriginalAudio === true,
+        ...metadata,
+        updatedAt: new Date(),
+      },
+      include: reelInclude(userId),
+    });
+
+    recordActivity(userId, 'short_video', 1).catch(console.error);
+
+    res.status(201).json(mapReelResponse(reel, userId));
+  } catch (error) {
+    console.error('onUploadComplete error:', error);
+    res.status(500).json({ error: 'Failed to complete upload' });
+  }
+};
+
+export const updateReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const existing = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true },
+    });
+
+    if (!existing) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (existing.authorId !== userId) {
+      res.status(403).json({ error: 'You can only edit your own reels' });
+      return;
+    }
+
+    const updateData: any = {};
+    const allowedFields = [
+      'title',
+      'caption',
+      'hashtags',
+      'mentions',
+      'skills',
+      'topics',
+      'category',
+      'visibility',
+      'allowComments',
+      'allowDuets',
+      'allowStitch',
+      'allowDownload',
+      'allowSharing',
+      'scheduledAt',
+    ];
+
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field];
+        if (field === 'scheduledAt' && req.body[field]) {
+          updateData[field] = new Date(req.body[field]);
+        }
+      }
+    }
+
+    const reel = await prisma.reels.update({
+      where: { id: reelId },
+      data: updateData,
+      include: reelInclude(userId),
+    });
+
+    res.json(mapReelResponse(reel, userId));
+  } catch (error) {
+    console.error('updateReel error:', error);
+    res.status(500).json({ error: 'Failed to update reel' });
+  }
+};
+
+export const publishDraft = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { scheduledAt } = req.body;
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { id: true, authorId: true, status: true },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (reel.authorId !== userId) {
+      res.status(403).json({ error: 'You can only publish your own reels' });
+      return;
+    }
+
+    if (reel.status !== 'draft') {
+      res.status(400).json({ error: 'Only drafts can be published' });
+      return;
+    }
+
+    const publishAt = scheduledAt ? new Date(scheduledAt) : new Date();
+    const isScheduled = scheduledAt && new Date(scheduledAt) > new Date();
+
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: {
+        status: 'ready',
+        visibility: 'public',
+        scheduledAt: isScheduled ? publishAt : null,
+        publishedAt: isScheduled ? null : publishAt,
+      },
+    });
+
+    const updated = await prisma.reels.findUnique({
+      where: { id: reelId },
+      include: reelInclude(userId),
+    });
+
+    res.json(mapReelResponse(updated!, userId));
+  } catch (error) {
+    console.error('publishDraft error:', error);
+    res.status(500).json({ error: 'Failed to publish draft' });
+  }
+};
+
+export const deleteReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const existing = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true, videoId: true },
+    });
+
+    if (!existing) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (existing.authorId !== userId) {
+      res.status(403).json({ error: 'You can only delete your own reels' });
+      return;
+    }
+
+    await prisma.reels.delete({ where: { id: reelId } });
+    bunnyStreamService.deleteVideo(existing.videoId).catch(console.error);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('deleteReel error:', error);
+    res.status(500).json({ error: 'Failed to delete reel' });
+  }
+};
+
+export const toggleLike = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const [reel, user] = await Promise.all([
+      prisma.reels.findUnique({
+        where: { id: reelId },
+        select: { id: true, authorId: true },
+      }),
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { name: true, username: true },
+      }),
+    ]);
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    const existingLike = await prisma.reel_likes.findUnique({
+      where: { reelId_userId: { reelId, userId } },
+    });
+
+    let liked = false;
+    if (existingLike) {
+      await prisma.reel_likes.delete({
+        where: { reelId_userId: { reelId, userId } },
+      });
+    } else {
+      await prisma.reel_likes.create({
+        data: { reelId, userId },
+      });
+      liked = true;
+    }
+
+    const likesCount = await prisma.reel_likes.count({ where: { reelId } });
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { likesCount },
+    });
+
+    const io = getIO();
+    if (io) {
+      // Broadcast to reel room for real-time updates
+      io.to(`reel:${reelId}`).emit('reel:engagement_update', { 
+        reelId, 
+        type: 'like',
+        userId, 
+        liked, 
+        likesCount 
+      });
+    }
+
+    // Send notification for likes (persisted)
+    if (liked && reel.authorId !== userId && user) {
+      notificationService.notifyReelLike(
+        reel.authorId,
+        userId,
+        user.name || user.username,
+        reelId
+      );
+    }
+
+    res.json({ liked, likesCount });
+  } catch (error) {
+    console.error('toggleLike error:', error);
+    res.status(500).json({ error: 'Failed to toggle like' });
+  }
+};
+
+export const toggleSave = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { id: true },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    const existingSave = await prisma.reel_saves.findUnique({
+      where: { reelId_userId: { reelId, userId } },
+    });
+
+    let saved = false;
+    if (existingSave) {
+      await prisma.reel_saves.delete({
+        where: { reelId_userId: { reelId, userId } },
+      });
+    } else {
+      await prisma.reel_saves.create({
+        data: { reelId, userId },
+      });
+      saved = true;
+    }
+
+    const savesCount = await prisma.reel_saves.count({ where: { reelId } });
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { savesCount },
+    });
+
+    res.json({ saved, savesCount });
+  } catch (error) {
+    console.error('toggleSave error:', error);
+    res.status(500).json({ error: 'Failed to toggle save' });
+  }
+};
+
+export const shareReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { shareType, platform, recipientId } = req.body;
+
+    const [reel, user] = await Promise.all([
+      prisma.reels.findUnique({
+        where: { id: reelId },
+        select: { 
+          id: true, 
+          authorId: true,
+          allowSharing: true, 
+          sharesCount: true,
+          title: true,
+          caption: true,
+          thumbnailUrl: true,
+        },
+      }),
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { name: true, username: true },
+      }),
+    ]);
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (!reel.allowSharing) {
+      res.status(403).json({ error: 'Sharing is disabled for this reel' });
+      return;
+    }
+
+    await prisma.reel_shares.create({
+      data: {
+        reelId,
+        userId,
+        shareType: shareType || 'copy_link',
+        platform,
+        recipientId,
+      },
+    });
+
+    const sharesCount = reel.sharesCount + 1;
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { sharesCount },
+    });
+
+    const io = getIO();
+    if (io) {
+      io.to(`reel:${reelId}`).emit('reel:engagement_update', { 
+        reelId, 
+        type: 'share',
+        sharesCount 
+      });
+    }
+
+    // Notify reel author about the share
+    if (reel.authorId !== userId && user) {
+      notificationService.notifyReelShare(
+        reel.authorId,
+        userId,
+        user.name || user.username,
+        reelId
+      );
+    }
+
+    res.json({ success: true, sharesCount });
+  } catch (error) {
+    console.error('shareReel error:', error);
+    res.status(500).json({ error: 'Failed to share reel' });
+  }
+};
+
+// Share reel in chat (send to specific user)
+export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { recipientId, message } = req.body;
+
+    if (!recipientId) {
+      res.status(400).json({ error: 'recipientId is required' });
+      return;
+    }
+
+    const [reel, sender, recipient] = await Promise.all([
+      prisma.reels.findUnique({
+        where: { id: reelId },
+        select: {
+          id: true,
+          authorId: true,
+          title: true,
+          caption: true,
+          thumbnailUrl: true,
+          hlsUrl: true,
+          videoUrl: true,
+          allowSharing: true,
+          sharesCount: true,
+          users: {
+            select: {
+              id: true,
+              username: true,
+              name: true,
+              profileImage: true,
+            },
+          },
+        },
+      }),
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, name: true, username: true, profileImage: true },
+      }),
+      prisma.user.findUnique({
+        where: { id: recipientId },
+        select: { id: true, name: true, username: true },
+      }),
+    ]);
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (!reel.allowSharing) {
+      res.status(403).json({ error: 'Sharing is disabled for this reel' });
+      return;
+    }
+
+    if (!recipient) {
+      res.status(404).json({ error: 'Recipient not found' });
+      return;
+    }
+
+    // Get or create conversation
+    let conversation = await prisma.conversations.findFirst({
+      where: {
+        OR: [
+          { participant1Id: userId, participant2Id: recipientId },
+          { participant1Id: recipientId, participant2Id: userId },
+        ],
+      },
+    });
+
+    if (!conversation) {
+      conversation = await prisma.conversations.create({
+        data: {
+          participant1Id: userId,
+          participant2Id: recipientId,
+        },
+      });
+    }
+
+    // Create message with reel content
+    const reelData = {
+      reelId: reel.id,
+      title: reel.title,
+      caption: reel.caption,
+      thumbnailUrl: reel.thumbnailUrl,
+      author: reel.users,
+    };
+
+    const chatMessage = await prisma.messages.create({
+      data: {
+        conversationId: conversation.id,
+        senderId: userId,
+        receiverId: recipientId,
+        content: JSON.stringify({ reelId: reel.id }),
+        contentType: 'reel',
+        mediaUrl: reel.thumbnailUrl,
+        mediaType: 'reel',
+      },
+    });
+
+    // Update conversation lastMessageAt
+    await prisma.conversations.update({
+      where: { id: conversation.id },
+      data: { lastMessageAt: new Date() },
+    });
+
+    // Record share
+    await prisma.reel_shares.create({
+      data: {
+        reelId,
+        userId,
+        shareType: 'chat',
+        recipientId,
+      },
+    });
+
+    // Update share count
+    const sharesCount = reel.sharesCount + 1;
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { sharesCount },
+    });
+
+    // Send real-time message to recipient
+    const io = getIO();
+    if (io) {
+      const messagePayload = {
+        id: chatMessage.id,
+        conversationId: conversation.id,
+        senderId: userId,
+        receiverId: recipientId,
+        content: chatMessage.content,
+        contentType: 'reel',
+        mediaUrl: chatMessage.mediaUrl,
+        mediaType: 'reel',
+        reelData: { ...reel, reelId: reel.id },
+        status: 'SENT',
+        createdAt: chatMessage.createdAt.toISOString(),
+        sender,
+      };
+
+      // Send to conversation room (match format expected by frontend: { conversationId, message })
+      io.to(`chat:${conversation.id}`).emit('chat:new_message', {
+        conversationId: conversation.id,
+        message: messagePayload,
+      });
+
+      // Send notification to recipient
+      io.to(`user:${recipientId}`).emit('chat:notification', {
+        conversationId: conversation.id,
+        message: messagePayload,
+      });
+
+      // Update reel engagement
+      io.to(`reel:${reelId}`).emit('reel:engagement_update', {
+        reelId,
+        type: 'share',
+        sharesCount,
+      });
+    }
+
+    // Notify reel author about the share
+    if (reel.authorId !== userId && sender) {
+      notificationService.notifyReelShare(
+        reel.authorId,
+        userId,
+        sender.name || sender.username,
+        reelId
+      );
+    }
+
+    res.json({
+      success: true,
+      message: {
+        id: chatMessage.id,
+        conversationId: conversation.id,
+        reelData,
+      },
+      sharesCount,
+    });
+  } catch (error) {
+    console.error('shareReelInChat error:', error);
+    res.status(500).json({ error: 'Failed to share reel in chat' });
+  }
+};
+
+let viewBatch: Map<string, { reelId: string; userId?: string; watchTimeMs: number; completed: boolean; source?: string }[]> = new Map();
+let viewBatchTimeout: NodeJS.Timeout | null = null;
+
+async function flushViewBatch() {
+  const batch = viewBatch;
+  viewBatch = new Map();
+
+  for (const [reelId, views] of batch) {
+    try {
+      const uniqueViews = new Map<string, typeof views[0]>();
+      for (const view of views) {
+        const key = view.userId || `anon_${Math.random()}`;
+        const existing = uniqueViews.get(key);
+        if (!existing || view.watchTimeMs > existing.watchTimeMs) {
+          uniqueViews.set(key, view);
+        }
+      }
+
+      for (const view of uniqueViews.values()) {
+        if (view.userId) {
+          const existingView = await prisma.reel_views.findFirst({
+            where: { reelId, userId: view.userId },
+          });
+
+          if (existingView) {
+            await prisma.reel_views.update({
+              where: { id: existingView.id },
+              data: {
+                watchTimeMs: Math.max(existingView.watchTimeMs, view.watchTimeMs),
+                completedWatch: existingView.completedWatch || view.completed,
+                replayCount: view.completed && existingView.completedWatch
+                  ? existingView.replayCount + 1
+                  : existingView.replayCount,
+              },
+            });
+          } else {
+            await prisma.reel_views.create({
+              data: {
+                reelId,
+                userId: view.userId,
+                watchTimeMs: view.watchTimeMs,
+                completedWatch: view.completed,
+                source: view.source,
+              },
+            });
+          }
+        } else {
+          await prisma.reel_views.create({
+            data: {
+              reelId,
+              watchTimeMs: view.watchTimeMs,
+              completedWatch: view.completed,
+              source: view.source,
+            },
+          });
+        }
+      }
+
+      const [totalViews, uniqueViewsCount] = await Promise.all([
+        prisma.reel_views.count({ where: { reelId } }),
+        prisma.reel_views.groupBy({
+          by: ['userId'],
+          where: { reelId, userId: { not: null } },
+        }),
+      ]);
+
+      const avgWatchTime = await prisma.reel_views.aggregate({
+        where: { reelId },
+        _avg: { watchTimeMs: true },
+      });
+
+      const completedViews = await prisma.reel_views.count({
+        where: { reelId, completedWatch: true },
+      });
+
+      await prisma.reels.update({
+        where: { id: reelId },
+        data: {
+          viewsCount: totalViews,
+          uniqueViewsCount: uniqueViewsCount.length,
+          avgWatchTimeMs: Math.round(avgWatchTime._avg.watchTimeMs || 0),
+          completionRate: totalViews > 0 ? completedViews / totalViews : 0,
+        },
+      });
+    } catch (error) {
+      console.error(`Error flushing view batch for reel ${reelId}:`, error);
+    }
+  }
+}
+
+export const trackView = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { watchTimeMs, completed, source } = req.body;
+
+    if (watchTimeMs < 3000) {
+      res.json({ success: true });
+      return;
+    }
+
+    const reelViews = viewBatch.get(reelId) || [];
+    reelViews.push({
+      reelId,
+      userId,
+      watchTimeMs: watchTimeMs || 0,
+      completed: completed || false,
+      source,
+    });
+    viewBatch.set(reelId, reelViews);
+
+    if (!viewBatchTimeout) {
+      viewBatchTimeout = setTimeout(() => {
+        viewBatchTimeout = null;
+        flushViewBatch().catch(console.error);
+      }, 5000);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('trackView error:', error);
+    res.status(500).json({ error: 'Failed to track view' });
+  }
+};
+
+export const getComments = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const parentId = ensureString(req.query.parentId) || undefined;
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { id: true, allowComments: true },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    const where: any = { reelId, parentId: parentId || null };
+
+    const comments = await prisma.reel_comments.findMany({
+      where,
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            profileImage: true,
+            headline: true,
+          },
+        },
+        ...(currentUserId
+          ? {
+              likes: {
+                where: { userId: currentUserId },
+                select: { userId: true },
+              },
+            }
+          : {}),
+        _count: { select: { replies: true } },
+      },
+      orderBy: [{ isPinned: 'desc' }, { likesCount: 'desc' }, { createdAt: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = comments.length > limit;
+    const items = hasMore ? comments.slice(0, limit) : comments;
+
+    res.json({
+      comments: items.map((c) => ({
+        id: c.id,
+        reelId: c.reelId,
+        parentId: c.parentId,
+        author: c.author,
+        content: c.content,
+        mentions: c.mentions,
+        likesCount: c.likesCount,
+        repliesCount: c._count.replies,
+        isLiked: currentUserId
+          ? Boolean((c as any).likes?.some((l: any) => l.userId === currentUserId))
+          : false,
+        isPinned: c.isPinned,
+        isAuthorHeart: c.isAuthorHeart,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+      })),
+      nextCursor: hasMore ? items[items.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getComments error:', error);
+    res.status(500).json({ error: 'Failed to fetch comments' });
+  }
+};
+
+export const createComment = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { content, parentId, mentions } = req.body;
+
+    if (!content || typeof content !== 'string') {
+      res.status(400).json({ error: 'Content is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { id: true, authorId: true, allowComments: true },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (!reel.allowComments) {
+      res.status(403).json({ error: 'Comments are disabled for this reel' });
+      return;
+    }
+
+    const comment = await prisma.reel_comments.create({
+      data: {
+        reelId,
+        authorId: userId,
+        content: content.trim(),
+        parentId: parentId || null,
+        mentions: mentions || [],
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            profileImage: true,
+            headline: true,
+          },
+        },
+        parent: parentId ? {
+          select: {
+            authorId: true,
+            author: {
+              select: { name: true, username: true },
+            },
+          },
+        } : false,
+        _count: { select: { replies: true } },
+      },
+    });
+
+    if (parentId) {
+      await prisma.reel_comments.update({
+        where: { id: parentId },
+        data: { repliesCount: { increment: 1 } },
+      });
+    }
+
+    const commentsCount = await prisma.reel_comments.count({
+      where: { reelId, parentId: null },
+    });
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { commentsCount },
+    });
+
+    const io = getIO();
+    if (io) {
+      // Broadcast to reel room for real-time updates
+      io.to(`reel:${reelId}`).emit('reel:engagement_update', {
+        reelId,
+        type: 'comment',
+        comment: {
+          id: comment.id,
+          author: comment.author,
+          content: comment.content,
+          parentId: comment.parentId,
+        },
+        commentsCount,
+      });
+    }
+
+    // Send notification to reel author (if not commenting on own reel)
+    const commentWithRelations = comment as typeof comment & { author: { name: string | null; username: string }; parent?: { authorId: string; author: { name: string | null; username: string } } };
+    if (reel.authorId !== userId) {
+      notificationService.notifyReelComment(
+        reel.authorId,
+        userId,
+        commentWithRelations.author.name || commentWithRelations.author.username,
+        reelId,
+        comment.id,
+        comment.content
+      );
+    }
+
+    // Send notification to parent comment author (if replying)
+    if (parentId && commentWithRelations.parent && commentWithRelations.parent.authorId !== userId) {
+      notificationService.notifyReelCommentReply(
+        commentWithRelations.parent.authorId,
+        userId,
+        commentWithRelations.author.name || commentWithRelations.author.username,
+        reelId,
+        comment.id,
+        comment.content
+      );
+    }
+
+    // Send notifications for @mentions
+    if (mentions && Array.isArray(mentions) && mentions.length > 0) {
+      const mentionedUsers = await prisma.user.findMany({
+        where: { username: { in: mentions } },
+        select: { id: true, username: true },
+      });
+
+      for (const mentionedUser of mentionedUsers) {
+        if (mentionedUser.id !== userId) {
+          notificationService.notifyMention(
+            mentionedUser.id,
+            userId,
+            commentWithRelations.author.name || commentWithRelations.author.username,
+            'reel_comment',
+            reelId,
+            comment.content
+          );
+        }
+      }
+    }
+
+    res.status(201).json({
+      id: comment.id,
+      reelId: comment.reelId,
+      parentId: comment.parentId,
+      author: commentWithRelations.author,
+      content: comment.content,
+      mentions: comment.mentions,
+      likesCount: 0,
+      repliesCount: 0,
+      isLiked: false,
+      isPinned: false,
+      isAuthorHeart: false,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+    });
+  } catch (error) {
+    console.error('createComment error:', error);
+    res.status(500).json({ error: 'Failed to create comment' });
+  }
+};
+
+export const toggleCommentLike = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const commentId = ensureString(req.params.commentId);
+    if (!commentId) {
+      res.status(400).json({ error: 'Comment ID is required' });
+      return;
+    }
+
+    const existing = await prisma.reel_comment_likes.findUnique({
+      where: { commentId_userId: { commentId, userId } },
+    });
+
+    let liked = false;
+    if (existing) {
+      await prisma.reel_comment_likes.delete({
+        where: { commentId_userId: { commentId, userId } },
+      });
+    } else {
+      await prisma.reel_comment_likes.create({
+        data: { commentId, userId },
+      });
+      liked = true;
+    }
+
+    const likesCount = await prisma.reel_comment_likes.count({ where: { commentId } });
+    await prisma.reel_comments.update({
+      where: { id: commentId },
+      data: { likesCount },
+    });
+
+    res.json({ liked, likesCount });
+  } catch (error) {
+    console.error('toggleCommentLike error:', error);
+    res.status(500).json({ error: 'Failed to toggle comment like' });
+  }
+};
+
+export const deleteComment = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    const commentId = ensureString(req.params.commentId);
+    if (!reelId || !commentId) {
+      res.status(400).json({ error: 'Reel ID and Comment ID are required' });
+      return;
+    }
+
+    const comment = await prisma.reel_comments.findUnique({
+      where: { id: commentId },
+      select: { authorId: true, reelId: true, parentId: true },
+    });
+
+    if (!comment) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true },
+    });
+
+    if (comment.authorId !== userId && reel?.authorId !== userId) {
+      res.status(403).json({ error: 'You can only delete your own comments' });
+      return;
+    }
+
+    await prisma.reel_comments.delete({ where: { id: commentId } });
+
+    if (comment.parentId) {
+      await prisma.reel_comments.update({
+        where: { id: comment.parentId },
+        data: { repliesCount: { decrement: 1 } },
+      });
+    }
+
+    const commentsCount = await prisma.reel_comments.count({
+      where: { reelId, parentId: null },
+    });
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { commentsCount },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('deleteComment error:', error);
+    res.status(500).json({ error: 'Failed to delete comment' });
+  }
+};
+
+export const heartComment = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    const commentId = ensureString(req.params.commentId);
+    if (!reelId || !commentId) {
+      res.status(400).json({ error: 'Reel ID and Comment ID are required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true },
+    });
+
+    if (!reel || reel.authorId !== userId) {
+      res.status(403).json({ error: 'Only the reel author can heart comments' });
+      return;
+    }
+
+    const comment = await prisma.reel_comments.findUnique({
+      where: { id: commentId },
+      select: { isAuthorHeart: true },
+    });
+
+    if (!comment) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
+
+    await prisma.reel_comments.update({
+      where: { id: commentId },
+      data: { isAuthorHeart: !comment.isAuthorHeart },
+    });
+
+    res.json({ isAuthorHeart: !comment.isAuthorHeart });
+  } catch (error) {
+    console.error('heartComment error:', error);
+    res.status(500).json({ error: 'Failed to heart comment' });
+  }
+};
+
+export const votePoll = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { optionId } = req.body;
+
+    if (optionId === undefined) {
+      res.status(400).json({ error: 'Option ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { pollQuestion: true, pollOptions: true, pollEndsAt: true },
+    });
+
+    if (!reel || !reel.pollQuestion) {
+      res.status(404).json({ error: 'Poll not found' });
+      return;
+    }
+
+    if (reel.pollEndsAt && new Date(reel.pollEndsAt) < new Date()) {
+      res.status(400).json({ error: 'Poll has ended' });
+      return;
+    }
+
+    const existingVote = await prisma.reel_poll_votes.findUnique({
+      where: { reelId_userId: { reelId, userId } },
+    });
+
+    if (existingVote) {
+      res.status(400).json({ error: 'You have already voted' });
+      return;
+    }
+
+    await prisma.reel_poll_votes.create({
+      data: { reelId, userId, optionId },
+    });
+
+    const pollOptions = (reel.pollOptions as any[]) || [];
+    const updatedOptions = pollOptions.map((opt: any) => ({
+      ...opt,
+      votes: opt.id === optionId ? (opt.votes || 0) + 1 : opt.votes || 0,
+    }));
+
+    await prisma.reels.update({
+      where: { id: reelId },
+      data: { pollOptions: updatedOptions },
+    });
+
+    res.json({ success: true, pollOptions: updatedOptions, userVotedOption: optionId });
+  } catch (error) {
+    console.error('votePoll error:', error);
+    res.status(500).json({ error: 'Failed to vote on poll' });
+  }
+};
+
+export const answerQuiz = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { optionId } = req.body;
+
+    if (optionId === undefined) {
+      res.status(400).json({ error: 'Option ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { quizQuestion: true, quizCorrectIndex: true },
+    });
+
+    if (!reel || !reel.quizQuestion) {
+      res.status(404).json({ error: 'Quiz not found' });
+      return;
+    }
+
+    const existingAnswer = await prisma.reel_quiz_answers.findUnique({
+      where: { reelId_userId: { reelId, userId } },
+    });
+
+    if (existingAnswer) {
+      res.status(400).json({ error: 'You have already answered' });
+      return;
+    }
+
+    const isCorrect = optionId === reel.quizCorrectIndex;
+
+    await prisma.reel_quiz_answers.create({
+      data: { reelId, userId, optionId, isCorrect },
+    });
+
+    res.json({ correct: isCorrect, correctAnswer: reel.quizCorrectIndex });
+  } catch (error) {
+    console.error('answerQuiz error:', error);
+    res.status(500).json({ error: 'Failed to answer quiz' });
+  }
+};
+
+export const getReelsByHashtag = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const hashtag = ensureString(req.params.hashtag);
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const reels = await prisma.reels.findMany({
+      where: {
+        status: 'ready',
+        visibility: 'public',
+        hashtags: { has: hashtag },
+      },
+      include: reelInclude(currentUserId),
+      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = reels.length > limit;
+    const pageItems = hasMore ? reels.slice(0, limit) : reels;
+
+    res.json({
+      hashtag,
+      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getReelsByHashtag error:', error);
+    res.status(500).json({ error: 'Failed to fetch reels by hashtag' });
+  }
+};
+
+export const getReelsByAudio = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const audioId = ensureString(req.params.audioId);
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const reels = await prisma.reels.findMany({
+      where: {
+        status: 'ready',
+        visibility: 'public',
+        audioId,
+      },
+      include: reelInclude(currentUserId),
+      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = reels.length > limit;
+    const pageItems = hasMore ? reels.slice(0, limit) : reels;
+
+    res.json({
+      audioId,
+      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getReelsByAudio error:', error);
+    res.status(500).json({ error: 'Failed to fetch reels by audio' });
+  }
+};
+
+export const getUserReels = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const userId = ensureString(req.params.userId);
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const whereClause: any = {
+      authorId: userId,
+      status: 'ready',
+    };
+
+    if (currentUserId !== userId) {
+      whereClause.visibility = 'public';
+    }
+
+    const reels = await prisma.reels.findMany({
+      where: whereClause,
+      include: reelInclude(currentUserId),
+      orderBy: { createdAt: 'desc' },
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = reels.length > limit;
+    const pageItems = hasMore ? reels.slice(0, limit) : reels;
+
+    res.json({
+      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getUserReels error:', error);
+    res.status(500).json({ error: 'Failed to fetch user reels' });
+  }
+};
+
+export const getUserLikedReels = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const currentUserId = req.user.userId;
+    const userId = ensureString(req.params.userId);
+
+    if (currentUserId !== userId) {
+      res.status(403).json({ error: 'You can only view your own liked reels' });
+      return;
+    }
+
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const likes = await prisma.reel_likes.findMany({
+      where: { userId },
+      include: {
+        reels: {
+          include: reelInclude(currentUserId),
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = likes.length > limit;
+    const pageItems = hasMore ? likes.slice(0, limit) : likes;
+
+    res.json({
+      reels: pageItems
+        .filter((l) => l.reels.status === 'ready')
+        .map((l) => mapReelResponse(l.reels, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getUserLikedReels error:', error);
+    res.status(500).json({ error: 'Failed to fetch liked reels' });
+  }
+};
+
+export const getUserSavedReels = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const currentUserId = req.user.userId;
+    const userId = ensureString(req.params.userId);
+
+    if (currentUserId !== userId) {
+      res.status(403).json({ error: 'You can only view your own saved reels' });
+      return;
+    }
+
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const saves = await prisma.reel_saves.findMany({
+      where: { userId },
+      include: {
+        reels: {
+          include: reelInclude(currentUserId),
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = saves.length > limit;
+    const pageItems = hasMore ? saves.slice(0, limit) : saves;
+
+    res.json({
+      reels: pageItems
+        .filter((s) => s.reels.status === 'ready')
+        .map((s) => mapReelResponse(s.reels, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getUserSavedReels error:', error);
+    res.status(500).json({ error: 'Failed to fetch saved reels' });
+  }
+};
+
+export const getDrafts = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const drafts = await prisma.reels.findMany({
+      where: { authorId: userId, status: 'draft' },
+      include: reelInclude(userId),
+      orderBy: { updatedAt: 'desc' },
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = drafts.length > limit;
+    const results = hasMore ? drafts.slice(0, -1) : drafts;
+
+    res.json({
+      reels: results.map((r) => mapReelResponse(r, userId)),
+      nextCursor: hasMore ? results[results.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getDrafts error:', error);
+    res.status(500).json({ error: 'Failed to fetch drafts' });
+  }
+};
+
+export const getReelResponses = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const currentUserId = req.user?.userId;
+    const reelId = ensureString(req.params.reelId);
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const reels = await prisma.reels.findMany({
+      where: {
+        originalReelId: reelId,
+        status: 'ready',
+        visibility: 'public',
+      },
+      include: reelInclude(currentUserId),
+      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = reels.length > limit;
+    const pageItems = hasMore ? reels.slice(0, limit) : reels;
+
+    res.json({
+      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getReelResponses error:', error);
+    res.status(500).json({ error: 'Failed to fetch reel responses' });
+  }
+};
+
+export const getCreatorAnalytics = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const days = parseInt(ensureString(req.query.days) || '30', 10);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const [reels, totalStats] = await Promise.all([
+      prisma.reels.findMany({
+        where: { authorId: userId, status: 'ready' },
+        select: {
+          id: true,
+          viewsCount: true,
+          likesCount: true,
+          commentsCount: true,
+          sharesCount: true,
+          savesCount: true,
+          avgWatchTimeMs: true,
+          completionRate: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.reels.aggregate({
+        where: { authorId: userId, status: 'ready' },
+        _sum: {
+          viewsCount: true,
+          likesCount: true,
+          commentsCount: true,
+          sharesCount: true,
+          savesCount: true,
+        },
+        _avg: {
+          avgWatchTimeMs: true,
+          completionRate: true,
+        },
+        _count: true,
+      }),
+    ]);
+
+    const recentViews = await prisma.reel_views.count({
+      where: {
+        reels: { authorId: userId },
+        createdAt: { gte: since },
+      },
+    });
+
+    const topReels = reels
+      .slice(0, 10)
+      .sort((a, b) => (b.viewsCount || 0) - (a.viewsCount || 0));
+
+    res.json({
+      totalReels: totalStats._count,
+      totalViews: totalStats._sum.viewsCount || 0,
+      totalLikes: totalStats._sum.likesCount || 0,
+      totalComments: totalStats._sum.commentsCount || 0,
+      totalShares: totalStats._sum.sharesCount || 0,
+      totalSaves: totalStats._sum.savesCount || 0,
+      avgWatchTimeMs: Math.round(totalStats._avg.avgWatchTimeMs || 0),
+      avgCompletionRate: totalStats._avg.completionRate || 0,
+      recentViews,
+      topReels: topReels.map((r) => ({
+        id: r.id,
+        viewsCount: r.viewsCount,
+        likesCount: r.likesCount,
+        commentsCount: r.commentsCount,
+        createdAt: r.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error('getCreatorAnalytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+};
+
+export const getReelAnalytics = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: {
+        authorId: true,
+        viewsCount: true,
+        uniqueViewsCount: true,
+        likesCount: true,
+        commentsCount: true,
+        sharesCount: true,
+        savesCount: true,
+        avgWatchTimeMs: true,
+        completionRate: true,
+        durationSeconds: true,
+        createdAt: true,
+      },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    if (reel.authorId !== userId) {
+      res.status(403).json({ error: 'You can only view analytics for your own reels' });
+      return;
+    }
+
+    const viewsBySource = await prisma.reel_views.groupBy({
+      by: ['source'],
+      where: { reelId },
+      _count: true,
+    });
+
+    const viewsByDevice = await prisma.reel_views.groupBy({
+      by: ['deviceType'],
+      where: { reelId },
+      _count: true,
+    });
+
+    res.json({
+      viewsCount: reel.viewsCount,
+      uniqueViewsCount: reel.uniqueViewsCount,
+      likesCount: reel.likesCount,
+      commentsCount: reel.commentsCount,
+      sharesCount: reel.sharesCount,
+      savesCount: reel.savesCount,
+      avgWatchTimeMs: reel.avgWatchTimeMs,
+      completionRate: reel.completionRate,
+      durationSeconds: reel.durationSeconds,
+      engagementRate:
+        reel.viewsCount > 0
+          ? (reel.likesCount + reel.commentsCount + reel.sharesCount) / reel.viewsCount
+          : 0,
+      viewsBySource: viewsBySource.map((v) => ({
+        source: v.source || 'unknown',
+        count: v._count,
+      })),
+      viewsByDevice: viewsByDevice.map((v) => ({
+        device: v.deviceType || 'unknown',
+        count: v._count,
+      })),
+      createdAt: reel.createdAt,
+    });
+  } catch (error) {
+    console.error('getReelAnalytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch reel analytics' });
+  }
+};
+
+export const reportReel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = req.user.userId;
+    const reelId = ensureString(req.params.reelId);
+    if (!reelId) {
+      res.status(400).json({ error: 'Reel ID is required' });
+      return;
+    }
+    const { reason, description } = req.body;
+
+    if (!reason) {
+      res.status(400).json({ error: 'Reason is required' });
+      return;
+    }
+
+    const validReasons = [
+      'spam',
+      'harassment',
+      'violence',
+      'nudity',
+      'misinformation',
+      'other',
+    ];
+    if (!validReasons.includes(reason)) {
+      res.status(400).json({ error: 'Invalid reason' });
+      return;
+    }
+
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { id: true },
+    });
+
+    if (!reel) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    await prisma.reel_reports.create({
+      data: {
+        reelId,
+        reporterId: userId,
+        reason,
+        description,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('reportReel error:', error);
+    res.status(500).json({ error: 'Failed to report reel' });
+  }
+};
+
+export const transcodingWebhook = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { VideoGuid, Status, LibraryId } = req.body;
+
+    if (LibraryId !== process.env.BUNNY_STREAM_LIBRARY_ID) {
+      res.status(400).json({ error: 'Invalid library ID' });
+      return;
+    }
+
+    const reelRecord = await prisma.reels.findUnique({
+      where: { videoId: VideoGuid },
+      select: { id: true, authorId: true, status: true, scheduledAt: true },
+    });
+
+    if (!reelRecord) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
+    const statusString = bunnyStreamService.getStatusString(Status);
+
+    if (statusString === 'ready') {
+      const videoInfo = await bunnyStreamService.getVideo(VideoGuid);
+      const now = new Date();
+      const isDraft = reelRecord.status === 'draft';
+      const hasScheduledFuture = reelRecord.scheduledAt && new Date(reelRecord.scheduledAt) > now;
+      const shouldPublish = !isDraft && !hasScheduledFuture;
+
+      await prisma.reels.update({
+        where: { id: reelRecord.id },
+        data: {
+          status: 'ready',
+          transcodingProgress: 100,
+          durationSeconds: Math.round(videoInfo.length || 0),
+          width: videoInfo.width || 1080,
+          height: videoInfo.height || 1920,
+          fileSize: videoInfo.storageSize,
+          ...(shouldPublish ? { publishedAt: now } : {}),
+        },
+      });
+
+      const io = getIO();
+      if (io) {
+        io.to(`user:${reelRecord.authorId}`).emit('reel:processing_complete', {
+          reelId: reelRecord.id,
+          hlsUrl: bunnyStreamService.getHlsUrl(VideoGuid),
+        });
+      }
+    } else if (statusString === 'failed') {
+      await prisma.reels.update({
+        where: { id: reelRecord.id },
+        data: {
+          status: 'failed',
+          processingError: 'Transcoding failed',
+        },
+      });
+
+      const io = getIO();
+      if (io) {
+        io.to(`user:${reelRecord.authorId}`).emit('reel:processing_failed', {
+          reelId: reelRecord.id,
+          error: 'Transcoding failed',
+        });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('transcodingWebhook error:', error);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+};

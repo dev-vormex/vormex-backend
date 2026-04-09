@@ -1,0 +1,24 @@
+name: Backend Keep Alive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-backend:
+    name: Ping Production Health Endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEEPALIVE_URL: ${{ vars.BACKEND_KEEPALIVE_URL || 'https://api.vormex.in/api/health' }}
+
+    steps:
+      - name: Ping backend
+        run: |
+          echo "Pinging ${KEEPALIVE_URL}"
+          curl --fail --silent --show-error \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 5 \
+            "${KEEPALIVE_URL}"

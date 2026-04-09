@@ -1,0 +1,45 @@
+import type { UserResponse } from '../types/auth.types';
+import { getPremiumAccessSnapshot } from './premium-access.service';
+
+export async function buildUserResponse(user: any): Promise<UserResponse> {
+  const snapshot = await getPremiumAccessSnapshot(String(user.id));
+
+  return {
+    id: user.id,
+    email: user.email,
+    username: user.username,
+    name: user.name,
+    profileImage: user.profileImage,
+    bio: user.bio,
+    college: user.college,
+    branch: user.branch,
+    graduationYear: user.graduationYear,
+    isVerified: user.isVerified,
+    authProvider: user.authProvider,
+    googleId: user.googleId,
+    appleId: user.appleId,
+    githubUsername: user.githubUsername,
+    githubId: user.githubId,
+    githubConnected: user.githubConnected,
+    githubAvatarUrl: user.githubAvatarUrl,
+    githubProfileUrl: user.githubProfileUrl,
+    githubLastSyncedAt: user.githubLastSyncedAt,
+    headline: user.headline,
+    bannerImageUrl: user.bannerImageUrl,
+    location: user.location,
+    currentYear: user.currentYear,
+    degree: user.degree,
+    portfolioUrl: user.portfolioUrl,
+    linkedinUrl: user.linkedinUrl,
+    otherSocialUrls: user.otherSocialUrls,
+    isOpenToOpportunities: user.isOpenToOpportunities,
+    interests: user.interests || [],
+    onboardingCompleted: user.onboardingCompleted ?? false,
+    isPremium: snapshot.isPremium,
+    canUseAgent: snapshot.canUseAgent,
+    canAccessProfileCustomization: snapshot.canAccessProfileCustomization,
+    premiumDisplayAmount: snapshot.premiumDisplayAmount,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
