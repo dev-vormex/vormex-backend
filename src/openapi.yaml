@@ -1,0 +1,2597 @@
+openapi: 3.1.0
+info:
+  title: Vormex API
+  description: |
+    Professional social networking platform for students - LinkedIn + Instagram reels + GitHub profile + LeetCode stats style.
+    
+    ## Features
+    - User authentication (Email/Password, Google OAuth)
+    - GitHub OAuth integration with contribution calendar
+    - Activity tracking with streaks (GitHub-style)
+    - Professional profile fields (Skills, Experience, Education, Projects, Certificates, Achievements)
+    - Unified content feed (Posts, Articles, Forum Q&A)
+    - XP and leveling system
+    
+    ## Authentication
+    Most endpoints require JWT authentication. Include the token in the Authorization header:
+    ```
+    Authorization: Bearer <your-jwt-token>
+    ```
+  version: 1.0.0
+  contact:
+    name: Vormex API Support
+    email: support@vormex.in
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: /api
+    description: Current server origin
+  - url: https://api.vormex.in/api
+    description: Production server
+
+tags:
+  - name: Authentication
+    description: User registration, login, and authentication
+  - name: Password
+    description: Password reset and recovery
+  - name: Verification
+    description: Email verification
+  - name: OAuth
+    description: Third-party authentication (Google)
+  - name: GitHub Integration
+    description: GitHub OAuth and profile sync
+  - name: Profile
+    description: User profiles and content feeds
+  - name: Activity
+    description: Activity tracking and contribution calendar
+  - name: Skills
+    description: User skills management
+  - name: Experience
+    description: Work experience and internships
+  - name: Education
+    description: Education history
+  - name: Projects
+    description: Portfolio projects
+  - name: Certificates
+    description: Certifications and licenses
+  - name: Achievements
+    description: Hackathons, competitions, and awards
+  - name: Interests
+    description: User interests management
+  - name: Upload
+    description: Image upload endpoints (expects pre-cropped images from frontend)
+  - name: Health
+    description: System health and status
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token obtained from login or registration
+
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+        details:
+          type: string
+          description: Additional error details
+        code:
+          type: string
+          description: Error code (e.g., "TOKEN_EXPIRED", "NOT_CONNECTED")
+
+    Success:
+      type: object
+      properties:
+        message:
+          type: string
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        username:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{2,29}$'
+          minLength: 3
+          maxLength: 30
+          example: koushik_dev
+          description: Unique username for profile URLs and @mentions
+        name:
+          type: string
+        profileImage:
+          type: string
+          nullable: true
+        bio:
+          type: string
+          nullable: true
+        college:
+          type: string
+          nullable: true
+        branch:
+          type: string
+          nullable: true
+        graduationYear:
+          type: integer
+          nullable: true
+        isVerified:
+          type: boolean
+        authProvider:
+          type: string
+          enum: [email, google, apple]
+        interests:
+          type: array
+          items:
+            type: string
+          maxItems: 10
+          example: ["AI", "Web3", "Mobile Development"]
+          description: Array of user interests (max 10, 2-30 chars each, will be capitalized and deduplicated)
+        createdAt:
+          type: string
+          format: date-time
+
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+        - name
+        - username
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        name:
+          type: string
+        username:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{2,29}$'
+          minLength: 3
+          maxLength: 30
+          example: koushik_dev
+          description: Unique username (3-30 chars, lowercase, alphanumeric + underscore, must start with letter)
+        college:
+          type: string
+        branch:
+          type: string
+
+    LoginRequest:
+      type: object
+      required:
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          description: Email address (use email OR username)
+        username:
+          type: string
+          description: Username (use email OR username)
+        emailOrUsername:
+          type: string
+          description: Alternative single field for email or username
+        password:
+          type: string
+          description: User password
+
+    AuthResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        token:
+          type: string
+          description: JWT token for authentication
+
+    FullProfileResponse:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            id:
+              type: string
+            username:
+              type: string
+            name:
+              type: string
+            email:
+              type: string
+              description: Only included if viewing own profile
+            avatar:
+              type: string
+              nullable: true
+            bannerImageUrl:
+              type: string
+              nullable: true
+            headline:
+              type: string
+              nullable: true
+            bio:
+              type: string
+              nullable: true
+            location:
+              type: string
+              nullable: true
+            college:
+              type: string
+            degree:
+              type: string
+              nullable: true
+            branch:
+              type: string
+            currentYear:
+              type: integer
+              nullable: true
+            graduationYear:
+              type: integer
+              nullable: true
+            portfolioUrl:
+              type: string
+              nullable: true
+            linkedinUrl:
+              type: string
+              nullable: true
+            githubProfileUrl:
+              type: string
+              nullable: true
+            isOpenToOpportunities:
+              type: boolean
+            verified:
+              type: boolean
+            interests:
+              type: array
+              items:
+                type: string
+              maxItems: 10
+              example: ["AI", "Web3", "Mobile Development"]
+              description: Array of user interests (max 10, 2-30 chars each)
+        stats:
+          type: object
+          properties:
+            xp:
+              type: integer
+            level:
+              type: integer
+            xpToNextLevel:
+              type: integer
+            totalPosts:
+              type: integer
+            totalArticles:
+              type: integer
+            currentStreak:
+              type: integer
+            longestStreak:
+              type: integer
+        github:
+          type: object
+          properties:
+            connected:
+              type: boolean
+            username:
+              type: string
+              nullable: true
+            stats:
+              type: object
+              nullable: true
+        activityHeatmap:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivityHeatmapDay'
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSkill'
+        experiences:
+          type: array
+          items:
+            $ref: '#/components/schemas/Experience'
+        education:
+          type: array
+          items:
+            $ref: '#/components/schemas/Education'
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+        certificates:
+          type: array
+          items:
+            $ref: '#/components/schemas/Certificate'
+        achievements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Achievement'
+
+    ActivityHeatmapDay:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2024-01-01"
+        activityCount:
+          type: integer
+        isActive:
+          type: boolean
+        level:
+          type: integer
+          enum: [0, 1, 2, 3]
+          description: 0=gray, 1=light green, 2=medium green, 3=dark green
+        breakdown:
+          type: object
+          properties:
+            posts:
+              type: integer
+            articles:
+              type: integer
+            comments:
+              type: integer
+            forumQuestions:
+              type: integer
+            forumAnswers:
+              type: integer
+            likes:
+              type: integer
+            messages:
+              type: integer
+
+    ActivityHeatmapResponse:
+      type: object
+      properties:
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivityHeatmapDay'
+        stats:
+          type: object
+          properties:
+            totalContributions:
+              type: integer
+            currentStreak:
+              type: integer
+            longestStreak:
+              type: integer
+            contributionLevels:
+              type: object
+              properties:
+                level0:
+                  type: integer
+                level1:
+                  type: integer
+                level2:
+                  type: integer
+                level3:
+                  type: integer
+
+    UserSkill:
+      type: object
+      properties:
+        id:
+          type: string
+        skill:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            category:
+              type: string
+              nullable: true
+        proficiency:
+          type: string
+          enum: [Beginner, Intermediate, Advanced, Expert]
+          nullable: true
+        yearsOfExp:
+          type: integer
+          nullable: true
+
+    Experience:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        company:
+          type: string
+        type:
+          type: string
+          enum: [Internship, Part-time, Full-time, Freelance, Contract]
+        location:
+          type: string
+          nullable: true
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+          nullable: true
+        isCurrent:
+          type: boolean
+        description:
+          type: string
+          nullable: true
+        skills:
+          type: array
+          items:
+            type: string
+
+    Education:
+      type: object
+      properties:
+        id:
+          type: string
+        school:
+          type: string
+        degree:
+          type: string
+        fieldOfStudy:
+          type: string
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+          nullable: true
+        isCurrent:
+          type: boolean
+        grade:
+          type: string
+          nullable: true
+        activities:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        role:
+          type: string
+          nullable: true
+        techStack:
+          type: array
+          items:
+            type: string
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+          nullable: true
+        isCurrent:
+          type: boolean
+        projectUrl:
+          type: string
+          nullable: true
+        githubUrl:
+          type: string
+          nullable: true
+        images:
+          type: array
+          items:
+            type: string
+        featured:
+          type: boolean
+
+    Certificate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        issuingOrg:
+          type: string
+        issueDate:
+          type: string
+          format: date
+        expiryDate:
+          type: string
+          format: date
+          nullable: true
+        doesNotExpire:
+          type: boolean
+        credentialId:
+          type: string
+          nullable: true
+        credentialUrl:
+          type: string
+          nullable: true
+
+    Achievement:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        type:
+          type: string
+          enum: [Hackathon, Competition, Award, Scholarship, Recognition]
+        organization:
+          type: string
+        date:
+          type: string
+          format: date
+        description:
+          type: string
+          nullable: true
+        certificateUrl:
+          type: string
+          nullable: true
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Check API and database connectivity
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  timestamp:
+                    type: integer
+                  database:
+                    type: string
+                    example: connected
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/register:
+    post:
+      tags:
+        - Authentication
+      summary: Register new user
+      description: Create a new user account with email, password, and username
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              email: student@example.com
+              password: SecurePass123!
+              name: John Doe
+              username: johndoe
+              college: VIT Vellore
+              branch: Computer Science
+      responses:
+        '201':
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Validation error (invalid username format, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: User already exists (email or username taken)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: Login user
+      description: Authenticate user with email OR username and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              emailLogin:
+                summary: Login with email
+                value:
+                  email: student@example.com
+                  password: SecurePass123!
+              usernameLogin:
+                summary: Login with username
+                value:
+                  username: johndoe
+                  password: SecurePass123!
+              singleFieldLogin:
+                summary: Login with single field
+                value:
+                  emailOrUsername: student@example.com
+                  password: SecurePass123!
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/me:
+    get:
+      tags:
+        - Authentication
+      summary: Get current user
+      description: Get authenticated user's profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/forgot-password:
+    post:
+      tags:
+        - Password
+      summary: Request password reset
+      description: Send password reset email to user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '200':
+          description: Reset email sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/reset-password:
+    post:
+      tags:
+        - Password
+      summary: Reset password
+      description: Reset password using token from email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - token
+                - newPassword
+              properties:
+                token:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 8
+      responses:
+        '200':
+          description: Password reset successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          description: Invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/verify-email:
+    get:
+      tags:
+        - Verification
+      summary: Verify email
+      description: Verify email address with token
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Email verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          description: Invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/resend-verification:
+    post:
+      tags:
+        - Verification
+      summary: Resend verification email
+      description: Resend email verification link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '200':
+          description: Verification email sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+
+  /auth/google:
+    post:
+      tags:
+        - OAuth
+      summary: Google Sign-In
+      description: Authenticate with Google OAuth ID token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - idToken
+              properties:
+                idToken:
+                  type: string
+                  description: Google ID token from client
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /integrations/github/start:
+    get:
+      tags:
+        - GitHub Integration
+      summary: Start GitHub OAuth
+      description: Get GitHub authorization URL to start OAuth flow
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Authorization URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authUrl:
+                    type: string
+                    format: uri
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /integrations/github/callback:
+    get:
+      tags:
+        - GitHub Integration
+      summary: GitHub OAuth callback
+      description: Handle GitHub OAuth callback (public endpoint)
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to frontend
+        '400':
+          description: Invalid callback parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /integrations/github/sync:
+    post:
+      tags:
+        - GitHub Integration
+      summary: Sync GitHub stats
+      description: Manually trigger GitHub profile sync
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sync successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  stats:
+                    type: object
+                  syncedAt:
+                    type: string
+                    format: date-time
+        '400':
+          description: GitHub not connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Token expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /integrations/github/disconnect:
+    post:
+      tags:
+        - GitHub Integration
+      summary: Disconnect GitHub
+      description: Disconnect GitHub account
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Disconnected successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+
+  /integrations/github/stats:
+    get:
+      tags:
+        - GitHub Integration
+      summary: Get GitHub stats
+      description: Get user's GitHub statistics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: GitHub stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connected:
+                    type: boolean
+                  username:
+                    type: string
+                    nullable: true
+                  stats:
+                    type: object
+                    nullable: true
+                  lastSyncedAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+        '404':
+          description: No stats found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/profile:
+    get:
+      tags:
+        - Profile
+      summary: Get user profile
+      description: Get full user profile with all data. Supports UUID or username (e.g., @koushik). Public route but respects privacy settings.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: User ID (UUID) or username (e.g., koushik or @koushik)
+          examples:
+            uuid:
+              summary: UUID format
+              value: 550e8400-e29b-41d4-a716-446655440000
+            username:
+              summary: Username format
+              value: koushik
+            usernameWithAt:
+              summary: Username with @ prefix
+              value: '@koushik'
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Profile data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FullProfileResponse'
+        '403':
+          description: Private profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/feed:
+    get:
+      tags:
+        - Profile
+      summary: Get user content feed
+      description: Get unified content feed (posts, articles, forum Q&A). Supports UUID or username.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: User ID (UUID) or username
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: filter
+          in: query
+          schema:
+            type: string
+            enum: [all, posts, articles, forum, videos]
+            default: all
+      responses:
+        '200':
+          description: Feed data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                  totalCount:
+                    type: integer
+                  hasMore:
+                    type: boolean
+
+  /users/me:
+    put:
+      tags:
+        - Profile
+      summary: Update profile
+      description: Update own profile information. Username cannot be changed after registration (permanent).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  description: User's full name
+                  example: "John Doe"
+                headline:
+                  type: string
+                  maxLength: 120
+                bio:
+                  type: string
+                  maxLength: 500
+                location:
+                  type: string
+                currentYear:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                degree:
+                  type: string
+                graduationYear:
+                  type: integer
+                portfolioUrl:
+                  type: string
+                  format: uri
+                linkedinUrl:
+                  type: string
+                  format: uri
+                interests:
+                  type: array
+                  items:
+                    type: string
+                  maxItems: 10
+                  example: ["AI", "Web3", "Mobile Development"]
+                  description: Array of interests (max 10, 2-30 chars each, will be capitalized and deduplicated)
+                username:
+                  type: string
+                  description: Username cannot be changed (ignored if provided)
+      responses:
+        '200':
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/banner:
+    post:
+      tags:
+        - Profile
+      summary: Upload banner image
+      description: Update profile banner image URL
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - bannerUrl
+              properties:
+                bannerUrl:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Banner updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bannerImageUrl:
+                    type: string
+
+  /users/me/avatar:
+    post:
+      tags:
+        - Profile
+      summary: Upload avatar image
+      description: Update profile avatar image URL
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - avatarUrl
+              properties:
+                avatarUrl:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Avatar updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  avatar:
+                    type: string
+
+  /users/me/interests:
+    get:
+      tags:
+        - Interests
+      summary: Get user interests
+      description: Get all interests for the current user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User interests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  interests:
+                    type: array
+                    items:
+                      type: string
+                    maxItems: 10
+                    example: ["AI", "Web3", "Mobile Development"]
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      tags:
+        - Interests
+      summary: Add a new interest
+      description: |
+        Add a new interest to the user's profile.
+        - Max 10 interests total
+        - Each interest: 2-30 characters
+        - Interest will be capitalized automatically
+        - Duplicates are not allowed (case-insensitive)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - interest
+              properties:
+                interest:
+                  type: string
+                  minLength: 2
+                  maxLength: 30
+                  example: "web3"
+                  description: Interest to add (will be capitalized)
+      responses:
+        '201':
+          description: Interest added successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  interests:
+                    type: array
+                    items:
+                      type: string
+                    maxItems: 10
+                    example: ["AI", "Web3", "Mobile Development"]
+        '400':
+          description: Validation error or maximum interests reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Interest already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/interests/{interest}:
+    put:
+      tags:
+        - Interests
+      summary: Update an interest
+      description: |
+        Update an existing interest.
+        - Interest value in URL should be URL-encoded
+        - New interest: 2-30 characters
+        - Will be capitalized automatically
+        - Duplicates are not allowed (case-insensitive)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: interest
+          in: path
+          required: true
+          description: The interest value to update (URL-encoded)
+          schema:
+            type: string
+          example: "AI"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - interest
+              properties:
+                interest:
+                  type: string
+                  minLength: 2
+                  maxLength: 30
+                  example: "Artificial Intelligence"
+                  description: New interest value (will be capitalized)
+      responses:
+        '200':
+          description: Interest updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  interests:
+                    type: array
+                    items:
+                      type: string
+                    maxItems: 10
+                    example: ["Artificial Intelligence", "Web3", "Mobile Development"]
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Interest not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Interest already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Interests
+      summary: Delete an interest
+      description: |
+        Remove an interest from the user's profile.
+        - Interest value in URL should be URL-encoded
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: interest
+          in: path
+          required: true
+          description: The interest value to delete (URL-encoded)
+          schema:
+            type: string
+          example: "AI"
+      responses:
+        '200':
+          description: Interest deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  interests:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Web3", "Mobile Development"]
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Interest not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/activity:
+    get:
+      tags:
+        - Activity
+      summary: Get activity heatmap
+      description: Get GitHub-style contribution calendar data. Supports UUID or username.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: User ID (UUID) or username
+        - name: year
+          in: query
+          description: "Year to view (default: last 365 days)"
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Activity heatmap data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHeatmapResponse'
+        '400':
+          description: Invalid year
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/activity/years:
+    get:
+      tags:
+        - Activity
+      summary: Get available years
+      description: Get list of years available for activity calendar. Supports UUID or username.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: User ID (UUID) or username
+      responses:
+        '200':
+          description: Available years
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  years:
+                    type: array
+                    items:
+                      type: integer
+                  joinedYear:
+                    type: integer
+
+  /users/me/skills:
+    post:
+      tags:
+        - Skills
+      summary: Add skill
+      description: Add a skill to user profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - skillName
+              properties:
+                skillName:
+                  type: string
+                proficiency:
+                  type: string
+                  enum: [Beginner, Intermediate, Advanced, Expert]
+                yearsOfExp:
+                  type: integer
+      responses:
+        '201':
+          description: Skill added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSkill'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/skills/{id}:
+    put:
+      tags:
+        - Skills
+      summary: Update skill
+      description: Update skill proficiency or experience
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                proficiency:
+                  type: string
+                  enum: [Beginner, Intermediate, Advanced, Expert]
+                yearsOfExp:
+                  type: integer
+      responses:
+        '200':
+          description: Skill updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSkill'
+        '404':
+          description: Skill not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Skills
+      summary: Remove skill
+      description: Remove skill from profile
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Skill removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Skill not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /skills/search:
+    get:
+      tags:
+        - Skills
+      summary: Search skills
+      description: Search skills for autocomplete (public)
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+      responses:
+        '200':
+          description: Matching skills
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    name:
+                      type: string
+                    category:
+                      type: string
+                      nullable: true
+
+  /users/me/experiences:
+    post:
+      tags:
+        - Experience
+      summary: Create experience
+      description: Add work experience or internship
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - company
+                - type
+                - startDate
+              properties:
+                title:
+                  type: string
+                company:
+                  type: string
+                type:
+                  type: string
+                  enum: [Internship, Part-time, Full-time, Freelance, Contract]
+                location:
+                  type: string
+                startDate:
+                  type: string
+                  format: date
+                endDate:
+                  type: string
+                  format: date
+                isCurrent:
+                  type: boolean
+                description:
+                  type: string
+                skills:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Experience created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Experience'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/experiences/{id}:
+    put:
+      tags:
+        - Experience
+      summary: Update experience
+      description: Update work experience
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Experience'
+      responses:
+        '200':
+          description: Experience updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Experience'
+        '404':
+          description: Experience not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Experience
+      summary: Delete experience
+      description: Remove work experience
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Experience deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Experience not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/experiences:
+    get:
+      tags:
+        - Experience
+      summary: Get user experiences
+      description: Get all experiences for a user (public)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of experiences
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Experience'
+
+  /users/me/education:
+    post:
+      tags:
+        - Education
+      summary: Create education
+      description: Add education history
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - school
+                - degree
+                - fieldOfStudy
+                - startDate
+              properties:
+                school:
+                  type: string
+                degree:
+                  type: string
+                fieldOfStudy:
+                  type: string
+                startDate:
+                  type: string
+                  format: date
+                endDate:
+                  type: string
+                  format: date
+                isCurrent:
+                  type: boolean
+                grade:
+                  type: string
+                activities:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '201':
+          description: Education created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Education'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/education/{id}:
+    put:
+      tags:
+        - Education
+      summary: Update education
+      description: Update education history
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Education'
+      responses:
+        '200':
+          description: Education updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Education'
+        '404':
+          description: Education not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Education
+      summary: Delete education
+      description: Remove education history
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Education deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Education not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/education:
+    get:
+      tags:
+        - Education
+      summary: Get user education
+      description: Get all education for a user (public)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of education
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Education'
+
+  /users/me/projects:
+    post:
+      tags:
+        - Projects
+      summary: Create project
+      description: Add portfolio project
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - description
+                - startDate
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                role:
+                  type: string
+                techStack:
+                  type: array
+                  items:
+                    type: string
+                startDate:
+                  type: string
+                  format: date
+                endDate:
+                  type: string
+                  format: date
+                isCurrent:
+                  type: boolean
+                projectUrl:
+                  type: string
+                  format: uri
+                githubUrl:
+                  type: string
+                  format: uri
+                images:
+                  type: array
+                  items:
+                    type: string
+                featured:
+                  type: boolean
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/projects/{id}:
+    put:
+      tags:
+        - Projects
+      summary: Update project
+      description: Update portfolio project
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Project'
+      responses:
+        '200':
+          description: Project updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Projects
+      summary: Delete project
+      description: Remove portfolio project
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Project deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/projects/{id}/feature:
+    post:
+      tags:
+        - Projects
+      summary: Feature project
+      description: Toggle featured status (max 3 featured projects)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Feature status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          description: Maximum featured projects reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/projects:
+    get:
+      tags:
+        - Projects
+      summary: Get user projects
+      description: Get all projects for a user (public)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Project'
+
+  /users/me/certificates:
+    post:
+      tags:
+        - Certificates
+      summary: Create certificate
+      description: Add certification or license
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - issuingOrg
+                - issueDate
+              properties:
+                name:
+                  type: string
+                issuingOrg:
+                  type: string
+                issueDate:
+                  type: string
+                  format: date
+                expiryDate:
+                  type: string
+                  format: date
+                doesNotExpire:
+                  type: boolean
+                credentialId:
+                  type: string
+                credentialUrl:
+                  type: string
+                  format: uri
+      responses:
+        '201':
+          description: Certificate created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Certificate'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/certificates/{id}:
+    put:
+      tags:
+        - Certificates
+      summary: Update certificate
+      description: Update certification
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Certificate'
+      responses:
+        '200':
+          description: Certificate updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Certificate'
+        '404':
+          description: Certificate not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Certificates
+      summary: Delete certificate
+      description: Remove certification
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Certificate deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Certificate not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/certificates:
+    get:
+      tags:
+        - Certificates
+      summary: Get user certificates
+      description: Get all certificates for a user (public)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of certificates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Certificate'
+
+  /users/me/achievements:
+    post:
+      tags:
+        - Achievements
+      summary: Create achievement
+      description: Add hackathon, competition, or award
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - type
+                - organization
+                - date
+              properties:
+                title:
+                  type: string
+                type:
+                  type: string
+                  enum: [Hackathon, Competition, Award, Scholarship, Recognition]
+                organization:
+                  type: string
+                date:
+                  type: string
+                  format: date
+                description:
+                  type: string
+                certificateUrl:
+                  type: string
+                  format: uri
+      responses:
+        '201':
+          description: Achievement created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Achievement'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me/achievements/{id}:
+    put:
+      tags:
+        - Achievements
+      summary: Update achievement
+      description: Update achievement
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Achievement'
+      responses:
+        '200':
+          description: Achievement updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Achievement'
+        '404':
+          description: Achievement not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags:
+        - Achievements
+      summary: Delete achievement
+      description: Remove achievement
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Achievement deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '404':
+          description: Achievement not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/achievements:
+    get:
+      tags:
+        - Achievements
+      summary: Get user achievements
+      description: Get all achievements for a user (public)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of achievements
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Achievement'
+
+
+  /upload/avatar:
+    post:
+      tags:
+        - Upload
+      summary: Upload profile picture
+      description: |
+        Upload profile picture (expects pre-cropped 1:1 aspect ratio from frontend).
+        Backend resizes to 400x400 and converts to AVIF format.
+        Max file size: 10 MB.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: Pre-cropped image file (1:1 aspect ratio)
+              required:
+                - image
+      responses:
+        '200':
+          description: Profile picture uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Profile picture uploaded successfully
+                  avatarUrl:
+                    type: string
+                    example: https://vormex.b-cdn.net/profiles/avatars/user-123-1234567890.avif
+                  user:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      username:
+                        type: string
+                      name:
+                        type: string
+                      profileImage:
+                        type: string
+        '400':
+          description: Invalid image or file too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Upload
+      summary: Delete profile picture
+      description: |
+        Delete the current user's profile picture.
+        Removes the image from Bunny.net storage and sets profileImage to null in the database.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Profile picture deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Profile picture deleted successfully
+                  user:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      username:
+                        type: string
+                      name:
+                        type: string
+                      profileImage:
+                        type: string
+                        nullable: true
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /upload/banner:
+    post:
+      tags:
+        - Upload
+      summary: Upload banner image
+      description: |
+        Upload banner image (expects pre-cropped 3:1 aspect ratio from frontend).
+        Backend resizes to 1500x500 and converts to AVIF format.
+        Max file size: 10 MB.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: Pre-cropped image file (3:1 aspect ratio)
+              required:
+                - image
+      responses:
+        '200':
+          description: Banner uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Banner image uploaded successfully
+                  bannerUrl:
+                    type: string
+                    example: https://vormex.b-cdn.net/profiles/banners/user-123-1234567890.avif
+                  user:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      username:
+                        type: string
+                      name:
+                        type: string
+                      bannerImageUrl:
+                        type: string
+        '400':
+          description: Invalid image or file too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Upload
+      summary: Delete banner image
+      description: |
+        Delete the current user's banner image.
+        Removes the image from Bunny.net storage and sets bannerImageUrl to null in the database.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Banner image deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Banner image deleted successfully
+                  user:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      username:
+                        type: string
+                      name:
+                        type: string
+                      bannerImageUrl:
+                        type: string
+                        nullable: true
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

@@ -1,0 +1,185 @@
+import { prisma } from '../config/prisma';
+import { engagementService } from './engagement.service';
+import { pushNotificationService } from './push-notification.service';
+import { socialProofService } from './social-proof.service';
+import { storyService } from './story.service';
+
+export const maintenanceSchedules = [
+  {
+    schedulerId: 'daily_match_notifications',
+    jobName: 'daily_match_notifications',
+    pattern: '30 15 * * *',
+  },
+  {
+    schedulerId: 'streak_reminders',
+    jobName: 'streak_reminders',
+    pattern: '30 14 * * *',
+  },
+  {
+    schedulerId: 'streak_freeze_processing',
+    jobName: 'streak_freeze_processing',
+    pattern: '0 19 * * *',
+  },
+  {
+    schedulerId: 'weekly_counter_reset',
+    jobName: 'weekly_counter_reset',
+    pattern: '30 18 * * 0',
+  },
+  {
+    schedulerId: 'social_proof_leaderboard',
+    jobName: 'social_proof_leaderboard',
+    pattern: '0 * * * *',
+  },
+  {
+    schedulerId: 'social_proof_trending',
+    jobName: 'social_proof_trending',
+    pattern: '*/15 * * * *',
+  },
+  {
+    schedulerId: 'social_proof_cleanup',
+    jobName: 'social_proof_cleanup',
+    pattern: '30 19 * * *',
+  },
+  {
+    schedulerId: 'story_cleanup',
+    jobName: 'story_cleanup',
+    pattern: '0 * * * *',
+  },
+  {
+    schedulerId: 'study_streak_calculation',
+    jobName: 'study_streak_calculation',
+    pattern: '30 18 * * *',
+  },
+  {
+    schedulerId: 'story_interactive_notifications',
+    jobName: 'story_interactive_notifications',
+    pattern: '*/5 * * * *',
+  },
+  {
+    schedulerId: 'story_countdown_notifications',
+    jobName: 'story_countdown_notifications',
+    pattern: '* * * * *',
+  },
+] as const;
+
+export type MaintenanceJobName = (typeof maintenanceSchedules)[number]['jobName'];
+
+async function getUsersWithActiveTokens(): Promise<string[]> {
+  const usersWithTokens = await prisma.device_tokens.findMany({
+    where: { isActive: true },
+    select: { userId: true },
+    distinct: ['userId'],
+  });
+
+  return usersWithTokens.map((entry) => entry.userId);
+}
+
+async function runDailyMatchNotifications(): Promise<{ sent: number; total: number }> {
+  const userIds = await getUsersWithActiveTokens();
+  let sent = 0;
+
+  for (const userId of userIds) {
+    try {
+      const matchCount = Math.floor(Math.random() * 4) + 1;
+      await pushNotificationService.pushDailyMatches(userId, matchCount);
+      sent += 1;
+    } catch {
+      continue;
+    }
+  }
+
+  return { sent, total: userIds.length };
+}
+
+async function runStreakReminders(): Promise<{ sent: number }> {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const streakChecks = [
+    { field: 'connectionStreak', dateField: 'lastConnectionDate' },
+    { field: 'loginStreak', dateField: 'lastLoginDate' },
+    { field: 'postingStreak', dateField: 'lastPostDate' },
+    { field: 'messagingStreak', dateField: 'lastMessageDate' },
+  ] as const;
+
+  let totalSent = 0;
+
+  for (const check of streakChecks) {
+    const atRiskUsers = await prisma.engagement_streaks.findMany({
+      where: {
+        [check.field]: { gte: 2 },
+        [check.dateField]: { lt: today },
+      },
+      select: {
+        userId: true,
+        [check.field]: true,
+      },
+    });
+
+    const usersWithTokens = await prisma.device_tokens.findMany({
+      where: {
+        userId: { in: atRiskUsers.map((user) => user.userId) },
+        isActive: true,
+      },
+      select: { userId: true },
+      distinct: ['userId'],
+    });
+
+    const tokenUserIds = new Set(usersWithTokens.map((entry) => entry.userId));
+
+    for (const user of atRiskUsers) {
+      if (!tokenUserIds.has(user.userId)) {
+        continue;
+      }
+
+      try {
+        await pushNotificationService.pushStreakAtRisk(
+          user.userId,
+          Number((user as Record<string, unknown>)[check.field] || 0)
+        );
+        totalSent += 1;
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return { sent: totalSent };
+}
+
+export async function runMaintenanceJob(jobName: MaintenanceJobName): Promise<unknown> {
+  switch (jobName) {
+    case 'daily_match_notifications':
+      return runDailyMatchNotifications();
+    case 'streak_reminders':
+      return runStreakReminders();
+    case 'streak_freeze_processing':
+      return engagementService.processStreakFreezes();
+    case 'weekly_counter_reset':
+      return engagementService.resetWeeklyCounters();
+    case 'social_proof_leaderboard':
+      return socialProofService.runLeaderboardCron();
+    case 'social_proof_trending':
+      return socialProofService.runTrendingCron();
+    case 'social_proof_cleanup':
+      await socialProofService.cleanupOldActivities();
+      await socialProofService.cleanupOldProfileViews();
+      return socialProofService.runOnboardingCron();
+    case 'story_cleanup':
+      return storyService.cleanupExpiredStories();
+    case 'study_streak_calculation':
+      return storyService.calculateStudyStreaks();
+    case 'story_interactive_notifications':
+      return storyService.processInteractiveNotifications();
+    case 'story_countdown_notifications':
+      return storyService.processCountdownNotifications();
+    default: {
+      const exhaustiveCheck: never = jobName;
+      return exhaustiveCheck;
+    }
+  }
+}
+
+export async function initCronJobs(): Promise<typeof maintenanceSchedules> {
+  return maintenanceSchedules;
+}
