@@ -1,0 +1,12 @@
+services:
+  - type: web
+    runtime: node
+    name: vormex-backend
+    plan: starter
+    buildCommand: npm ci && npm run build
+    preDeployCommand: npm run migrate:deploy
+    startCommand: node dist/api.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production

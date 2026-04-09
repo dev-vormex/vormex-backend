@@ -29,6 +29,21 @@ npm run dev
 
 If you want to disable the automatic Neon keep-alive helper for a session, run with `AUTO_KEEP_DB_AWAKE=false`.
 
+### Render Deploy
+
+This repo includes `render.yaml` with the production settings for Render.
+
+If you configure the service manually in the Render dashboard, use:
+
+```bash
+Build Command: npm ci && npm run build
+Pre-Deploy Command: npm run migrate:deploy
+Start Command: node dist/api.js
+Health Check Path: /api/health
+```
+
+The most common startup error is setting the start command to `node dist/api.js` without also running the build command first. In that case, Render starts successfully but exits because `dist/api.js` was never generated.
+
 ### API Documentation
 
 Once the server is running, visit:
