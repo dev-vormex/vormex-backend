@@ -42,7 +42,9 @@ Start Command: node dist/api.js
 Health Check Path: /api/health
 ```
 
-The most common startup error is setting the start command to `node dist/api.js` without also running the build command first. In that case, Render starts successfully but exits because `dist/api.js` was never generated.
+This package also includes a `postinstall` hook that runs `npm run build`. That makes Render's default Node build behavior safer, because a plain `npm install` will still generate `dist/api.js`.
+
+The most common startup error is setting the start command to `node dist/api.js` without also running the build step first. In that case, Render starts successfully but exits because `dist/api.js` was never generated.
 
 ### API Documentation
 
