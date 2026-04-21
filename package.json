@@ -9,6 +9,7 @@
     "dev:api": "ts-node-dev --respawn --transpile-only src/api.ts",
     "dev:worker": "ts-node-dev --respawn --transpile-only src/worker.ts",
     "dev:scheduler": "ts-node-dev --respawn --transpile-only src/scheduler.ts",
+    "postinstall": "npm run build",
     "build": "prisma generate && tsc && cp src/openapi.yaml dist/",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "start": "npm run start:api",
