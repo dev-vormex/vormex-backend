@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { randomUUID } from 'crypto';
 import multer from 'multer';
 import { imageProcessingService } from '../services/image-processing.service';
 import { bunnyStorageService } from '../services/bunny-storage.service';
@@ -6,6 +7,51 @@ import { prisma } from '../config/prisma';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { enqueueOutboxEvent } from '../outbox/service';
 import { AuthenticatedRequest } from '../types/auth.types';
+
+const CHAT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const CHAT_VIDEO_MAX_BYTES = 150 * 1024 * 1024;
+const CHAT_VIDEO_MAX_DURATION_MS = 90_000;
+
+const chatFileExtensionByMimeType: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/webm': 'webm',
+  'audio/wav': 'wav',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+};
+
+function sanitizeChatFileName(fileName: string, mimeType: string): string {
+  const baseName = (fileName || 'attachment')
+    .split(/[\\/]/)
+    .pop()
+    ?.trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'attachment';
+
+  if (baseName.includes('.')) {
+    return baseName;
+  }
+
+  const extension = chatFileExtensionByMimeType[mimeType];
+  return extension ? `${baseName}.${extension}` : baseName;
+}
+
+function parseOptionalDurationMs(value: unknown): number | null {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return null;
+  }
+
+  const durationMs = Number(value);
+  return Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null;
+}
 
 // Multer config (memory storage)
 const upload = multer({
@@ -465,15 +511,30 @@ export const uploadChatMedia = async (req: AuthenticatedRequest, res: Response):
     }
 
     const userId = String(req.user.userId);
-    const fileName = req.file.originalname;
+    const fileName = sanitizeChatFileName(req.file.originalname, req.file.mimetype);
     const fileSize = req.file.size;
     const mimeType = req.file.mimetype;
+    const isVideo = mimeType.startsWith('video/');
+    const maxSize = isVideo ? CHAT_VIDEO_MAX_BYTES : CHAT_ATTACHMENT_MAX_BYTES;
+    const durationMs = parseOptionalDurationMs(req.body?.durationMs);
+
+    if (fileSize > maxSize) {
+      res.status(400).json({
+        error: isVideo ? 'Videos must be under 150 MB' : 'File must be under 25 MB',
+      });
+      return;
+    }
+
+    if (isVideo && durationMs !== null && durationMs > CHAT_VIDEO_MAX_DURATION_MS) {
+      res.status(400).json({ error: 'Videos must be 90 seconds or less' });
+      return;
+    }
 
     // Determine media type
     let mediaType = 'document';
     if (mimeType.startsWith('image/')) {
       mediaType = 'image';
-    } else if (mimeType.startsWith('video/')) {
+    } else if (isVideo) {
       mediaType = 'video';
     } else if (mimeType.startsWith('audio/')) {
       mediaType = 'audio';
@@ -483,7 +544,8 @@ export const uploadChatMedia = async (req: AuthenticatedRequest, res: Response):
     const cdnUrl = await bunnyStorageService.uploadFile(
       req.file.buffer,
       `chat/${userId}`,
-      `${Date.now()}-${fileName}`
+      `${Date.now()}-${randomUUID()}-${fileName}`,
+      mimeType
     );
 
     res.json({
@@ -491,6 +553,7 @@ export const uploadChatMedia = async (req: AuthenticatedRequest, res: Response):
       fileName,
       fileSize,
       mediaType,
+      ...(durationMs !== null ? { durationMs } : {}),
     });
   } catch (error: any) {
     console.error('Upload chat media error:', error);

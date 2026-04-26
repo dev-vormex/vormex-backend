@@ -3,6 +3,10 @@ import { OpenAIRealtimeWebSocket } from 'openai/realtime/websocket';
 import { logger } from '../lib/logger';
 import { getIO } from '../sockets';
 import { AIServiceError } from '../services/ai.service';
+import {
+  getAgentAccessDeniedMessage,
+  getPremiumAccessSnapshot,
+} from '../services/premium-access.service';
 import { agentSessionService } from './session.service';
 import {
   executeAgentTool,
@@ -873,6 +877,7 @@ class AgentRealtimeVoiceService {
         suggestedActions: suggestedActions.length,
       },
     });
+    const accessSnapshot = await getPremiumAccessSnapshot(state.userId);
 
     const memorySummary = buildMemorySummary({
       previousSummary: state.session.memorySummary,
@@ -950,6 +955,14 @@ class AgentRealtimeVoiceService {
     );
 
     this.resetTurn(state);
+
+    if (accessSnapshot.agentLimitReached) {
+      this.emitToSocket(state.socketId, 'agent:voice_error', {
+        sessionId: state.sessionId,
+        error: getAgentAccessDeniedMessage(accessSnapshot),
+      });
+      this.stopSession(state.socketId);
+    }
   }
 
   async startSession(params: {

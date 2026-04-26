@@ -5,6 +5,7 @@ import type {
   GitHubLanguageResponse,
   LanguageStat,
   TopRepo,
+  GitHubContributionCalendar,
   GitHubSyncResult,
 } from '../types/github.types';
 import { encryptToken } from '../utils/encryption.util';
@@ -338,7 +339,111 @@ export function selectTopRepositories(repos: GitHubRepo[]): TopRepo[] {
         ? repo.description.substring(0, 100) + '...'
         : repo.description
       : null,
+    updatedAt: repo.updated_at,
   }));
+}
+
+/**
+ * Fetch a user's public GitHub contribution calendar.
+ * Uses the GraphQL API so we can mirror the profile-style contribution graph.
+ */
+export async function getGitHubContributionCalendar(
+  username: string,
+  accessToken: string
+): Promise<GitHubContributionCalendar> {
+  try {
+    const response = await axios.post(
+      'https://api.github.com/graphql',
+      {
+        query: `
+          query GetContributionCalendar($username: String!) {
+            user(login: $username) {
+              contributionsCollection {
+                contributionYears
+                contributionCalendar {
+                  colors
+                  totalContributions
+                  months {
+                    firstDay
+                    name
+                    totalWeeks
+                    year
+                  }
+                  weeks {
+                    firstDay
+                    contributionDays {
+                      color
+                      contributionCount
+                      contributionLevel
+                      date
+                      weekday
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `,
+        variables: { username },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/vnd.github+json',
+        },
+      }
+    );
+
+    if (response.data?.errors?.length) {
+      const firstError = response.data.errors[0];
+      throw new Error(firstError?.message || 'GitHub contribution query failed');
+    }
+
+    const contributionCollection =
+      response.data?.data?.user?.contributionsCollection;
+    const contributionCalendar = contributionCollection?.contributionCalendar;
+
+    if (!contributionCalendar) {
+      throw new Error(`No contribution calendar found for GitHub user '${username}'`);
+    }
+
+    return {
+      colors: contributionCalendar.colors || [],
+      contributionYears: contributionCollection.contributionYears || [],
+      months: (contributionCalendar.months || []).map((month: any) => ({
+        firstDay: month.firstDay,
+        name: month.name,
+        totalWeeks: month.totalWeeks,
+        year: month.year,
+      })),
+      totalContributions: contributionCalendar.totalContributions || 0,
+      weeks: (contributionCalendar.weeks || []).map((week: any) => ({
+        firstDay: week.firstDay,
+        contributionDays: (week.contributionDays || []).map((day: any) => ({
+          color: day.color,
+          contributionCount: day.contributionCount,
+          contributionLevel: day.contributionLevel,
+          date: day.date,
+          weekday: day.weekday,
+        })),
+      })),
+    };
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const axiosError = error as AxiosError;
+      if (axiosError.response?.status === 401) {
+        throw new Error('Invalid or expired GitHub access token');
+      }
+      if (axiosError.response?.status === 403) {
+        const remaining = axiosError.response.headers['x-ratelimit-remaining'];
+        if (remaining === '0') {
+          throw new Error('GitHub API rate limit exceeded. Please try again later.');
+        }
+      }
+    }
+
+    throw error;
+  }
 }
 
 /**
@@ -401,6 +506,19 @@ export async function syncGitHubData(
     const totalStars = repos.reduce((sum, repo) => sum + repo.stargazers_count, 0);
     const totalForks = repos.reduce((sum, repo) => sum + repo.forks_count, 0);
 
+    let contributionCalendar: GitHubContributionCalendar | null = null;
+    try {
+      contributionCalendar = await getGitHubContributionCalendar(profile.login, accessToken);
+      console.log(
+        `Fetched ${contributionCalendar.totalContributions} GitHub contributions for ${profile.login}`
+      );
+    } catch (error) {
+      console.warn(
+        `Failed to fetch contribution calendar for ${profile.login}:`,
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+    }
+
     // Convert languageStats array to object format for JSON storage
     const topLanguagesObject: Record<string, { bytes: number; percentage: number }> = {};
     for (const stat of languageStats) {
@@ -422,6 +540,7 @@ export async function syncGitHubData(
         following: profile.following,
         topLanguages: topLanguagesObject,
         topRepos: topRepos as any,
+        ...(contributionCalendar ? { contributionData: contributionCalendar as any } : {}),
         lastCalculatedAt: new Date(),
       },
       update: {
@@ -432,6 +551,7 @@ export async function syncGitHubData(
         following: profile.following,
         topLanguages: topLanguagesObject,
         topRepos: topRepos as any,
+        ...(contributionCalendar ? { contributionData: contributionCalendar as any } : {}),
         lastCalculatedAt: new Date(),
       },
     });
@@ -482,4 +602,3 @@ export async function syncGitHubData(
     };
   }
 }
-

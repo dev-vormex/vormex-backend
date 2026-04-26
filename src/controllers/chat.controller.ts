@@ -4,6 +4,8 @@ import { prisma, prismaRead } from '../config/prisma';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { enqueueOutboxEvent } from '../outbox/service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from '../outbox/helpers';
+import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
+import { emitRealtimeEnvelopes } from '../infrastructure/realtime/emitter';
 import { ensureString } from '../utils/request.util';
 import { isPrismaConnectionError } from '../utils/prisma-error.util';
 
@@ -540,6 +542,35 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       []
     );
 
+    const realtimeEnvelopes: RealtimeEnvelope[] = [
+      {
+        event: 'chat:new_message',
+        rooms: [`chat:${conversationId}`],
+        payload: {
+          conversationId,
+          message: messagePayload,
+        },
+      },
+      {
+        event: 'chat:new_message',
+        users: [String(req.user.userId)],
+        payload: {
+          conversationId,
+          message: messagePayload,
+        },
+      },
+      {
+        event: 'chat:notification',
+        users: [receiverId],
+        payload: {
+          type: 'new_message',
+          conversationId,
+          message: messagePayload,
+          sender,
+        },
+      },
+    ];
+
     await prisma.$transaction(async (tx) => {
       await tx.messages.create({
         data: {
@@ -571,34 +602,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
         eventType: 'chat.message.created',
         queueName: queueNames.realtimeFanout,
         payload: {
-          envelopes: [
-            {
-              event: 'chat:new_message',
-              rooms: [`chat:${conversationId}`],
-              payload: {
-                conversationId,
-                message: messagePayload,
-              },
-            },
-            {
-              event: 'chat:new_message',
-              users: [String(req.user!.userId)],
-              payload: {
-                conversationId,
-                message: messagePayload,
-              },
-            },
-            {
-              event: 'chat:notification',
-              users: [receiverId],
-              payload: {
-                type: 'new_message',
-                conversationId,
-                message: messagePayload,
-                sender,
-              },
-            },
-          ],
+          envelopes: realtimeEnvelopes,
         },
       });
 
@@ -638,6 +642,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       timeout: 15_000,
     });
 
+    emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(201).json(messagePayload);
   } catch (error) {
     console.error('sendMessage error:', error);
@@ -658,6 +663,7 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
     const now = new Date();
+    let realtimeEnvelopes: RealtimeEnvelope[] = [];
     const result = await prisma.$transaction(async (tx) => {
       const conversation = await tx.conversations.findFirst({
         where: {
@@ -694,25 +700,27 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       const payload = {
         conversationId,
         readBy: req.user!.userId,
-        readAt: now,
+        readAt: now.toISOString(),
       };
+
+      realtimeEnvelopes = [
+        {
+          event: 'chat:messages_read',
+          rooms: [`chat:${conversationId}`],
+          payload,
+        },
+        {
+          event: 'chat:messages_read',
+          users: [senderId],
+          payload,
+        },
+      ];
 
       await enqueueRealtimeFanout(tx as any, {
         aggregateType: 'conversation',
         aggregateId: conversationId,
         eventType: 'chat.messages.read',
-        envelopes: [
-          {
-            event: 'chat:messages_read',
-            rooms: [`chat:${conversationId}`],
-            payload,
-          },
-          {
-            event: 'chat:messages_read',
-            users: [senderId],
-            payload,
-          },
-        ],
+        envelopes: realtimeEnvelopes,
       });
 
       await enqueueCacheInvalidation(tx as any, {
@@ -736,6 +744,7 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({
       updatedCount: result.updatedCount,
       readAt: now.toISOString(),
@@ -774,6 +783,19 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    const realtimeEnvelopes: RealtimeEnvelope[] = [
+      {
+        event: 'chat:message_deleted',
+        rooms: [`chat:${message.conversationId}`],
+        payload: {
+          messageId,
+          conversationId: message.conversationId,
+          deletedBy: req.user.userId,
+          forEveryone: Boolean(forEveryone),
+        },
+      },
+    ];
+
     await prisma.$transaction(async (tx) => {
       if (forEveryone) {
         await tx.messages.update({
@@ -790,18 +812,7 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
         aggregateType: 'message',
         aggregateId: messageId,
         eventType: 'chat.message.deleted',
-        envelopes: [
-          {
-            event: 'chat:message_deleted',
-            rooms: [`chat:${message.conversationId}`],
-            payload: {
-              messageId,
-              conversationId: message.conversationId,
-              deletedBy: req.user!.userId,
-              forEveryone: Boolean(forEveryone),
-            },
-          },
-        ],
+        envelopes: realtimeEnvelopes,
       });
 
       await enqueueCacheInvalidation(tx as any, {
@@ -812,6 +823,7 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
       });
     });
 
+    emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('deleteMessage error:', error);
@@ -903,6 +915,7 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       where: { id: req.user.userId },
       select: userSelect,
     });
+    let realtimeEnvelopes: RealtimeEnvelope[] = [];
     const updated = await prisma.$transaction(async (tx) => {
       const nextMessage = await tx.messages.update({
         where: { id: messageId },
@@ -919,22 +932,24 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
         },
       });
 
+      realtimeEnvelopes = [
+        {
+          event: 'chat:message_edited',
+          rooms: [`chat:${nextMessage.conversationId}`],
+          payload: {
+            messageId: nextMessage.id,
+            conversationId: nextMessage.conversationId,
+            content: nextMessage.content,
+            editedAt: nextMessage.updatedAt.toISOString(),
+          },
+        },
+      ];
+
       await enqueueRealtimeFanout(tx as any, {
         aggregateType: 'message',
         aggregateId: messageId,
         eventType: 'chat.message.edited',
-        envelopes: [
-          {
-            event: 'chat:message_edited',
-            rooms: [`chat:${nextMessage.conversationId}`],
-            payload: {
-              messageId: nextMessage.id,
-              conversationId: nextMessage.conversationId,
-              content: nextMessage.content,
-              editedAt: nextMessage.updatedAt,
-            },
-          },
-        ],
+        envelopes: realtimeEnvelopes,
       });
 
       await enqueueCacheInvalidation(tx as any, {
@@ -947,6 +962,7 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       return nextMessage;
     });
 
+    emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json(mapMessagePayload(updated, sender, []));
   } catch (error) {
     console.error('editMessage error:', error);
@@ -991,8 +1007,23 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
       },
     });
 
+    const buildReactionEnvelopes = (action: 'added' | 'removed' | 'updated'): RealtimeEnvelope[] => [
+      {
+        event: 'chat:message_reaction',
+        rooms: [`chat:${message.conversationId}`],
+        payload: {
+          messageId,
+          conversationId: message.conversationId,
+          userId: req.user!.userId,
+          emoji,
+          action,
+        },
+      },
+    ];
+
     if (existingReaction) {
       if (existingReaction.emoji === emoji) {
+        const realtimeEnvelopes = buildReactionEnvelopes('removed');
         await prisma.$transaction(async (tx) => {
           await tx.message_reactions.delete({
             where: { id: existingReaction.id },
@@ -1002,24 +1033,14 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
             aggregateType: 'message',
             aggregateId: messageId,
             eventType: 'chat.message.reaction.removed',
-            envelopes: [
-              {
-                event: 'chat:message_reaction',
-                rooms: [`chat:${message.conversationId}`],
-                payload: {
-                  messageId,
-                  conversationId: message.conversationId,
-                  userId: req.user!.userId,
-                  emoji,
-                  action: 'removed',
-                },
-              },
-            ],
+            envelopes: realtimeEnvelopes,
           });
         });
+        emitRealtimeEnvelopes(realtimeEnvelopes);
         res.status(200).json({ action: 'removed', emoji });
         return;
       } else {
+        const realtimeEnvelopes = buildReactionEnvelopes('updated');
         await prisma.$transaction(async (tx) => {
           await tx.message_reactions.update({
             where: { id: existingReaction.id },
@@ -1030,26 +1051,16 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
             aggregateType: 'message',
             aggregateId: messageId,
             eventType: 'chat.message.reaction.updated',
-            envelopes: [
-              {
-                event: 'chat:message_reaction',
-                rooms: [`chat:${message.conversationId}`],
-                payload: {
-                  messageId,
-                  conversationId: message.conversationId,
-                  userId: req.user!.userId,
-                  emoji,
-                  action: 'updated',
-                },
-              },
-            ],
+            envelopes: realtimeEnvelopes,
           });
         });
+        emitRealtimeEnvelopes(realtimeEnvelopes);
         res.status(200).json({ action: 'updated', emoji });
         return;
       }
     }
 
+    const realtimeEnvelopes = buildReactionEnvelopes('added');
     await prisma.$transaction(async (tx) => {
       await tx.message_reactions.create({
         data: {
@@ -1064,22 +1075,11 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
         aggregateType: 'message',
         aggregateId: messageId,
         eventType: 'chat.message.reaction.added',
-        envelopes: [
-          {
-            event: 'chat:message_reaction',
-            rooms: [`chat:${message.conversationId}`],
-            payload: {
-              messageId,
-              conversationId: message.conversationId,
-              userId: req.user!.userId,
-              emoji,
-              action: 'added',
-            },
-          },
-        ],
+        envelopes: realtimeEnvelopes,
       });
     });
 
+    emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ action: 'added', emoji });
   } catch (error) {
     console.error('addReaction error:', error);

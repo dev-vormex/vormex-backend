@@ -19,6 +19,14 @@ interface NotificationPayload {
   imageUrl?: string;
 }
 
+interface ProfileViewPushPayload {
+  title: string;
+  body: string;
+  viewerId: string;
+  batchKey: string;
+  viewerCount: number;
+}
+
 // Firebase Admin SDK for push notifications
 import * as admin from 'firebase-admin';
 let firebaseInitialized = false;
@@ -317,6 +325,68 @@ class PushNotificationService {
     });
   }
 
+  async pushGroupMessage(
+    userId: string,
+    groupName: string,
+    senderName: string,
+    preview: string,
+    groupId: string,
+    senderId?: string,
+    groupImage?: string,
+    senderImage?: string
+  ): Promise<boolean> {
+    const messagePreview = preview.length > 100 ? preview.substring(0, 97) + '...' : preview;
+
+    return this.sendToUser(userId, {
+      title: groupName,
+      body: `${senderName}: ${messagePreview}`,
+      imageUrl: groupImage,
+      data: {
+        type: 'group_message',
+        groupId,
+        groupName,
+        groupImage: groupImage || '',
+        senderId: senderId || '',
+        senderName,
+        senderImage: senderImage || '',
+        messagePreview,
+        screen: 'group_chat',
+      },
+    });
+  }
+
+  async pushGroupMessageToUsers(
+    userIds: string[],
+    groupName: string,
+    senderName: string,
+    preview: string,
+    groupId: string,
+    senderId?: string,
+    groupImage?: string,
+    senderImage?: string
+  ): Promise<number> {
+    const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
+    let successCount = 0;
+
+    for (const userId of uniqueUserIds) {
+      const sent = await this.pushGroupMessage(
+        userId,
+        groupName,
+        senderName,
+        preview,
+        groupId,
+        senderId,
+        groupImage,
+        senderImage
+      );
+      if (sent) {
+        successCount++;
+      }
+    }
+
+    return successCount;
+  }
+
   async pushStudyGroupInvite(userId: string, groupName: string, inviterName: string, groupId: string): Promise<boolean> {
     return this.sendToUser(userId, {
       title: '📚 Study Group Invite',
@@ -329,13 +399,16 @@ class PushNotificationService {
     });
   }
 
-  async pushProfileView(userId: string, viewerName: string, viewerId: string): Promise<boolean> {
+  async pushProfileView(userId: string, payload: ProfileViewPushPayload): Promise<boolean> {
     return this.sendToUser(userId, {
-      title: '👀 Profile View',
-      body: `${viewerName} checked out your profile`,
+      title: payload.title,
+      body: payload.body,
       data: {
         type: 'profile_view',
-        viewerId,
+        viewerId: payload.viewerId,
+        actorId: payload.viewerId,
+        notificationBatchKey: payload.batchKey,
+        viewerCount: String(payload.viewerCount),
         screen: 'profile',
       },
     });

@@ -1,6 +1,9 @@
 import { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from '../types/auth.types';
-import { getPremiumAccessSnapshot } from '../services/premium-access.service';
+import {
+  getAgentAccessDeniedMessage,
+  getPremiumAccessSnapshot,
+} from '../services/premium-access.service';
 
 export async function requireAgentAccess(
   req: AuthenticatedRequest,
@@ -17,7 +20,8 @@ export async function requireAgentAccess(
     const snapshot = await getPremiumAccessSnapshot(userId);
     if (!snapshot.canUseAgent) {
       res.status(403).json({
-        error: 'AI Agent access is not enabled for this account yet.',
+        error: getAgentAccessDeniedMessage(snapshot),
+        code: snapshot.agentLimitReached ? 'agent_limit_reached' : 'agent_access_disabled',
       });
       return;
     }

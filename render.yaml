@@ -5,7 +5,7 @@ services:
     plan: starter
     buildCommand: npm ci && npm run build
     preDeployCommand: npm run migrate:deploy
-    startCommand: node dist/api.js
+    startCommand: npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV

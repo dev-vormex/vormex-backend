@@ -1643,6 +1643,7 @@ model stories {
   visibility      String        @default("PUBLIC")
   linkUrl         String?
   linkTitle       String?
+  musicMetadata   Json?
   viewsCount      Int           @default(0)
   reactionsCount  Int           @default(0)
   expiresAt       DateTime

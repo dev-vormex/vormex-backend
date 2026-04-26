@@ -4,6 +4,7 @@ import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { bunnyStorageService } from '../services/bunny-storage.service';
 import { getIO } from '../sockets';
+import { parseStoredMusicAttachment } from '../utils/music.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -11,7 +12,28 @@ interface AuthRequest extends Request {
 
 const STORY_EXPIRY_HOURS = 24;
 
+function getStoryViewsCount(story: any) {
+  return story?._count?.story_views ?? story?.viewsCount ?? 0;
+}
+
+async function syncStoryViewsCount(storyId: string, currentViewsCount?: number) {
+  const viewsCount = await prisma.story_views.count({
+    where: { storyId },
+  });
+
+  if ((currentViewsCount ?? 0) !== viewsCount) {
+    await prisma.stories.update({
+      where: { id: storyId },
+      data: { viewsCount },
+    });
+  }
+
+  return viewsCount;
+}
+
 function mapStoryToResponse(story: any, currentUserId?: string) {
+  const music = parseStoredMusicAttachment(story.musicMetadata);
+
   return {
     id: story.id,
     mediaUrl: story.mediaUrl || '',
@@ -25,13 +47,14 @@ function mapStoryToResponse(story: any, currentUserId?: string) {
     textStyle: null,
     stickers: null,
     filters: null,
-    musicUrl: null,
-    musicTitle: null,
-    musicArtist: null,
+    music,
+    musicUrl: music?.audioUrl ?? null,
+    musicTitle: music?.title ?? null,
+    musicArtist: music?.artist ?? null,
     linkUrl: story.linkUrl,
     linkTitle: story.linkTitle,
     visibility: story.visibility,
-    viewsCount: story.viewsCount || 0,
+    viewsCount: getStoryViewsCount(story),
     reactionsCount: story.reactionsCount || 0,
     repliesCount: 0,
     isViewed: false,
@@ -81,6 +104,11 @@ export const getStoriesFeed = async (req: AuthRequest, res: Response): Promise<v
             name: true,
             profileImage: true,
             headline: true,
+          },
+        },
+        _count: {
+          select: {
+            story_views: true,
           },
         },
       },
@@ -136,6 +164,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
     let visibility = 'PUBLIC';
     let linkUrl: string | null = null;
     let linkTitle: string | null = null;
+    let musicMetadata: any = null;
 
     // Handle FormData (media upload)
     const file = req.file as Express.Multer.File | undefined;
@@ -159,6 +188,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
       visibility = (req.body.visibility as string) || 'PUBLIC';
       linkUrl = (req.body.linkUrl as string) || null;
       linkTitle = (req.body.linkTitle as string) || null;
+      musicMetadata = parseStoredMusicAttachment(req.body.music);
     } else {
       // JSON body (text-only story)
       const body = req.body as Record<string, any>;
@@ -169,6 +199,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
       visibility = (body.visibility as string) || 'PUBLIC';
       linkUrl = (body.linkUrl as string) || null;
       linkTitle = (body.linkTitle as string) || null;
+      musicMetadata = parseStoredMusicAttachment(body.music);
 
       if (!textContent && mediaType === 'TEXT') {
         res.status(400).json({ error: 'Text content is required for text stories' });
@@ -189,6 +220,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
         visibility,
         linkUrl,
         linkTitle,
+        musicMetadata,
         expiresAt,
       },
       include: {
@@ -211,7 +243,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
     if (io) {
       io.emit('story:created', {
         story: storyData,
-        author: story.users,
+        author: (story as any).users,
         timestamp: story.createdAt,
       });
     }
@@ -235,7 +267,14 @@ export const getStory = async (req: AuthRequest, res: Response): Promise<void> =
 
     const story = await prisma.stories.findFirst({
       where: { id: storyId, expiresAt: { gt: new Date() } },
-      include: { users: { select: { id: true, username: true, name: true, profileImage: true, headline: true } } },
+      include: {
+        users: { select: { id: true, username: true, name: true, profileImage: true, headline: true } },
+        _count: {
+          select: {
+            story_views: true,
+          },
+        },
+      },
     });
 
     if (!story) {
@@ -266,6 +305,13 @@ export const getMyStories = async (req: AuthRequest, res: Response): Promise<voi
 
     const stories = await prisma.stories.findMany({
       where,
+      include: {
+        _count: {
+          select: {
+            story_views: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -325,6 +371,11 @@ export const getUserStories = async (req: AuthRequest, res: Response): Promise<v
       },
       include: {
         users: { select: { id: true, username: true, name: true, profileImage: true, headline: true } },
+        _count: {
+          select: {
+            story_views: true,
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -371,7 +422,8 @@ export const viewStory = async (req: AuthRequest, res: Response): Promise<void> 
 
     // Don't count owner views
     if (story.authorId === viewerId) {
-      res.json({ message: 'Story viewed (own story)', viewsCount: story.viewsCount, isNewView: false });
+      const viewsCount = await syncStoryViewsCount(storyId, story.viewsCount);
+      res.json({ message: 'Story viewed (own story)', viewsCount, isNewView: false });
       return;
     }
 
@@ -395,15 +447,10 @@ export const viewStory = async (req: AuthRequest, res: Response): Promise<void> 
       }
     }
 
-    // Update view count only if this is a new view
-    let viewsCount = story.viewsCount;
-    if (isNewView) {
-      const updated = await prisma.stories.update({
-        where: { id: storyId },
-        data: { viewsCount: { increment: 1 } },
-      });
-      viewsCount = updated.viewsCount;
+    // Keep the denormalized story.viewsCount aligned with actual unique viewer rows.
+    const viewsCount = await syncStoryViewsCount(storyId, story.viewsCount);
 
+    if (isNewView) {
       // Emit real-time view notification to story author
       const io = getIO();
       if (io) {
@@ -455,15 +502,27 @@ export const getStoryViewers = async (req: AuthRequest, res: Response): Promise<
     const cursor = req.query.cursor as string | undefined;
     const limit = parseInt(req.query.limit as string) || 50;
 
-    const views = await prisma.story_views.findMany({
-      where: { storyId },
-      orderBy: { viewedAt: 'desc' },
-      take: limit + 1,
-      ...(cursor && { cursor: { id: cursor }, skip: 1 }),
-    });
+    const [views, totalCount] = await Promise.all([
+      prisma.story_views.findMany({
+        where: { storyId },
+        orderBy: { viewedAt: 'desc' },
+        take: limit + 1,
+        ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+      }),
+      prisma.story_views.count({
+        where: { storyId },
+      }),
+    ]);
 
     const hasMore = views.length > limit;
     const viewsToReturn = hasMore ? views.slice(0, -1) : views;
+
+    if (story.viewsCount !== totalCount) {
+      await prisma.stories.update({
+        where: { id: storyId },
+        data: { viewsCount: totalCount },
+      });
+    }
 
     // Get viewer details
     const viewerIds = viewsToReturn.map((v) => v.viewerId);
@@ -487,7 +546,7 @@ export const getStoryViewers = async (req: AuthRequest, res: Response): Promise<
 
     res.json({
       viewers,
-      totalCount: story.viewsCount,
+      totalCount,
       nextCursor: hasMore ? viewsToReturn[viewsToReturn.length - 1]?.id : null,
       hasMore,
     });

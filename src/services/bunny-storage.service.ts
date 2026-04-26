@@ -17,7 +17,8 @@ export class BunnyStorageService {
   async uploadFile(
     buffer: Buffer,
     path: string,
-    filename: string
+    filename: string,
+    contentType = 'application/octet-stream'
   ): Promise<string> {
     try {
       const fullPath = `${path}/${filename}`;
@@ -27,7 +28,7 @@ export class BunnyStorageService {
       await axios.put(uploadUrl, buffer, {
         headers: {
           'AccessKey': this.apiKey,
-          'Content-Type': 'application/octet-stream',
+          'Content-Type': contentType,
         },
       });
 
@@ -122,4 +123,3 @@ export class BunnyStorageService {
 }
 
 export const bunnyStorageService = new BunnyStorageService();
-

@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import {
   cancelPremiumSubscription,
+  evaluateAgentAccess,
   formatCurrency,
   getPremiumDaysRemaining,
   getPremiumDurationDays,
@@ -362,13 +363,14 @@ export const getPremiumAdminUsers = async (
             },
           },
         });
-        const canUseAgent =
-          user.isAdmin ||
-          (!user.featureAccessOverride?.agentBlocked &&
-            agentMode !== 'disabled' &&
-            (isPremium ||
-              agentMode === 'all' ||
-              (agentMode === 'selected' && Boolean(user.featureAccessOverride?.agentEnabled))));
+        const agentAccess = evaluateAgentAccess({
+          isAdmin: user.isAdmin,
+          isPremium,
+          agentMode,
+          agentEnabled: Boolean(user.featureAccessOverride?.agentEnabled),
+          agentBlocked: Boolean(user.featureAccessOverride?.agentBlocked),
+          creditsUsed,
+        });
 
         return {
           id: user.id,
@@ -386,7 +388,7 @@ export const getPremiumAdminUsers = async (
           premiumDisplayAmount: formatCurrency(premiumAmountMinor, settings.premiumCurrency),
           agentEnabled: Boolean(user.featureAccessOverride?.agentEnabled),
           agentBlocked: Boolean(user.featureAccessOverride?.agentBlocked),
-          canUseAgent,
+          canUseAgent: agentAccess.canUseAgent,
           profileCustomizationGranted: Boolean(
             user.featureAccessOverride?.profileCustomizationGranted
           ),

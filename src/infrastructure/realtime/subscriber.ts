@@ -1,6 +1,7 @@
 import type { Server } from 'socket.io';
 import { redisSub } from '../redis/client';
 import { REALTIME_CHANNEL, type RealtimeEnvelope } from './channels';
+import { emitRealtimeEnvelopeToServer } from './emitter';
 import { logger } from '../../lib/logger';
 
 let subscribed = false;
@@ -18,15 +19,7 @@ export async function initializeRealtimeSubscriptions(io: Server): Promise<void>
 
     try {
       const envelope = JSON.parse(message) as RealtimeEnvelope;
-      if (envelope.broadcast) {
-        io.emit(envelope.event, envelope.payload);
-      }
-      for (const room of envelope.rooms || []) {
-        io.to(room).emit(envelope.event, envelope.payload);
-      }
-      for (const userId of envelope.users || []) {
-        io.to(`user:${userId}`).emit(envelope.event, envelope.payload);
-      }
+      emitRealtimeEnvelopeToServer(io, envelope);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.error({

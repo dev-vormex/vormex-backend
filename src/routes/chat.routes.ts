@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { NextFunction, Request, Response, Router } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import {
@@ -23,14 +23,33 @@ import {
 import { uploadChatMedia } from '../controllers/upload.controller';
 
 const router = Router();
+const CHAT_VIDEO_MAX_BYTES = 150 * 1024 * 1024;
 
 // Chat media upload middleware
 const chatUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 25 * 1024 * 1024, // 25 MB limit
+    fileSize: CHAT_VIDEO_MAX_BYTES, // Videos are capped at 90 seconds client-side.
   },
 });
+
+const handleChatUpload = (req: Request, res: Response, next: NextFunction): void => {
+  chatUpload.single('file')(req, res, (error: unknown) => {
+    if (!error) {
+      next();
+      return;
+    }
+
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({
+        error: 'Videos must be 90 seconds or less and under 150 MB. Other files must be under 25 MB.',
+      });
+      return;
+    }
+
+    next(error);
+  });
+};
 
 router.use(authenticate);
 
@@ -51,6 +70,6 @@ router.get('/requests', getMessageRequests);
 router.get('/requests/count', getMessageRequestsCount);
 router.post('/requests/:conversationId/accept', acceptMessageRequest);
 router.delete('/requests/:conversationId', declineMessageRequest);
-router.post('/upload', chatUpload.single('file'), uploadChatMedia);
+router.post('/upload', handleChatUpload, uploadChatMedia);
 
 export default router;

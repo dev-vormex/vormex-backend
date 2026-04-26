@@ -8,6 +8,7 @@ import { prisma } from '../config/prisma';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { enqueueOutboxEvent } from '../outbox/service';
 import { cacheService } from './cache.service';
+import { pushNotificationService } from './push-notification.service';
 
 export type NotificationType = 
   | 'like'
@@ -15,6 +16,7 @@ export type NotificationType =
   | 'comment_reply'
   | 'mention'
   | 'follow'
+  | 'profile_view'
   | 'connection_request'
   | 'connection_accepted'
   | 'reel_like'
@@ -82,6 +84,179 @@ const formatRealtimeNotification = (notification: any) => ({
   createdAt: notification.createdAt.toISOString(),
 });
 
+const PROFILE_VIEW_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+const PROFILE_VIEW_NAME_THRESHOLD = 10;
+const PROFILE_VIEW_BATCH_LIMIT = 15;
+
+const asString = (value: unknown): string | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const asProfileViewers = (value: unknown) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+
+  return value.reduce<Array<{ id: string; name: string }>>((accumulator, item) => {
+    const id = asString(item?.id);
+    const name = asString(item?.name);
+
+    if (!id || !name || seen.has(id)) {
+      return accumulator;
+    }
+
+    seen.add(id);
+    accumulator.push({ id, name });
+    return accumulator;
+  }, []);
+};
+
+const asDate = (value: unknown): Date | null => {
+  const normalized = asString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const normalizeProfileViewViewerName = (name?: string | null) => {
+  const trimmed = asString(name);
+  return trimmed || 'Someone';
+};
+
+const parseProfileViewNotificationData = (notification: any) => {
+  const data = notification?.data && typeof notification.data === 'object'
+    ? notification.data
+    : {};
+  const viewers = asProfileViewers(data.viewers);
+  const fallbackActorId = asString(notification?.actorId);
+  const fallbackActorName =
+    normalizeProfileViewViewerName(
+      notification?.users_notifications_actorIdTousers?.name ||
+      notification?.users_notifications_actorIdTousers?.username
+    );
+  const normalizedViewers = viewers.length > 0
+    ? viewers
+    : fallbackActorId
+      ? [{ id: fallbackActorId, name: fallbackActorName }]
+      : [];
+
+  const windowStartedAt =
+    asDate(data.windowStartedAt) ||
+    notification?.createdAt ||
+    new Date();
+  const batchKey =
+    asString(data.batchKey) ||
+    asString(data.notificationBatchKey) ||
+    (notification?.id ? `profile_view:${notification.id}` : null) ||
+    `profile_view:${windowStartedAt.getTime()}`;
+
+  return {
+    batchKey,
+    windowStartedAt,
+    viewers: normalizedViewers,
+  };
+};
+
+const formatProfileViewNames = (names: string[]) => {
+  if (names.length <= 0) {
+    return 'Someone';
+  }
+
+  if (names.length === 1) {
+    return names[0];
+  }
+
+  if (names.length === 2) {
+    return `${names[0]} and ${names[1]}`;
+  }
+
+  return `${names[0]}, ${names[1]}, and ${names.length - 2} others`;
+};
+
+const buildProfileViewNotificationCopy = (
+  viewers: Array<{ id: string; name: string }>
+) => {
+  const viewerCount = viewers.length;
+  const viewerNames = viewers.map((viewer) => viewer.name);
+
+  if (viewerCount <= 1) {
+    return {
+      title: 'Profile view',
+      body: `${viewerNames[0] || 'Someone'} viewed your profile`,
+    };
+  }
+
+  if (viewerCount < PROFILE_VIEW_NAME_THRESHOLD) {
+    return {
+      title: 'Profile views',
+      body: `${formatProfileViewNames(viewerNames)} viewed your profile in the last 3 days`,
+    };
+  }
+
+  return {
+    title: 'Profile views',
+    body: `${viewerCount} people viewed your profile in the last 3 days`,
+  };
+};
+
+const enqueueNotificationCreatedEvents = async (tx: any, notification: any) => {
+  const payload = formatRealtimeNotification(notification);
+
+  await enqueueOutboxEvent(tx as any, {
+    aggregateType: 'notification',
+    aggregateId: notification.id,
+    eventType: 'notification.created',
+    queueName: queueNames.realtimeFanout,
+    payload: {
+      envelopes: [
+        {
+          event: 'notification:new',
+          users: [notification.userId],
+          payload,
+        },
+        {
+          event: `notification:${notification.type}`,
+          users: [notification.userId],
+          payload: {
+            notificationId: notification.id,
+            actor: payload.actor,
+            post: payload.post,
+            reel: payload.reel,
+            data: notification.data,
+          },
+        },
+      ],
+    },
+  });
+};
+
+const enqueueNotificationCacheInvalidation = async (
+  tx: any,
+  userId: string,
+  notificationId: string,
+  eventType: string = 'notification.cache.invalidate'
+) => {
+  await enqueueOutboxEvent(tx as any, {
+    aggregateType: 'notification',
+    aggregateId: notificationId,
+    eventType,
+    queueName: queueNames.cacheInvalidation,
+    payload: {
+      tags: [`notifications:${userId}`],
+    },
+  });
+};
+
 export const collapseInboxNotifications = (notifications: any[] = []) => {
   const seenConnectionRequests = new Set<string>();
 
@@ -130,47 +305,153 @@ class NotificationService {
           include: notificationInclude,
         });
 
-        const payload = formatRealtimeNotification(notification);
-
-        await enqueueOutboxEvent(tx as any, {
-          aggregateType: 'notification',
-          aggregateId: notification.id,
-          eventType: 'notification.created',
-          queueName: queueNames.realtimeFanout,
-          payload: {
-            envelopes: [
-              {
-                event: 'notification:new',
-                users: [userId],
-                payload,
-              },
-              {
-                event: `notification:${type}`,
-                users: [userId],
-                payload: {
-                  notificationId: notification.id,
-                  actor: payload.actor,
-                  post: payload.post,
-                  reel: payload.reel,
-                  data: notification.data,
-                },
-              },
-            ],
-          },
-        });
-
-        await enqueueOutboxEvent(tx as any, {
-          aggregateType: 'notification',
-          aggregateId: notification.id,
-          eventType: 'notification.cache.invalidate',
-          queueName: queueNames.cacheInvalidation,
-          payload: {
-            tags: [`notifications:${userId}`],
-          },
-        });
+        await enqueueNotificationCreatedEvents(tx, notification);
+        await enqueueNotificationCacheInvalidation(tx, userId, notification.id);
       });
     } catch (error) {
       console.error('Failed to create notification:', error);
+    }
+  }
+
+  async notifyProfileView(
+    userId: string,
+    viewerId: string,
+    viewerName: string
+  ): Promise<void> {
+    if (!userId || !viewerId || userId === viewerId) {
+      return;
+    }
+
+    const now = new Date();
+    const normalizedViewerName = normalizeProfileViewViewerName(viewerName);
+
+    try {
+      const delivery = await prisma.$transaction(async (tx) => {
+        const recentNotifications = await tx.notifications.findMany({
+          where: {
+            userId,
+            type: 'profile_view',
+          },
+          include: notificationInclude,
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        });
+
+        const activeNotification = recentNotifications.find((notification) => {
+          const parsed = parseProfileViewNotificationData(notification);
+          return (
+            now.getTime() - parsed.windowStartedAt.getTime() <= PROFILE_VIEW_WINDOW_MS &&
+            parsed.viewers.length < PROFILE_VIEW_BATCH_LIMIT
+          );
+        });
+
+        if (activeNotification) {
+          const parsed = parseProfileViewNotificationData(activeNotification);
+
+          if (parsed.viewers.some((viewer) => viewer.id === viewerId)) {
+            return null;
+          }
+
+          const viewers = [
+            { id: viewerId, name: normalizedViewerName },
+            ...parsed.viewers,
+          ].slice(0, PROFILE_VIEW_BATCH_LIMIT);
+          const copy = buildProfileViewNotificationCopy(viewers);
+          const data = {
+            screen: 'profile',
+            batchKey: parsed.batchKey,
+            windowStartedAt: parsed.windowStartedAt.toISOString(),
+            lastViewedAt: now.toISOString(),
+            viewerCount: viewers.length,
+            latestViewerId: viewerId,
+            latestViewerName: normalizedViewerName,
+            viewers,
+          };
+
+          await tx.notifications.update({
+            where: { id: activeNotification.id },
+            data: {
+              title: copy.title,
+              body: copy.body,
+              actorId: viewerId,
+              data,
+              isRead: false,
+              readAt: null,
+              createdAt: now,
+            },
+          });
+
+          await enqueueNotificationCacheInvalidation(
+            tx,
+            userId,
+            activeNotification.id,
+            'notification.profile_view.updated'
+          );
+
+          return {
+            title: copy.title,
+            body: copy.body,
+            batchKey: parsed.batchKey,
+            viewerCount: viewers.length,
+            latestViewerId: viewerId,
+          };
+        }
+
+        const batchKey = `profile_view:${userId}:${now.getTime()}`;
+        const viewers = [{ id: viewerId, name: normalizedViewerName }];
+        const copy = buildProfileViewNotificationCopy(viewers);
+        const notification = await tx.notifications.create({
+          data: {
+            userId,
+            type: 'profile_view',
+            title: copy.title,
+            body: copy.body,
+            actorId: viewerId,
+            createdAt: now,
+            data: {
+              screen: 'profile',
+              batchKey,
+              windowStartedAt: now.toISOString(),
+              lastViewedAt: now.toISOString(),
+              viewerCount: 1,
+              latestViewerId: viewerId,
+              latestViewerName: normalizedViewerName,
+              viewers,
+            },
+          },
+          include: notificationInclude,
+        });
+
+        await enqueueNotificationCreatedEvents(tx, notification);
+        await enqueueNotificationCacheInvalidation(
+          tx,
+          userId,
+          notification.id,
+          'notification.profile_view.created'
+        );
+
+        return {
+          title: copy.title,
+          body: copy.body,
+          batchKey,
+          viewerCount: 1,
+          latestViewerId: viewerId,
+        };
+      });
+
+      if (!delivery) {
+        return;
+      }
+
+      await pushNotificationService.pushProfileView(userId, {
+        title: delivery.title,
+        body: delivery.body,
+        viewerId: delivery.latestViewerId,
+        batchKey: delivery.batchKey,
+        viewerCount: delivery.viewerCount,
+      });
+    } catch (error) {
+      console.error('Failed to send profile view notification:', error);
     }
   }
 

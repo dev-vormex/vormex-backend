@@ -21,6 +21,12 @@ import {
   deleteReel,
   getGroups,
   deleteGroup,
+  getAdminGroupMembers,
+  updateAdminGroupMemberRole,
+  removeAdminGroupMember,
+  clearAdminGroupChat,
+  getChatStorageSummary,
+  clearAllChats,
   getReports,
   getReportStats,
   getReportById,
@@ -91,6 +97,14 @@ router.delete('/reels/:id', deleteReel);
 // Groups
 router.get('/groups', getGroups);
 router.delete('/groups/:id', deleteGroup);
+router.get('/groups/:id/members', getAdminGroupMembers);
+router.patch('/groups/:id/members/:userId', updateAdminGroupMemberRole);
+router.delete('/groups/:id/members/:userId', removeAdminGroupMember);
+router.post('/groups/:id/clear-chat', clearAdminGroupChat);
+
+// Chat storage
+router.get('/chats/storage', getChatStorageSummary);
+router.post('/chats/clear', clearAllChats);
 
 // Reports (stats before :id)
 router.get('/reports/stats', getReportStats);
