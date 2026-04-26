@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { spendCoins } from '../services/progress.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -80,6 +81,7 @@ function serializeStoreItem(item: StoreCatalogItem) {
   return {
     ...item,
     price: item.xpCost,
+    coinsCost: item.xpCost,
     isAvailable: item.isActive,
   };
 }
@@ -183,7 +185,7 @@ export const purchaseItem = async (req: AuthRequest, res: Response): Promise<voi
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { xpBalance: true },
+      select: { id: true },
     });
 
     if (!user) {
@@ -206,38 +208,29 @@ export const purchaseItem = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    if (user.xpBalance < item.xpCost) {
-      res.status(400).json({ error: 'Not enough XP balance' });
-      return;
-    }
-
-    const newBalance = user.xpBalance - item.xpCost;
-
-    await prisma.$transaction([
-      prisma.user.update({
-        where: { id: userId },
-        data: { xpBalance: { decrement: item.xpCost } },
-      }),
-      prisma.xp_transactions.create({
-        data: {
-          userId,
-          amount: -item.xpCost,
-          type: 'store_purchase',
-          source: 'store',
-          sourceId: item.slug,
-          description: `Purchased ${item.name}`,
-        },
-      }),
-    ]);
+    const { newBalance } = await spendCoins({
+      userId,
+      amount: item.xpCost,
+      type: 'store_purchase',
+      source: 'store',
+      sourceId: item.slug,
+      description: `Purchased ${item.name}`,
+    });
 
     res.json({
       success: true,
       message: `${item.name} purchased successfully!`,
       item: serializeStoreItem(item),
+      coinsSpent: item.xpCost,
+      coinsBalance: newBalance,
       xpSpent: item.xpCost,
       newBalance,
     });
   } catch (error) {
+    if (error instanceof Error && error.message === 'Not enough Coins') {
+      res.status(400).json({ error: 'Not enough Coins' });
+      return;
+    }
     res.status(500).json({ error: 'Failed to purchase item' });
   }
 };
@@ -332,6 +325,7 @@ export const getPurchaseHistory = async (req: AuthRequest, res: Response): Promi
           userId: transaction.userId,
           itemId: item.id,
           item: serializeStoreItem(item),
+          coinsSpent: Math.abs(transaction.amount),
           xpSpent: Math.abs(transaction.amount),
           purchasedAt: transaction.createdAt.toISOString(),
         };
@@ -386,7 +380,7 @@ export const activateItem = async (req: AuthRequest, res: Response): Promise<voi
   }
 };
 
-// Get XP balance
+// Get Coins balance
 export const getBalance = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user?.userId;
@@ -398,10 +392,10 @@ export const getBalance = async (req: AuthRequest, res: Response): Promise<void>
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { xpBalance: true },
+      select: { coinsBalance: true, xpBalance: true },
     });
 
-    res.json(user?.xpBalance || 0);
+    res.json(user?.coinsBalance || user?.xpBalance || 0);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch balance' });
   }

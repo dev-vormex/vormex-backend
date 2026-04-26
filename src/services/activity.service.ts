@@ -5,6 +5,12 @@ import type {
   ActivityHeatmapDay,
   ActivitySummary,
 } from '../types/activity.types';
+import {
+  awardActivityProgress,
+  calculateLevelProgress,
+  getLifetimeXp,
+  isMeaningfulActivity,
+} from './progress.service';
 
 /**
  * Get today's date in UTC as YYYY-MM-DD string
@@ -25,14 +31,16 @@ function getTodayDateString(): string {
 export async function recordActivity(
   userId: string,
   activityType: ActivityType,
-  count: number = 1
+  count: number = 1,
+  options: { sourceId?: string | null } = {}
 ): Promise<void> {
   try {
     const today = getTodayDateString();
     const todayDate = new Date(today + 'T00:00:00.000Z');
+    const activityCount = Math.max(0, Math.floor(count || 0));
+    const countsForDailyStreak = activityCount > 0 && isMeaningfulActivity(activityType);
 
-    // Find or create UserDailyActivity for today
-    await prisma.userDailyActivity.findUnique({
+    const existingActivity = await prisma.userDailyActivity.findUnique({
       where: {
         userId_date: {
           userId,
@@ -42,41 +50,43 @@ export async function recordActivity(
     });
 
     // Prepare update data based on activity type
-    const updateData: any = {
-      isActive: true,
-    };
+    const updateData: any = {};
+
+    if (countsForDailyStreak) {
+      updateData.isActive = true;
+    }
 
     switch (activityType) {
       case 'post':
-        updateData.postsCount = { increment: count };
+        updateData.postsCount = { increment: activityCount };
         break;
       case 'article':
-        updateData.articlesCount = { increment: count };
+        updateData.articlesCount = { increment: activityCount };
         break;
       case 'comment':
-        updateData.commentsCount = { increment: count };
+        updateData.commentsCount = { increment: activityCount };
         break;
       case 'forum_question':
-        updateData.forumQuestionsCount = { increment: count };
+        updateData.forumQuestionsCount = { increment: activityCount };
         break;
       case 'forum_answer':
-        updateData.forumAnswersCount = { increment: count };
+        updateData.forumAnswersCount = { increment: activityCount };
         break;
       case 'like':
-        updateData.likesGivenCount = { increment: count };
+        updateData.likesGivenCount = { increment: activityCount };
         break;
       case 'message':
-        updateData.messagesCount = { increment: count };
+        updateData.messagesCount = { increment: activityCount };
         break;
       case 'short_video':
-        updateData.postsCount = { increment: count };
+        updateData.postsCount = { increment: activityCount };
         break;
       case 'connection':
         // Connections mark the day as active but don't increment a counter
         // The connection count is tracked in UserStats.connectionsCount
         break;
       case 'login':
-        // Logins mark the day as active but don't increment a counter
+        // Logins are tracked as a category streak only; they do not preserve Daily Activity Streak.
         break;
       default:
         console.warn(`Unknown activity type: ${activityType}`);
@@ -94,20 +104,30 @@ export async function recordActivity(
       create: {
         userId,
         date: todayDate,
-        ...updateData,
-        postsCount: activityType === 'post' || activityType === 'short_video' ? count : 0,
-        articlesCount: activityType === 'article' ? count : 0,
-        commentsCount: activityType === 'comment' ? count : 0,
-        forumQuestionsCount: activityType === 'forum_question' ? count : 0,
-        forumAnswersCount: activityType === 'forum_answer' ? count : 0,
-        likesGivenCount: activityType === 'like' ? count : 0,
-        messagesCount: activityType === 'message' ? count : 0,
-        isActive: true,
+        postsCount: activityType === 'post' || activityType === 'short_video' ? activityCount : 0,
+        articlesCount: activityType === 'article' ? activityCount : 0,
+        commentsCount: activityType === 'comment' ? activityCount : 0,
+        forumQuestionsCount: activityType === 'forum_question' ? activityCount : 0,
+        forumAnswersCount: activityType === 'forum_answer' ? activityCount : 0,
+        likesGivenCount: activityType === 'like' ? activityCount : 0,
+        messagesCount: activityType === 'message' ? activityCount : 0,
+        isActive: countsForDailyStreak,
       },
-      update: updateData,
+      update: Object.keys(updateData).length > 0
+        ? updateData
+        : { isActive: existingActivity?.isActive ?? false },
     });
 
-    console.log(`Activity recorded: user ${userId}, type: ${activityType}, count: ${count}`);
+    if (countsForDailyStreak) {
+      await awardActivityProgress({
+        userId,
+        activityType,
+        count: activityCount,
+        sourceId: options.sourceId,
+      });
+    }
+
+    console.log(`Activity recorded: user ${userId}, type: ${activityType}, count: ${activityCount}`);
 
     // Trigger stats update asynchronously (don't await)
     updateUserStats(userId).catch((err) =>
@@ -226,17 +246,6 @@ export async function calculateStreak(userId: string): Promise<StreakInfo> {
 }
 
 /**
- * Calculate XP required for next level
- * 
- * @param currentLevel - Current user level
- * @returns XP required to reach next level
- */
-function calculateXpForNextLevel(currentLevel: number): number {
-  // Simple formula: 100 XP per level
-  return (currentLevel + 1) * 100;
-}
-
-/**
  * Update aggregated user statistics
  * Aggregates data from multiple sources and calculates XP/level
  * 
@@ -347,21 +356,8 @@ export async function updateUserStats(userId: string): Promise<any> {
     // Calculate streak
     const streakInfo = await calculateStreak(userId);
 
-    // Calculate XP based on activity
-    // XP = (posts * 10) + (articles * 25) + (comments * 2) + (forumQuestions * 15) + (forumAnswers * 20) + (likesReceived * 1)
-    // Add streak bonus: currentStreak * 5
-    const xp =
-      totalPosts * 10 +
-      totalArticles * 25 +
-      totalComments * 2 +
-      totalForumQuestions * 15 +
-      totalForumAnswers * 20 +
-      totalLikesReceived * 1 +
-      streakInfo.currentStreak * 5;
-
-    // Calculate level from XP
-    // Simple formula: level = Math.floor(xp / 100) + 1 (100 XP per level)
-    const level = Math.floor(xp / 100) + 1;
+    const xp = await getLifetimeXp(userId);
+    const level = calculateLevelProgress(xp).level;
 
     // Upsert UserStats
     const stats = await prisma.userStats.upsert({
@@ -408,7 +404,7 @@ export async function updateUserStats(userId: string): Promise<any> {
     });
 
     console.log(
-      `Stats updated for user ${userId}, XP: ${xp}, Level: ${level}, Streak: ${streakInfo.currentStreak}`
+      `Stats updated for user ${userId}, lifetime XP: ${xp}, Level: ${level}, Streak: ${streakInfo.currentStreak}`
     );
 
     return stats;
@@ -679,8 +675,7 @@ export async function getActivitySummary(userId: string): Promise<ActivitySummar
       stats.totalForumQuestions + stats.totalForumAnswers;
     const totalEngagement = stats.totalLikesReceived + stats.totalComments;
 
-    // Calculate XP to next level
-    const xpToNextLevel = calculateXpForNextLevel(stats.level) - stats.xp;
+    const levelProgress = calculateLevelProgress(stats.xp);
 
     // Build streak info
     const streak: StreakInfo = {
@@ -697,8 +692,8 @@ export async function getActivitySummary(userId: string): Promise<ActivitySummar
       streak,
       xpAndLevel: {
         xp: stats.xp,
-        level: stats.level,
-        xpToNextLevel: Math.max(0, xpToNextLevel), // Ensure non-negative
+        level: levelProgress.level,
+        xpToNextLevel: levelProgress.xpToNextLevel,
       },
     };
   } catch (error) {
@@ -722,4 +717,3 @@ export async function getActivitySummary(userId: string): Promise<ActivitySummar
     };
   }
 }
-

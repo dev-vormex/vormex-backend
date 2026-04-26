@@ -155,8 +155,8 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
     });
 
     // Record activity for both users (non-blocking)
-    recordActivity(req.user.userId, 'connection', 1).catch(console.error);
-    recordActivity(connection.requesterId, 'connection', 1).catch(console.error);
+    recordActivity(req.user.userId, 'connection', 1, { sourceId: connectionId }).catch(console.error);
+    recordActivity(connection.requesterId, 'connection', 1, { sourceId: connectionId }).catch(console.error);
 
     // Update engagement streaks for both users (non-blocking)
     updateEngagementStreak(req.user.userId, 'connection').catch(console.error);

@@ -2,7 +2,10 @@ import { Request, Response } from 'express';
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../config/prisma';
-import { sendPasswordResetEmail } from '../utils/email.util';
+import {
+  isEmailServiceUnavailableError,
+  sendPasswordResetEmail,
+} from '../utils/email.util';
 import {
   ForgotPasswordRequestBody,
   ResetPasswordRequestBody,
@@ -72,6 +75,8 @@ export const forgotPassword = async (
     // Always return success message (security: don't reveal if email exists)
     // Only proceed if user exists and has a password (not OAuth-only user)
     if (user && user.password) {
+      let resetTokenStored = false;
+
       try {
         // Generate secure random token
         const plainToken = crypto.randomBytes(32).toString('hex');
@@ -90,15 +95,40 @@ export const forgotPassword = async (
             resetTokenExpiry,
           },
         });
+        resetTokenStored = true;
 
         // Send email with PLAIN token (user needs unhashed version)
         await sendPasswordResetEmail(trimmedEmail, plainToken);
 
         console.log('Password reset token generated for user:', trimmedEmail);
       } catch (error) {
+        if (resetTokenStored) {
+          try {
+            await prisma.user.update({
+              where: { id: user.id },
+              data: {
+                resetToken: null,
+                resetTokenExpiry: null,
+              },
+            });
+          } catch (rollbackError) {
+            console.error('Failed to rollback password reset token after email failure:', rollbackError);
+          }
+        }
+
         // Log error but still return success message (security)
         console.error('Error processing password reset request:', error);
-        // Don't throw - we still want to return 200 to user
+
+        if (isEmailServiceUnavailableError(error)) {
+          res.status(error.statusCode).json({
+            error: error.message,
+            code: error.code,
+            ...(error.retryAfterSeconds
+              ? { retryAfterSeconds: error.retryAfterSeconds }
+              : {}),
+          });
+          return;
+        }
       }
     }
 
@@ -216,4 +246,3 @@ export const resetPassword = async (
     });
   }
 };
-

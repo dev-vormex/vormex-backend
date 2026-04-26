@@ -2,7 +2,10 @@ import { Request, Response } from 'express';
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../config/prisma';
-import { sendVerificationEmail } from '../utils/email.util';
+import {
+  isEmailServiceUnavailableError,
+  sendVerificationEmail,
+} from '../utils/email.util';
 import {
   ResendVerificationRequestBody,
   ErrorResponse,
@@ -198,7 +201,17 @@ export const resendVerification = async (
       } catch (error) {
         // Log error but still return success message (security)
         console.error('Error processing resend verification request:', error);
-        // Don't throw - we still want to return 200 to user
+
+        if (isEmailServiceUnavailableError(error)) {
+          res.status(error.statusCode).json({
+            error: error.message,
+            code: error.code,
+            ...(error.retryAfterSeconds
+              ? { retryAfterSeconds: error.retryAfterSeconds }
+              : {}),
+          });
+          return;
+        }
       }
     }
 
@@ -214,4 +227,3 @@ export const resendVerification = async (
     });
   }
 };
-

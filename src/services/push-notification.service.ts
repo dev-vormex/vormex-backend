@@ -19,12 +19,29 @@ interface NotificationPayload {
   imageUrl?: string;
 }
 
+interface ReengagementPushPayload {
+  title: string;
+  body: string;
+  campaignType: 'match' | 'growth' | 'streak';
+  data?: Record<string, string>;
+}
+
 interface ProfileViewPushPayload {
   title: string;
   body: string;
   viewerId: string;
   batchKey: string;
   viewerCount: number;
+}
+
+interface RecommendedMatchPushData {
+  actorId?: string;
+  matchReason?: string;
+  matchScore?: string;
+  matchUserId?: string;
+  screen?: string;
+  source?: string;
+  tab?: string;
 }
 
 // Firebase Admin SDK for push notifications
@@ -212,6 +229,39 @@ class PushNotificationService {
         matchCount: String(matchCount),
         screen: 'find_people',
         tab: 'smart_matches',
+      },
+    });
+  }
+
+  async pushRecommendedMatch(
+    userId: string,
+    title: string,
+    body: string,
+    data: RecommendedMatchPushData = {}
+  ): Promise<boolean> {
+    return this.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'recommended_match',
+        screen: 'find_people',
+        tab: 'smart_matches',
+        ...data,
+      },
+    });
+  }
+
+  async pushReengagementNudge(userId: string, payload: ReengagementPushPayload): Promise<boolean> {
+    const type = payload.campaignType === 'streak' ? 'streak_at_risk' : 'daily_match';
+    const screen = payload.campaignType === 'streak' ? 'engagement' : 'find_people';
+
+    return this.sendToUser(userId, {
+      title: payload.title,
+      body: payload.body,
+      data: {
+        type,
+        screen,
+        ...(payload.data || {}),
       },
     });
   }
@@ -409,7 +459,7 @@ class PushNotificationService {
         actorId: payload.viewerId,
         notificationBatchKey: payload.batchKey,
         viewerCount: String(payload.viewerCount),
-        screen: 'profile',
+        screen: 'profile_views',
       },
     });
   }

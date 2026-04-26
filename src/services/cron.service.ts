@@ -1,19 +1,15 @@
 import { prisma } from '../config/prisma';
 import { engagementService } from './engagement.service';
 import { pushNotificationService } from './push-notification.service';
+import { runReengagementCampaign } from './reengagement-notification.service';
 import { socialProofService } from './social-proof.service';
 import { storyService } from './story.service';
 
 export const maintenanceSchedules = [
   {
-    schedulerId: 'daily_match_notifications',
-    jobName: 'daily_match_notifications',
-    pattern: '30 15 * * *',
-  },
-  {
-    schedulerId: 'streak_reminders',
-    jobName: 'streak_reminders',
-    pattern: '30 14 * * *',
+    schedulerId: 'reengagement_campaign_hourly',
+    jobName: 'reengagement_campaign_hourly',
+    pattern: '30 * * * *',
   },
   {
     schedulerId: 'streak_freeze_processing',
@@ -149,10 +145,8 @@ async function runStreakReminders(): Promise<{ sent: number }> {
 
 export async function runMaintenanceJob(jobName: MaintenanceJobName): Promise<unknown> {
   switch (jobName) {
-    case 'daily_match_notifications':
-      return runDailyMatchNotifications();
-    case 'streak_reminders':
-      return runStreakReminders();
+    case 'reengagement_campaign_hourly':
+      return runReengagementCampaign();
     case 'streak_freeze_processing':
       return engagementService.processStreakFreezes();
     case 'weekly_counter_reset':

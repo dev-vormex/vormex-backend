@@ -6,9 +6,38 @@ import { enqueueOutboxEvent } from '../outbox/service';
 import { ensureString } from '../utils/request.util';
 import * as profileService from '../services/profile.service';
 import { getActivityHeatmap, getContributionYears } from '../services/activity.service';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { isUUID } from '../utils/username.util';
 import type { FullProfileResponse, UnifiedFeedResponse } from '../types/profile.types';
 import type { ActivityHeatmapResponse } from '../types/activity.types';
+
+function normalizeProfileField(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.toLowerCase() : null;
+}
+
+function normalizeProfileInterests(values: string[] | null | undefined): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      values
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => value.length > 0)
+    )
+  ).sort();
+}
+
+function profileInterestArraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
 
 /**
  * Get full user profile
@@ -316,6 +345,24 @@ export const updateProfile = async (
       return;
     }
 
+    const shouldCheckMatchSignals = college !== undefined || processedInterests !== undefined;
+    const previousSignalState = shouldCheckMatchSignals
+      ? await prisma.user.findUnique({
+          where: { id: userId },
+          select: {
+            college: true,
+            interests: true,
+          },
+        })
+      : null;
+
+    if (shouldCheckMatchSignals && !previousSignalState) {
+      res.status(404).json({
+        error: 'User not found',
+      });
+      return;
+    }
+
     // Build update object (only include defined fields)
     const updateData: any = {};
     if (name !== undefined) updateData.name = name.trim();
@@ -385,6 +432,21 @@ export const updateProfile = async (
     console.log(
       `Profile updated: ${userId}, fields: ${Object.keys(updateData).join(', ')}`
     );
+
+    const shouldTriggerMatchNotifications =
+      Boolean(previousSignalState) && (
+        (college !== undefined &&
+          normalizeProfileField(previousSignalState?.college) !== normalizeProfileField(updatedUser.college)) ||
+        (processedInterests !== undefined &&
+          !profileInterestArraysEqual(
+            normalizeProfileInterests(previousSignalState?.interests),
+            normalizeProfileInterests(updatedUser.interests)
+          ))
+      );
+
+    if (shouldTriggerMatchNotifications) {
+      queueMatchAvailabilityNotifications(userId, 'profile_update');
+    }
 
     res.status(200).json(updatedUser);
   } catch (error) {

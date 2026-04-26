@@ -25,6 +25,10 @@ interface LeaderboardParams {
     userId?: string;
 }
 
+function normalizeCollege(value?: string | null) {
+    return value?.trim().toLowerCase() || null;
+}
+
 class SocialProofService {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // CONTROLLER METHODS
@@ -64,21 +68,46 @@ class SocialProofService {
                     },
                 });
 
-                return tx.user.findUnique({
+                const [viewer, viewedUser] = await Promise.all([
+                    tx.user.findUnique({
                     where: { id: viewerId },
                     select: {
                         id: true,
                         name: true,
                         username: true,
+                        college: true,
                     },
-                });
+                    }),
+                    tx.user.findUnique({
+                        where: { id: viewedId },
+                        select: {
+                            college: true,
+                        },
+                    }),
+                ]);
+
+                if (!viewer) {
+                    return null;
+                }
+
+                return {
+                    id: viewer.id,
+                    name: viewer.name,
+                    username: viewer.username,
+                    sameCollege:
+                        !!normalizeCollege(viewer.college) &&
+                        normalizeCollege(viewer.college) === normalizeCollege(viewedUser?.college),
+                };
             });
 
             if (payload) {
                 await notificationService.notifyProfileView(
                     viewedId,
-                    payload.id,
-                    payload.name || payload.username || 'Someone'
+                    {
+                        id: payload.id,
+                        name: payload.name || payload.username || 'Someone',
+                        sameCollege: payload.sameCollege,
+                    }
                 );
             }
         } catch (error) {
@@ -89,13 +118,19 @@ class SocialProofService {
 
     /** Get profile view statistics for a user */
     async getProfileViewStats(userId: string) {
-        const today = new Date();
+        const now = new Date();
+        const today = new Date(now);
         today.setHours(0, 0, 0, 0);
 
-        const weekAgo = new Date(today);
-        weekAgo.setDate(weekAgo.getDate() - 7);
+        const lastHour = new Date(now.getTime() - 60 * 60 * 1000);
+        const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const previousWeekStart = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
 
-        const [totalViews, todayViews, weeklyViews] = await Promise.all([
+        const [profileOwner, totalViews, todayViews, weeklyViews, lastHourViews, previousWeekViews, recentViews, uniqueViewers] = await Promise.all([
+            prisma.user.findUnique({
+                where: { id: userId },
+                select: { college: true },
+            }),
             prisma.profile_views.count({ where: { viewedId: userId } }),
             prisma.profile_views.count({
                 where: { viewedId: userId, viewedAt: { gte: today } },
@@ -103,13 +138,171 @@ class SocialProofService {
             prisma.profile_views.count({
                 where: { viewedId: userId, viewedAt: { gte: weekAgo } },
             }),
+            prisma.profile_views.count({
+                where: { viewedId: userId, viewedAt: { gte: lastHour } },
+            }),
+            prisma.profile_views.count({
+                where: {
+                    viewedId: userId,
+                    viewedAt: {
+                        gte: previousWeekStart,
+                        lt: weekAgo,
+                    },
+                },
+            }),
+            prisma.profile_views.findMany({
+                where: { viewedId: userId },
+                orderBy: { viewedAt: 'desc' },
+                take: 24,
+                include: {
+                    users_profile_views_viewerIdTousers: {
+                        select: {
+                            id: true,
+                            name: true,
+                            username: true,
+                            profileImage: true,
+                            college: true,
+                            headline: true,
+                        },
+                    },
+                },
+            }),
+            prisma.profile_views.findMany({
+                where: { viewedId: userId },
+                distinct: ['viewerId'],
+                select: { viewerId: true },
+            }),
         ]);
+
+        const seenViewerIds = new Set<string>();
+        const recentViewers = recentViews.reduce<any[]>((accumulator, view) => {
+            if (seenViewerIds.has(view.viewerId)) {
+                return accumulator;
+            }
+
+            seenViewerIds.add(view.viewerId);
+            accumulator.push({
+                id: view.id,
+                viewedAt: view.viewedAt.toISOString(),
+                source: view.source || null,
+                viewer: {
+                    id: view.users_profile_views_viewerIdTousers.id,
+                    name: view.users_profile_views_viewerIdTousers.name,
+                    username: view.users_profile_views_viewerIdTousers.username,
+                    profileImage: view.users_profile_views_viewerIdTousers.profileImage,
+                    college: view.users_profile_views_viewerIdTousers.college,
+                    headline: view.users_profile_views_viewerIdTousers.headline,
+                    isSameCollege:
+                        !!normalizeCollege(profileOwner?.college) &&
+                        normalizeCollege(profileOwner?.college) ===
+                            normalizeCollege(view.users_profile_views_viewerIdTousers.college),
+                },
+            });
+            return accumulator;
+        }, []);
+
+        const weeklyDelta = weeklyViews - previousWeekViews;
+        const trendPercent =
+            previousWeekViews > 0
+                ? Math.round((weeklyDelta / previousWeekViews) * 100)
+                : weeklyViews > 0
+                    ? 100
+                    : 0;
+        const trendDirection = weeklyDelta < 0 ? 'down' : 'up';
 
         return {
             totalViews,
             todayViews,
             weeklyViews,
-            trend: weeklyViews > 0 ? 'up' : 'stable',
+            trend: weeklyDelta > 0 ? 'up' : weeklyDelta < 0 ? 'down' : 'stable',
+            viewsToday: todayViews,
+            viewsLastHour: lastHourViews,
+            viewsThisWeek: weeklyViews,
+            trendPercent,
+            trendDirection,
+            recentViewers,
+            viewerCount: uniqueViewers.length,
+        };
+    }
+
+    async getProfileViewHistory(userId: string, page: number = 1, limit: number = 50) {
+        const safePage = Number.isFinite(page) ? Math.max(1, page) : 1;
+        const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 50;
+        const skip = (safePage - 1) * safeLimit;
+
+        const [profileOwner, groupedViews, distinctViewers, totalViews] = await Promise.all([
+            prisma.user.findUnique({
+                where: { id: userId },
+                select: { college: true },
+            }),
+            prisma.profile_views.groupBy({
+                by: ['viewerId'],
+                where: { viewedId: userId },
+                _count: { _all: true },
+                _max: { viewedAt: true },
+                _min: { viewedAt: true },
+                orderBy: {
+                    _max: {
+                        viewedAt: 'desc',
+                    },
+                },
+                skip,
+                take: safeLimit,
+            }),
+            prisma.profile_views.findMany({
+                where: { viewedId: userId },
+                distinct: ['viewerId'],
+                select: { viewerId: true },
+            }),
+            prisma.profile_views.count({
+                where: { viewedId: userId },
+            }),
+        ]);
+
+        const viewerIds = groupedViews.map((entry) => entry.viewerId);
+        const viewers = viewerIds.length > 0
+            ? await prisma.user.findMany({
+                where: { id: { in: viewerIds } },
+                select: {
+                    id: true,
+                    name: true,
+                    username: true,
+                    profileImage: true,
+                    college: true,
+                    headline: true,
+                },
+            })
+            : [];
+        const viewerMap = new Map(viewers.map((viewer) => [viewer.id, viewer]));
+
+        return {
+            page: safePage,
+            limit: safeLimit,
+            totalCount: distinctViewers.length,
+            totalViews,
+            hasMore: skip + groupedViews.length < distinctViewers.length,
+            viewers: groupedViews.map((entry) => {
+                const viewer = viewerMap.get(entry.viewerId);
+                return {
+                    viewerId: entry.viewerId,
+                    lastViewedAt: entry._max.viewedAt?.toISOString() || new Date().toISOString(),
+                    firstViewedAt: entry._min.viewedAt?.toISOString() || new Date().toISOString(),
+                    viewCount: entry._count._all,
+                    isSameCollege:
+                        !!normalizeCollege(profileOwner?.college) &&
+                        normalizeCollege(profileOwner?.college) === normalizeCollege(viewer?.college),
+                    viewer: viewer
+                        ? {
+                            id: viewer.id,
+                            name: viewer.name,
+                            username: viewer.username,
+                            profileImage: viewer.profileImage,
+                            college: viewer.college,
+                            headline: viewer.headline,
+                        }
+                        : null,
+                };
+            }),
         };
     }
 

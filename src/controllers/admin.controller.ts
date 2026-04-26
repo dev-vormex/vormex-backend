@@ -5,6 +5,14 @@ import { bunnyConfig } from '../config/bunny.config';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
 import { bunnyStorageService } from '../services/bunny-storage.service';
+import {
+  getConfiguredReengagementSlots,
+  getCurrentReengagementWindow,
+  isReengagementEnabled,
+  previewReengagementForUser,
+  runReengagementForUser,
+} from '../services/reengagement-notification.service';
+import { isRedisEnabled } from '../infrastructure/redis/client';
 import { getIO } from '../sockets';
 
 interface AuthRequest extends Request {
@@ -33,6 +41,20 @@ const normalizeOptionalString = (value: any): string | undefined => {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
+};
+
+const parseOptionalDateInput = (value: any): Date | undefined => {
+  const raw = normalizeOptionalString(value);
+  if (!raw) {
+    return undefined;
+  }
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return undefined;
+  }
+
+  return parsed;
 };
 
 const buildUserAudienceWhere = ({
@@ -81,6 +103,9 @@ const buildUserAudienceWhere = ({
 
 const mapAdminUser = (user: any) => ({
   ...user,
+  hasActivePushToken: (user.device_tokens?.length ?? 0) > 0,
+  activePushPlatforms: Array.from(new Set((user.device_tokens ?? []).map((entry: any) => entry.platform))),
+  lastPushTokenAt: user.device_tokens?.[0]?.updatedAt ?? null,
   skills: user.skills?.map((entry: any) => entry.skill.name) ?? [],
   _count: {
     posts: user._count.posts,
@@ -546,6 +571,109 @@ export const sendAdminNotification = async (req: AuthRequest, res: Response): Pr
   }
 };
 
+export const getReengagementNotificationStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const now = parseOptionalDateInput(req.query?.now) || new Date();
+    const window = getCurrentReengagementWindow(now);
+
+    const [recentDeliveries, deliveryBreakdown] = await Promise.all([
+      prisma.reengagement_notification_deliveries.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: 25,
+        select: {
+          userId: true,
+          campaignDateKey: true,
+          slotKey: true,
+          campaignType: true,
+          status: true,
+          title: true,
+          reason: true,
+          sentAt: true,
+          createdAt: true,
+        },
+      }),
+      window.slotDateKey
+        ? prisma.reengagement_notification_deliveries.groupBy({
+            by: ['slotKey', 'status'],
+            where: {
+              campaignDateKey: window.slotDateKey,
+            },
+            _count: {
+              _all: true,
+            },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const fcmConfigured = Boolean(
+      process.env.FIREBASE_PROJECT_ID &&
+      process.env.FIREBASE_CLIENT_EMAIL &&
+      process.env.FIREBASE_PRIVATE_KEY
+    );
+
+    res.json({
+      enabled: isReengagementEnabled(),
+      redisConfigured: isRedisEnabled(),
+      fcmConfigured,
+      now: now.toISOString(),
+      currentIstHour: window.currentIstHour,
+      currentSlotKey: window.slot?.key || null,
+      currentSlotDateKey: window.slotDateKey,
+      configuredSlots: getConfiguredReengagementSlots().map((slot) => ({
+        hourIst: slot.hourIst,
+        key: slot.key,
+        tone: slot.tone,
+      })),
+      deliveryBreakdown,
+      recentDeliveries,
+      note: 'Scheduler and worker must be running as separate services for automatic delivery.',
+    });
+  } catch (error) {
+    console.error('getReengagementNotificationStatus error:', error);
+    res.status(500).json({ error: 'Failed to load re-engagement notification status' });
+  }
+};
+
+export const runReengagementNotificationDryRun = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = normalizeOptionalString(req.body?.userId);
+    if (!userId) {
+      res.status(400).json({ error: 'userId is required' });
+      return;
+    }
+
+    if (req.body?.now && !parseOptionalDateInput(req.body.now)) {
+      res.status(400).json({ error: 'Invalid now value. Use an ISO date string.' });
+      return;
+    }
+
+    const now = parseOptionalDateInput(req.body?.now) || new Date();
+    const send = req.body?.send === true || req.body?.send === 'true';
+    const result = send
+      ? await runReengagementForUser(userId, now)
+      : await previewReengagementForUser(userId, now);
+
+    res.json({
+      ...result,
+      mode: send ? 'send' : 'preview',
+      requestedAt: now.toISOString(),
+    });
+  } catch (error) {
+    console.error('runReengagementNotificationDryRun error:', error);
+    res.status(500).json({ error: 'Failed to run re-engagement dry run' });
+  }
+};
+
 // ============================================
 // USERS
 // ============================================
@@ -562,6 +690,10 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     const search = req.query.search as string;
     const status = req.query.status as string;
     const excludeBanned = String(req.query.excludeBanned || '').toLowerCase() === 'true';
+    const hasActivePushToken =
+      typeof req.query.hasActivePushToken === 'string'
+        ? req.query.hasActivePushToken.toLowerCase() === 'true'
+        : undefined;
     const colleges = parseStringArray(req.query.college);
     const skills = parseStringArray(req.query.skill);
     const sortBy = (req.query.sortBy as string) || 'createdAt';
@@ -578,6 +710,13 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     if (status === 'verified') where.isVerified = true;
     else if (status === 'unverified') where.isVerified = false;
     else if (status === 'banned') where.isBanned = true;
+    if (hasActivePushToken === true) {
+      where.device_tokens = {
+        some: {
+          isActive: true,
+        },
+      };
+    }
 
     const [users, total] = await Promise.all([
       prisma.user.findMany({
@@ -602,6 +741,17 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
           lastActiveAt: true,
           isOnline: true,
           authProvider: true,
+          device_tokens: {
+            where: {
+              isActive: true,
+            },
+            orderBy: { updatedAt: 'desc' },
+            take: 3,
+            select: {
+              platform: true,
+              updatedAt: true,
+            },
+          },
           skills: {
             select: {
               skill: {

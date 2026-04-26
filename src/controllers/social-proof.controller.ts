@@ -75,6 +75,32 @@ export const getProfileViews = async (req: Request, res: Response) => {
   }
 };
 
+// GET /api/social-proof/profile-views/:userId/history
+export const getProfileViewHistory = async (req: Request, res: Response) => {
+  try {
+    const userId = ensureString(req.params.userId);
+    if (!userId) {
+      res.status(400).json({ success: false, error: 'User ID is required' });
+      return;
+    }
+
+    const requestingUserId = (req as any).user.userId;
+    if (userId !== requestingUserId) {
+      res.status(403).json({ success: false, error: 'You can only view your own profile analytics' });
+      return;
+    }
+
+    const page = parseInt(ensureString(req.query.page) || '1', 10) || 1;
+    const limit = parseInt(ensureString(req.query.limit) || '50', 10) || 50;
+
+    const history = await socialProofService.getProfileViewHistory(userId, page, limit);
+    res.json({ success: true, data: history });
+  } catch (error: any) {
+    console.error('Error getting profile view history:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 3. LEADERBOARD
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

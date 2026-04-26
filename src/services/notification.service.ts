@@ -30,6 +30,7 @@ export type NotificationType =
   | 'streak_lost'
   | 'xp_earned'
   | 'post_share'
+  | 'recommended_match'
   | 'people_you_know_joined'
   | 'admin_announcement';
 
@@ -85,8 +86,21 @@ const formatRealtimeNotification = (notification: any) => ({
 });
 
 const PROFILE_VIEW_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
-const PROFILE_VIEW_NAME_THRESHOLD = 10;
 const PROFILE_VIEW_BATCH_LIMIT = 15;
+
+const asBoolean = (value: unknown): boolean | null => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+
+  return null;
+};
 
 const asString = (value: unknown): string | null => {
   if (typeof value !== 'string') {
@@ -104,16 +118,17 @@ const asProfileViewers = (value: unknown) => {
 
   const seen = new Set<string>();
 
-  return value.reduce<Array<{ id: string; name: string }>>((accumulator, item) => {
+  return value.reduce<Array<{ id: string; name: string; sameCollege: boolean }>>((accumulator, item) => {
     const id = asString(item?.id);
     const name = asString(item?.name);
+    const sameCollege = asBoolean(item?.sameCollege) ?? false;
 
     if (!id || !name || seen.has(id)) {
       return accumulator;
     }
 
     seen.add(id);
-    accumulator.push({ id, name });
+    accumulator.push({ id, name, sameCollege });
     return accumulator;
   }, []);
 };
@@ -144,10 +159,11 @@ const parseProfileViewNotificationData = (notification: any) => {
       notification?.users_notifications_actorIdTousers?.name ||
       notification?.users_notifications_actorIdTousers?.username
     );
+  const fallbackSameCollege = asBoolean(data.sameCollegeHint) ?? false;
   const normalizedViewers = viewers.length > 0
     ? viewers
     : fallbackActorId
-      ? [{ id: fallbackActorId, name: fallbackActorName }]
+      ? [{ id: fallbackActorId, name: fallbackActorName, sameCollege: fallbackSameCollege }]
       : [];
 
   const windowStartedAt =
@@ -167,45 +183,46 @@ const parseProfileViewNotificationData = (notification: any) => {
   };
 };
 
-const formatProfileViewNames = (names: string[]) => {
-  if (names.length <= 0) {
-    return 'Someone';
-  }
-
-  if (names.length === 1) {
-    return names[0];
-  }
-
-  if (names.length === 2) {
-    return `${names[0]} and ${names[1]}`;
-  }
-
-  return `${names[0]}, ${names[1]}, and ${names.length - 2} others`;
-};
-
 const buildProfileViewNotificationCopy = (
-  viewers: Array<{ id: string; name: string }>
+  viewers: Array<{ id: string; name: string; sameCollege: boolean }>
 ) => {
   const viewerCount = viewers.length;
-  const viewerNames = viewers.map((viewer) => viewer.name);
+  const sameCollegeCount = viewers.filter((viewer) => viewer.sameCollege).length;
 
   if (viewerCount <= 1) {
+    if (sameCollegeCount > 0) {
+      return {
+        title: 'Campus profile view',
+        body: 'Someone from your college viewed your profile',
+      };
+    }
+
     return {
       title: 'Profile view',
-      body: `${viewerNames[0] || 'Someone'} viewed your profile`,
+      body: 'Someone viewed your profile',
     };
   }
 
-  if (viewerCount < PROFILE_VIEW_NAME_THRESHOLD) {
+  if (sameCollegeCount === viewerCount) {
+    return {
+      title: 'Campus profile views',
+      body: `${viewerCount} people from your college viewed your profile`,
+    };
+  }
+
+  if (sameCollegeCount > 0) {
+    const othersCount = viewerCount - 1;
     return {
       title: 'Profile views',
-      body: `${formatProfileViewNames(viewerNames)} viewed your profile in the last 3 days`,
+      body: othersCount > 1
+        ? `Someone from your college and ${othersCount} others viewed your profile`
+        : 'Someone from your college and someone else viewed your profile',
     };
   }
 
   return {
     title: 'Profile views',
-    body: `${viewerCount} people viewed your profile in the last 3 days`,
+    body: `${viewerCount} people viewed your profile`,
   };
 };
 
@@ -315,15 +332,20 @@ class NotificationService {
 
   async notifyProfileView(
     userId: string,
-    viewerId: string,
-    viewerName: string
+    viewer: {
+      id: string;
+      name: string;
+      sameCollege?: boolean;
+    }
   ): Promise<void> {
+    const viewerId = viewer?.id;
     if (!userId || !viewerId || userId === viewerId) {
       return;
     }
 
     const now = new Date();
-    const normalizedViewerName = normalizeProfileViewViewerName(viewerName);
+    const normalizedViewerName = normalizeProfileViewViewerName(viewer.name);
+    const sameCollege = !!viewer.sameCollege;
 
     try {
       const delivery = await prisma.$transaction(async (tx) => {
@@ -353,16 +375,19 @@ class NotificationService {
           }
 
           const viewers = [
-            { id: viewerId, name: normalizedViewerName },
+            { id: viewerId, name: normalizedViewerName, sameCollege },
             ...parsed.viewers,
           ].slice(0, PROFILE_VIEW_BATCH_LIMIT);
           const copy = buildProfileViewNotificationCopy(viewers);
+          const sameCollegeCount = viewers.filter((entry) => entry.sameCollege).length;
           const data = {
-            screen: 'profile',
+            screen: 'profile_views',
             batchKey: parsed.batchKey,
             windowStartedAt: parsed.windowStartedAt.toISOString(),
             lastViewedAt: now.toISOString(),
             viewerCount: viewers.length,
+            sameCollegeCount,
+            sameCollegeHint: sameCollege,
             latestViewerId: viewerId,
             latestViewerName: normalizedViewerName,
             viewers,
@@ -398,7 +423,7 @@ class NotificationService {
         }
 
         const batchKey = `profile_view:${userId}:${now.getTime()}`;
-        const viewers = [{ id: viewerId, name: normalizedViewerName }];
+        const viewers = [{ id: viewerId, name: normalizedViewerName, sameCollege }];
         const copy = buildProfileViewNotificationCopy(viewers);
         const notification = await tx.notifications.create({
           data: {
@@ -409,11 +434,13 @@ class NotificationService {
             actorId: viewerId,
             createdAt: now,
             data: {
-              screen: 'profile',
+              screen: 'profile_views',
               batchKey,
               windowStartedAt: now.toISOString(),
               lastViewedAt: now.toISOString(),
               viewerCount: 1,
+              sameCollegeCount: sameCollege ? 1 : 0,
+              sameCollegeHint: sameCollege,
               latestViewerId: viewerId,
               latestViewerName: normalizedViewerName,
               viewers,
@@ -550,6 +577,27 @@ class NotificationService {
         count,
         screen: 'find_people',
         tab: 'people_you_know',
+      },
+    });
+  }
+
+  async notifyRecommendedMatch(
+    userId: string,
+    actorId: string,
+    title: string,
+    body: string,
+    data: Record<string, any> = {}
+  ): Promise<void> {
+    await this.createNotification({
+      userId,
+      type: 'recommended_match',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'find_people',
+        tab: 'smart_matches',
+        ...data,
       },
     });
   }

@@ -17,6 +17,7 @@ import {
   revokeAuthSession,
   rotateAuthSession,
 } from '../services/auth-session.service';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { processPeopleYouKnowJoinForUser } from '../services/people-you-know-join.service';
 import { buildUserResponse } from '../services/user-response.service';
 import { updateEngagementStreak } from './engagement.controller';
@@ -238,6 +239,8 @@ export const register = async (
     } catch (peopleYouKnowError) {
       console.error('Failed to process joined-contact matches after registration:', peopleYouKnowError);
     }
+
+    queueMatchAvailabilityNotifications(user.id, 'signup');
 
     // Generate JWT token
     const session = await createAuthSession({

@@ -559,7 +559,7 @@ export const createReel = async (req: AuthRequest, res: Response): Promise<void>
       include: reelInclude(userId),
     });
 
-    recordActivity(userId, 'short_video', 1).catch(console.error);
+    recordActivity(userId, 'short_video', 1, { sourceId: reel.id }).catch(console.error);
 
     res.status(201).json(mapReelResponse(reel, userId));
   } catch (error: any) {
@@ -626,7 +626,7 @@ export const onUploadComplete = async (req: AuthRequest, res: Response): Promise
       include: reelInclude(userId),
     });
 
-    recordActivity(userId, 'short_video', 1).catch(console.error);
+    recordActivity(userId, 'short_video', 1, { sourceId: reel.id }).catch(console.error);
 
     res.status(201).json(mapReelResponse(reel, userId));
   } catch (error) {
