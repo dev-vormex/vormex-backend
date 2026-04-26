@@ -10,6 +10,7 @@ import type {
 import { getActivityHeatmap } from './activity.service';
 import { getGitHubContributionCalendar } from './github.service';
 import { socialProofService } from './social-proof.service';
+import { calculateLevelProgress } from './progress.service';
 import {
   extractDomain,
   getPostMetadata,
@@ -17,16 +18,6 @@ import {
   mapPostTypeToFrontend,
   normalizeUrl,
 } from '../utils/post.util';
-
-/**
- * Calculate XP required for next level
- * 
- * @param currentLevel - Current user level
- * @returns XP required to reach next level
- */
-function calculateXpForNextLevel(currentLevel: number): number {
-  return (currentLevel + 1) * 100;
-}
 
 const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -591,7 +582,8 @@ export async function getFullProfile(
       console.debug('Failed to get real-time follower/connection count', err);
     }
 
-    const xpToNextLevel = calculateXpForNextLevel(stats.level) - stats.xp;
+    const levelProgress = calculateLevelProgress(stats.xp);
+    stats.level = levelProgress.level;
 
     let contributionCalendar = githubStats?.contributionData || null;
     if (
@@ -693,7 +685,7 @@ export async function getFullProfile(
       },
       stats: {
         ...stats,
-        xpToNextLevel: Math.max(0, xpToNextLevel),
+        xpToNextLevel: levelProgress.xpToNextLevel,
       },
       github: github as any,
       activityHeatmap: activityHeatmap.days || [], // Extract days array for backward compatibility

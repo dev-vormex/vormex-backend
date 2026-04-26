@@ -122,6 +122,7 @@ model User {
   projects                                                 Project[]
   featureAccessOverride                                    user_feature_access_overrides?
   premiumCheckoutEvents                                    premium_checkout_events[]
+  reengagement_notification_deliveries                     reengagement_notification_deliveries[]
   quiz_battles_quiz_battles_player1IdTousers               quiz_battles[]         @relation("quiz_battles_player1IdTousers")
   quiz_battles_quiz_battles_player2IdTousers               quiz_battles[]         @relation("quiz_battles_player2IdTousers")
   reel_comments                                            reel_comments[]
@@ -296,6 +297,68 @@ model UserSkill {
   @@index([userId])
   @@index([skillId])
   @@map("user_skills")
+}
+
+model SkillEndorsement {
+  id           String   @id @default(uuid())
+  userId       String
+  skillId      String
+  skillName    String
+  endorsedById String
+  source       String   @default("manual")
+  sourceId     String?
+  note         String?
+  rating       Int?
+  createdAt    DateTime @default(now())
+
+  @@index([userId, skillName])
+  @@index([endorsedById, createdAt])
+  @@index([source, sourceId])
+  @@map("skill_endorsements")
+}
+
+model SkillSwapRequest {
+  id                   String    @id @default(uuid())
+  requesterId          String
+  recipientId          String
+  skill                String
+  message              String?
+  requesterGoal        String?
+  mode                 String    @default("learn")
+  status               String    @default("pending")
+  sessionLengthMinutes Int       @default(30)
+  scheduledFor         DateTime?
+  respondedAt          DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([requesterId, status, createdAt])
+  @@index([recipientId, status, createdAt])
+  @@index([skill, status])
+  @@map("skill_swap_requests")
+}
+
+model SkillSwapSession {
+  id                   String    @id @default(uuid())
+  requestId            String    @unique
+  mentorId             String
+  learnerId            String
+  skill                String
+  status               String    @default("scheduled")
+  sessionLengthMinutes Int       @default(30)
+  scheduledFor         DateTime?
+  completedAt          DateTime?
+  learnerRating        Int?
+  mentorRating         Int?
+  learnerNote          String?
+  mentorNote           String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([mentorId, status, scheduledFor])
+  @@index([learnerId, status, scheduledFor])
+  @@index([skill, status])
+  @@map("skill_swap_sessions")
 }
 
 model Experience {
@@ -890,6 +953,29 @@ model device_tokens {
 
   @@index([userId])
   @@index([userId, isActive])
+}
+
+model reengagement_notification_deliveries {
+  id              String   @id @default(uuid())
+  userId          String
+  campaignDateKey String
+  slotKey         String
+  slotHour        Int
+  campaignType    String
+  status          String   @default("pending")
+  title           String
+  body            String
+  payload         Json?
+  reason          String?
+  sentAt          DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  users           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, campaignDateKey, slotKey])
+  @@index([campaignDateKey, status])
+  @@index([userId, campaignDateKey])
+  @@map("reengagement_notification_deliveries")
 }
 
 model engagement_streaks {
@@ -1904,16 +1990,20 @@ model wordle_words {
 }
 
 model xp_transactions {
-  id          String   @id @default(uuid())
-  userId      String
-  amount      Int
-  type        String
-  source      String
-  sourceId    String?
-  description String?
-  createdAt   DateTime @default(now())
+  id              String   @id @default(uuid())
+  userId          String
+  amount          Int
+  type            String
+  source          String
+  sourceId        String?
+  description     String?
+  currency        String   @default("XP")
+  countsForStreak Boolean  @default(false)
+  idempotencyKey  String?  @unique
+  createdAt       DateTime @default(now())
 
   @@index([type])
+  @@index([currency])
   @@index([userId, createdAt])
   @@index([userId])
 }

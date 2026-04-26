@@ -525,7 +525,7 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
 
     // Record activity and update posting streak (non-blocking)
     const activityType = mappedType === 'article' ? 'article' : 'post';
-    recordActivity(userId, activityType, 1).catch(console.error);
+    recordActivity(userId, activityType, 1, { sourceId: created.id }).catch(console.error);
     updateEngagementStreak(userId, 'posting').catch(console.error);
 
     res.status(201).json(mapPostResponse(created, userId));
@@ -1189,7 +1189,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     // Record comment activity (non-blocking)
-    recordActivity(userId, 'comment', 1).catch(console.error);
+    recordActivity(userId, 'comment', 1, { sourceId: mapped.id }).catch(console.error);
 
     res.status(201).json(mapped);
   } catch (error) {

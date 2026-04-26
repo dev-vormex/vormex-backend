@@ -8,6 +8,7 @@ import {
   validate2FA,
   getDashboardStats,
   getNotificationAudienceFilters,
+  getReengagementNotificationStatus,
   getUsers,
   getUserById,
   updateUser,
@@ -34,6 +35,7 @@ import {
   updateReportPriority,
   takeReportAction,
   getAuditLogs,
+  runReengagementNotificationDryRun,
   sendAdminNotification,
 } from '../controllers/admin.controller';
 import {
@@ -65,6 +67,8 @@ router.get('/dashboard/stats', getDashboardStats);
 
 // Notifications
 router.get('/notifications/filters', getNotificationAudienceFilters);
+router.get('/notifications/reengagement/status', getReengagementNotificationStatus);
+router.post('/notifications/reengagement/dry-run', runReengagementNotificationDryRun);
 router.post('/notifications/send', sendAdminNotification);
 
 // Premium

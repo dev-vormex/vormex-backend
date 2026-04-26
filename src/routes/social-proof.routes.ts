@@ -4,6 +4,7 @@ import {
   getLiveStats,
   trackProfileView,
   getProfileViews,
+  getProfileViewHistory,
   getLeaderboard,
   getGroupStats,
   getEventStats,
@@ -45,6 +46,7 @@ router.use(authenticate);
 // Profile view tracking & analytics
 router.post('/track-view', trackProfileView);
 router.get('/profile-views/:userId', getProfileViews);
+router.get('/profile-views/:userId/history', getProfileViewHistory);
 
 // Group/circle stats
 router.get('/group-stats/:groupId', getGroupStats);

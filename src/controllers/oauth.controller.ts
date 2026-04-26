@@ -5,6 +5,7 @@ import { generateToken } from '../utils/jwt.util';
 import { verifyGoogleToken, GoogleTokenPayload } from '../utils/google.util';
 import { generateUsernameFromName, normalizeUsername } from '../utils/username.util';
 import { hashEmail } from '../utils/email-hash.util';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { processPeopleYouKnowJoinForUser } from '../services/people-you-know-join.service';
 import {
   GoogleSignInRequestBody,
@@ -416,6 +417,8 @@ export const googleSignIn = async (
     } catch (peopleYouKnowError) {
       console.error('Failed to process joined-contact matches after Google signup:', peopleYouKnowError);
     }
+
+    queueMatchAvailabilityNotifications(newUser.id, 'google_signup');
 
     // Generate JWT token
     const token = generateToken(newUser.id);

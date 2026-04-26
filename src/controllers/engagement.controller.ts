@@ -2,7 +2,12 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { isPrismaConnectionError } from '../utils/prisma-error.util';
 import { ensureString } from '../utils/request.util';
-import { recordActivity, calculateStreak } from '../services/activity.service';
+import { recordActivity } from '../services/activity.service';
+import {
+  calculateDailyActivityStreak,
+  getProgressOverview,
+  spendCoins,
+} from '../services/progress.service';
 import { getIO } from '../sockets';
 import {
   getRewardCardsForUser,
@@ -51,6 +56,177 @@ function checkAtRisk(lastDate: Date | null, currentStreak: number): boolean {
   return !isToday(lastDate);
 }
 
+async function buildStreakResponseData(userId: string) {
+  let streak = await prisma.engagement_streaks.findUnique({
+    where: { userId },
+  });
+
+  if (!streak) {
+    streak = await prisma.engagement_streaks.create({
+      data: { userId },
+    });
+  }
+
+  const [userStats, dailyStreak, weeklyConnections] = await Promise.all([
+    prisma.userStats.findUnique({ where: { userId } }),
+    calculateDailyActivityStreak(userId),
+    prisma.connections.count({
+      where: {
+        status: 'accepted',
+        updatedAt: { gte: getWeekStart() },
+        OR: [
+          { requesterId: userId },
+          { addresseeId: userId },
+        ],
+      },
+    }),
+  ]);
+
+  const isAtRisk = {
+    daily: dailyStreak.isAtRisk,
+    connection: checkAtRisk(streak.lastConnectionDate, streak.connectionStreak),
+    login: checkAtRisk(streak.lastLoginDate, streak.loginStreak),
+    posting: checkAtRisk(streak.lastPostDate, streak.postingStreak),
+    messaging: checkAtRisk(streak.lastMessageDate, streak.messagingStreak),
+  };
+
+  const overallBestStreak = Math.max(
+    streak.longestConnectionStreak || streak.bestConnectionStreak || 0,
+    streak.longestLoginStreak || streak.bestLoginStreak || 0,
+    streak.longestPostingStreak || streak.bestPostingStreak || 0,
+    streak.longestMessagingStreak || streak.bestMessagingStreak || 0,
+    dailyStreak.longest
+  );
+
+  const engagementScore = Math.min(100, Math.round(
+    (dailyStreak.current * 12 +
+     streak.connectionStreak * 10 +
+     streak.loginStreak * 3 +
+     streak.postingStreak * 15 +
+     streak.messagingStreak * 8 +
+     (userStats?.xp || 0) / 10) / 5
+  ));
+
+  return {
+    dailyStreak: dailyStreak.current,
+    longestDailyStreak: dailyStreak.longest,
+    dailyQualifiedToday: dailyStreak.qualifiedToday,
+    dailyIsAtRisk: dailyStreak.isAtRisk,
+    dailyLastQualifiedDate: dailyStreak.lastQualifiedDate?.toISOString().split('T')[0] || null,
+    connectionStreak: streak.connectionStreak,
+    longestConnectionStreak: streak.longestConnectionStreak || streak.bestConnectionStreak || streak.connectionStreak,
+    loginStreak: streak.loginStreak,
+    longestLoginStreak: streak.longestLoginStreak || streak.bestLoginStreak || streak.loginStreak,
+    postingStreak: streak.postingStreak,
+    longestPostingStreak: streak.longestPostingStreak || streak.bestPostingStreak || streak.postingStreak,
+    messagingStreak: streak.messagingStreak,
+    longestMessagingStreak: streak.longestMessagingStreak || streak.bestMessagingStreak || streak.messagingStreak,
+    overallBestStreak,
+    weeklyConnectionsMade: weeklyConnections,
+    weeklyConnectionsGoal: 10,
+    streakFreezes: streak.streakFreezes,
+    streakShieldActive: streak.streakShieldActive,
+    totalFreezesUsed: Math.max(0, 3 - streak.streakFreezes),
+    isAtRisk,
+    engagementScore,
+    showOnProfile: true,
+  };
+}
+
+async function buildWeeklyGoalsData(userId: string) {
+  const weekStart = getWeekStart();
+  const weekEnd = new Date(weekStart);
+  weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+  weekEnd.setUTCHours(23, 59, 59, 999);
+
+  const [connectionsMade, postsMade, weeklyActivity, dailyStreak] = await Promise.all([
+    prisma.connections.count({
+      where: {
+        status: 'accepted',
+        updatedAt: { gte: weekStart, lte: weekEnd },
+        OR: [
+          { requesterId: userId },
+          { addresseeId: userId },
+        ],
+      },
+    }),
+    prisma.post.count({
+      where: {
+        authorId: userId,
+        createdAt: { gte: weekStart, lte: weekEnd },
+      },
+    }),
+    prisma.userDailyActivity.aggregate({
+      where: {
+        userId,
+        date: { gte: weekStart, lte: weekEnd },
+      },
+      _sum: {
+        messagesCount: true,
+      },
+    }),
+    calculateDailyActivityStreak(userId),
+  ]);
+
+  const messagesSent = weeklyActivity._sum.messagesCount || 0;
+  const goals = [
+    {
+      id: 'weekly-connections',
+      type: 'connections',
+      label: 'Connections',
+      current: connectionsMade,
+      target: 10,
+      isComplete: connectionsMade >= 10,
+    },
+    {
+      id: 'weekly-posts',
+      type: 'posts',
+      label: 'Posts',
+      current: postsMade,
+      target: 3,
+      isComplete: postsMade >= 3,
+    },
+    {
+      id: 'weekly-messages',
+      type: 'messages',
+      label: 'Messages',
+      current: messagesSent,
+      target: 20,
+      isComplete: messagesSent >= 20,
+    },
+  ];
+
+  const totalProgress =
+    goals.reduce((sum, goal) => sum + Math.min(1, goal.current / goal.target), 0) / goals.length;
+  const nextGoal = goals.find((goal) => !goal.isComplete);
+  const reminderMessage = nextGoal
+    ? `${Math.max(0, nextGoal.target - nextGoal.current)} more ${nextGoal.label.toLowerCase()} to finish this week.`
+    : 'All weekly goals are complete.';
+
+  return {
+    id: `weekly-${weekStart.toISOString().split('T')[0]}`,
+    weekStartDate: weekStart.toISOString(),
+    weekEndDate: weekEnd.toISOString(),
+    goals,
+    totalProgress,
+    streakAtRisk: dailyStreak.isAtRisk,
+    reminderMessage,
+    // Backward-compatible fields for older Android builds.
+    weekStart: weekStart.toISOString(),
+    connectionsTarget: 10,
+    postsTarget: 3,
+    messagesTarget: 20,
+    connectionsMade,
+    postsMade,
+    messagesSent,
+    isCompleted: goals.every((goal) => goal.isComplete),
+    xpEarned: goals.every((goal) => goal.isComplete) ? 100 : 0,
+    connectionsProgress: Math.min(100, Math.round((connectionsMade / 10) * 100)),
+    postsProgress: Math.min(100, Math.round((postsMade / 3) * 100)),
+    messagesProgress: Math.min(100, Math.round((messagesSent / 20) * 100)),
+  };
+}
+
 // ======================
 // STREAKS
 // ======================
@@ -62,84 +238,8 @@ export const getStreaks = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // Get or create EngagementStreak record
-    let streak = await prisma.engagement_streaks.findUnique({
-      where: { userId },
-    });
-
-    if (!streak) {
-      streak = await prisma.engagement_streaks.create({
-        data: { userId },
-      });
-    }
-
-    // Get UserStats for overall activity streak
-    const userStats = await prisma.userStats.findUnique({
-      where: { userId },
-    });
-
-    // Calculate overall streak from UserDailyActivity
-    const activityStreak = await calculateStreak(userId);
-
-    // Get weekly connections count
-    const weekStart = getWeekStart();
-    const weeklyConnections = await prisma.connections.count({
-      where: {
-        status: 'accepted',
-        updatedAt: { gte: weekStart },
-        OR: [
-          { requesterId: userId },
-          { addresseeId: userId },
-        ],
-      },
-    });
-
-    // Calculate at-risk status for each streak type
-    const isAtRisk = {
-      connection: checkAtRisk(streak.lastConnectionDate, streak.connectionStreak),
-      login: checkAtRisk(streak.lastLoginDate, streak.loginStreak),
-      posting: checkAtRisk(streak.lastPostDate, streak.postingStreak),
-      messaging: checkAtRisk(streak.lastMessageDate, streak.messagingStreak),
-    };
-
-    // Calculate overall best streak
-    const overallBestStreak = Math.max(
-      streak.longestConnectionStreak || streak.bestConnectionStreak || 0,
-      streak.longestLoginStreak || streak.bestLoginStreak || 0,
-      streak.longestPostingStreak || streak.bestPostingStreak || 0,
-      streak.longestMessagingStreak || streak.bestMessagingStreak || 0,
-      activityStreak.longestStreak
-    );
-
-    // Calculate engagement score (0-100)
-    const engagementScore = Math.min(100, Math.round(
-      (streak.connectionStreak * 10 +
-       streak.loginStreak * 5 +
-       streak.postingStreak * 15 +
-       streak.messagingStreak * 8 +
-       (userStats?.xp || 0) / 10) / 5
-    ));
-
     res.json({
-      data: {
-        connectionStreak: streak.connectionStreak,
-        longestConnectionStreak: streak.longestConnectionStreak || streak.bestConnectionStreak || streak.connectionStreak,
-        loginStreak: streak.loginStreak,
-        longestLoginStreak: streak.longestLoginStreak || streak.bestLoginStreak || streak.loginStreak,
-        postingStreak: streak.postingStreak,
-        longestPostingStreak: streak.longestPostingStreak || streak.bestPostingStreak || streak.postingStreak,
-        messagingStreak: streak.messagingStreak,
-        longestMessagingStreak: streak.longestMessagingStreak || streak.bestMessagingStreak || streak.messagingStreak,
-        overallBestStreak,
-        weeklyConnectionsMade: weeklyConnections,
-        weeklyConnectionsGoal: 10,
-        streakFreezes: streak.streakFreezes,
-        streakShieldActive: streak.streakShieldActive,
-        totalFreezesUsed: 3 - streak.streakFreezes, // Assuming max 3 freezes
-        isAtRisk,
-        engagementScore,
-        showOnProfile: true, // TODO: Add to EngagementStreak model
-      },
+      data: await buildStreakResponseData(userId),
     });
   } catch (error) {
     console.error('getStreaks error:', error);
@@ -235,58 +335,8 @@ export const recordLogin = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const today = getTodayStart();
-
-    // Get or create EngagementStreak
-    let streak = await prisma.engagement_streaks.findUnique({
-      where: { userId },
-    });
-
-    if (!streak) {
-      streak = await prisma.engagement_streaks.create({
-        data: {
-          userId,
-          loginStreak: 1,
-          lastLoginDate: today,
-          bestLoginStreak: 1,
-          longestLoginStreak: 1,
-        },
-      });
-    } else {
-      // Check if already logged in today
-      if (streak.lastLoginDate && isToday(streak.lastLoginDate)) {
-        res.status(200).json({ message: 'Login already recorded today' });
-        return;
-      }
-
-      // Check if continuing streak (logged in yesterday)
-      const yesterday = new Date(today);
-      yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-      
-      let newLoginStreak = 1;
-      if (streak.lastLoginDate) {
-        const lastLoginDate = new Date(streak.lastLoginDate);
-        lastLoginDate.setUTCHours(0, 0, 0, 0);
-        if (lastLoginDate.getTime() === yesterday.getTime()) {
-          newLoginStreak = streak.loginStreak + 1;
-        }
-      }
-
-      const newLongestStreak = Math.max(streak.longestLoginStreak || 0, newLoginStreak);
-
-      await prisma.engagement_streaks.update({
-        where: { userId },
-        data: {
-          loginStreak: newLoginStreak,
-          lastLoginDate: today,
-          bestLoginStreak: newLongestStreak,
-          longestLoginStreak: newLongestStreak,
-        },
-      });
-    }
-
-    // Record activity for overall streak
-    await recordActivity(userId, 'post', 0); // Just to mark as active
+    await updateEngagementStreak(userId, 'login');
+    await recordActivity(userId, 'login', 1);
 
     // Emit Socket.IO event for streak update
     const io = getIO();
@@ -294,7 +344,10 @@ export const recordLogin = async (req: AuthRequest, res: Response): Promise<void
       io.to(`user:${userId}`).emit('streak:updated', { type: 'login' });
     }
 
-    res.status(200).json({ message: 'Login recorded' });
+    res.status(200).json({
+      message: 'Login recorded',
+      data: await buildStreakResponseData(userId),
+    });
   } catch (error) {
     console.error('recordLogin error:', error);
     res.status(500).json({ error: 'Failed to record login' });
@@ -1065,69 +1118,8 @@ export const getWeeklyGoals = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const weekStart = getWeekStart();
-
-    // Count weekly connections
-    const connectionsMade = await prisma.connections.count({
-      where: {
-        status: 'accepted',
-        updatedAt: { gte: weekStart },
-        OR: [
-          { requesterId: userId },
-          { addresseeId: userId },
-        ],
-      },
-    });
-
-    // Count weekly posts
-    const postsMade = await prisma.post.count({
-      where: {
-        authorId: userId,
-        createdAt: { gte: weekStart },
-      },
-    });
-
-    // Count weekly messages (from UserDailyActivity)
-    const weeklyActivity = await prisma.userDailyActivity.aggregate({
-      where: {
-        userId,
-        date: { gte: weekStart },
-      },
-      _sum: {
-        messagesCount: true,
-      },
-    });
-
-    const messagesSent = weeklyActivity._sum.messagesCount || 0;
-
-    // Define targets
-    const connectionsTarget = 10;
-    const postsTarget = 3;
-    const messagesTarget = 20;
-
-    // Calculate progress percentages
-    const connectionsProgress = Math.min(100, Math.round((connectionsMade / connectionsTarget) * 100));
-    const postsProgress = Math.min(100, Math.round((postsMade / postsTarget) * 100));
-    const messagesProgress = Math.min(100, Math.round((messagesSent / messagesTarget) * 100));
-
-    const isCompleted = connectionsProgress >= 100 && postsProgress >= 100 && messagesProgress >= 100;
-
     res.json({
-      data: {
-        id: `weekly-${weekStart.toISOString().split('T')[0]}`,
-        weekStart: weekStart.toISOString(),
-        connectionsTarget,
-        postsTarget,
-        messagesTarget,
-        connectionsMade,
-        postsMade,
-        messagesSent,
-        isCompleted,
-        xpEarned: isCompleted ? 100 : 0,
-        connectionsProgress,
-        postsProgress,
-        messagesProgress,
-      },
+      data: await buildWeeklyGoalsData(userId),
     });
   } catch (error) {
     console.error('getWeeklyGoals error:', error);
@@ -1422,35 +1414,12 @@ export const getDashboard = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    // Get streak data
-    const streak = await prisma.engagement_streaks.findUnique({
-      where: { userId },
-    });
-
-    // Get user stats
-    const userStats = await prisma.userStats.findUnique({
-      where: { userId },
-    });
-
-    // Get weekly goals data
-    const weekStart = getWeekStart();
-    const connectionsMade = await prisma.connections.count({
-      where: {
-        status: 'accepted',
-        updatedAt: { gte: weekStart },
-        OR: [
-          { requesterId: userId },
-          { addresseeId: userId },
-        ],
-      },
-    });
-
-    const postsMade = await prisma.post.count({
-      where: {
-        authorId: userId,
-        createdAt: { gte: weekStart },
-      },
-    });
+    const [progress, streaks, weeklyGoals, userStats] = await Promise.all([
+      getProgressOverview(userId),
+      buildStreakResponseData(userId),
+      buildWeeklyGoalsData(userId),
+      prisma.userStats.findUnique({ where: { userId } }),
+    ]);
 
     // Calculate rank
     const rank = await prisma.userStats.count({
@@ -1461,20 +1430,12 @@ export const getDashboard = async (req: AuthRequest, res: Response): Promise<voi
 
     res.json({
       data: {
-        streaks: {
-          connectionStreak: streak?.connectionStreak || 0,
-          loginStreak: streak?.loginStreak || 0,
-          postingStreak: streak?.postingStreak || 0,
-          messagingStreak: streak?.messagingStreak || 0,
-        },
-        weeklyGoals: {
-          connectionsTarget: 10,
-          connectionsMade,
-          postsTarget: 3,
-          postsMade,
-        },
-        xpEarned: userStats?.xp || 0,
-        level: userStats?.level || 1,
+        streaks,
+        weeklyGoals,
+        progress,
+        xpEarned: progress.xp.lifetimeXp,
+        level: progress.xp.level,
+        coinsBalance: progress.coins.balance,
         rank,
       },
     });
@@ -1547,61 +1508,45 @@ export const purchaseStreakFreeze = async (req: AuthRequest, res: Response): Pro
       return;
     }
 
-    const XP_COST = 100;
+    const COIN_COST = 100;
 
-    // Spendable XP comes from the wallet balance, not profile level XP.
-    const [user, streak] = await Promise.all([
-      prisma.user.findUnique({
-        where: { id: userId },
-        select: { xpBalance: true },
-      }),
-      prisma.engagement_streaks.findUnique({ where: { userId } }),
-    ]);
+    const streak = await prisma.engagement_streaks.upsert({
+      where: { userId },
+      create: { userId },
+      update: {},
+    });
 
-    if (!user || user.xpBalance < XP_COST) {
-      res.status(400).json({ error: 'Not enough XP balance' });
-      return;
-    }
+    const { newBalance } = await spendCoins({
+      userId,
+      amount: COIN_COST,
+      type: 'streak_freeze_purchase',
+      source: 'streaks',
+      sourceId: streak.id,
+      description: 'Purchased streak freeze',
+    });
 
-    if (!streak) {
-      res.status(400).json({ error: 'Streak data not found' });
-      return;
-    }
-
-    const newBalance = user.xpBalance - XP_COST;
-
-    await prisma.$transaction([
-      prisma.user.update({
-        where: { id: userId },
-        data: { xpBalance: { decrement: XP_COST } },
-      }),
-      prisma.engagement_streaks.update({
-        where: { userId },
-        data: { streakFreezes: { increment: 1 } },
-      }),
-      prisma.xp_transactions.create({
-        data: {
-          userId,
-          amount: -XP_COST,
-          type: 'streak_freeze_purchase',
-          source: 'streaks',
-          sourceId: streak.id,
-          description: 'Purchased streak freeze',
-        },
-      }),
-    ]);
+    await prisma.engagement_streaks.update({
+      where: { userId },
+      data: { streakFreezes: { increment: 1 } },
+    });
 
     res.json({
       data: {
         success: true,
         streakFreezes: streak.streakFreezes + 1,
-        xpCost: XP_COST,
+        coinCost: COIN_COST,
+        coinsBalance: newBalance,
+        xpCost: COIN_COST,
         xpBalance: newBalance,
         message: 'Streak freeze purchased!',
       },
     });
   } catch (error) {
     console.error('purchaseStreakFreeze error:', error);
+    if (error instanceof Error && error.message === 'Not enough Coins') {
+      res.status(400).json({ error: 'Not enough Coins' });
+      return;
+    }
     res.status(500).json({ error: 'Failed to purchase streak freeze' });
   }
 };

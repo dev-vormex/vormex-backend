@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
+import { awardUserProgress } from '../services/progress.service';
 
 interface GameStats {
   id: string;
@@ -32,6 +33,7 @@ interface GameStats {
   typingAverageWpm: number;
   typingBestAccuracy: number;
   currentXpBalance: number;
+  currentCoinsBalance: number;
 }
 
 interface LeaderboardEntry {
@@ -56,6 +58,8 @@ interface XPTransaction {
   sourceId?: string;
   description?: string;
   createdAt: string;
+  currency?: string;
+  countsForStreak?: boolean;
 }
 
 /**
@@ -80,7 +84,7 @@ export const getMyGameStats = async (
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { xpBalance: true },
+      select: { coinsBalance: true, xpBalance: true },
     });
 
     if (!gameStats) {
@@ -118,7 +122,8 @@ export const getMyGameStats = async (
       typingBestWpm: gameStats.typingBestWpm,
       typingAverageWpm: gameStats.typingAverageWpm,
       typingBestAccuracy: gameStats.typingBestAccuracy,
-      currentXpBalance: user?.xpBalance || 0,
+      currentXpBalance: user?.coinsBalance || user?.xpBalance || 0,
+      currentCoinsBalance: user?.coinsBalance || user?.xpBalance || 0,
     };
 
     res.status(200).json({ stats });
@@ -167,6 +172,8 @@ export const getXPHistory = async (
         sourceId: t.sourceId || undefined,
         description: t.description || undefined,
         createdAt: t.createdAt.toISOString(),
+        currency: t.currency,
+        countsForStreak: t.countsForStreak,
       })),
       nextCursor,
       hasMore,
@@ -410,24 +417,6 @@ export const answerTriviaQuestion = async (
           timesCorrect: { increment: isCorrect ? 1 : 0 },
         },
       }),
-      ...(isCorrect
-        ? [
-            prisma.user.update({
-              where: { id: userId },
-              data: { xpBalance: { increment: xpEarned } },
-            }),
-            prisma.xp_transactions.create({
-              data: {
-                userId,
-                amount: xpEarned,
-                type: 'trivia_correct',
-                source: 'daily_trivia',
-                sourceId: questionId,
-                description: 'Correct trivia answer',
-              },
-            }),
-          ]
-        : []),
     ]);
 
     const today = new Date();
@@ -440,6 +429,20 @@ export const answerTriviaQuestion = async (
         totalXpEarned: { increment: xpEarned },
       },
     });
+
+    if (isCorrect && xpEarned > 0) {
+      await awardUserProgress({
+        userId,
+        xpAmount: xpEarned,
+        coinAmount: xpEarned,
+        type: 'trivia_correct',
+        source: 'daily_trivia',
+        sourceId: questionId,
+        description: 'Correct trivia answer',
+        countsForStreak: true,
+        idempotencyKey: `${userId}:daily_trivia:${questionId}`,
+      });
+    }
 
     res.status(200).json({
       isCorrect,
@@ -625,25 +628,21 @@ export const guessWordle = async (
           ...(newStatus !== 'playing' ? { completedAt: new Date() } : {}),
         },
       }),
-      ...(isWon
-        ? [
-            prisma.user.update({
-              where: { id: userId },
-              data: { xpBalance: { increment: xpEarned } },
-            }),
-            prisma.xp_transactions.create({
-              data: {
-                userId,
-                amount: xpEarned,
-                type: 'wordle_win',
-                source: 'tech_wordle',
-                sourceId: gameId,
-                description: 'Won daily wordle',
-              },
-            }),
-          ]
-        : []),
     ]);
+
+    if (isWon && xpEarned > 0) {
+      await awardUserProgress({
+        userId,
+        xpAmount: xpEarned,
+        coinAmount: xpEarned,
+        type: 'wordle_win',
+        source: 'tech_wordle',
+        sourceId: gameId,
+        description: 'Won daily wordle',
+        countsForStreak: true,
+        idempotencyKey: `${userId}:tech_wordle:${gameId}`,
+      });
+    }
 
     res.status(200).json({
       result,
@@ -1179,6 +1178,11 @@ export const finishTypingRace = async (
       return;
     }
 
+    if (race.status === 'completed') {
+      res.status(400).json({ error: 'Race already completed' });
+      return;
+    }
+
     const xpEarned = Math.floor(wpm * accuracy / 100);
 
     const updatedRace = await prisma.typing_races.update({
@@ -1194,11 +1198,19 @@ export const finishTypingRace = async (
       },
     });
 
-    // Update user XP
-    await prisma.user.update({
-      where: { id: userId },
-      data: { xpBalance: { increment: xpEarned } },
-    });
+    if (xpEarned > 0) {
+      await awardUserProgress({
+        userId,
+        xpAmount: xpEarned,
+        coinAmount: xpEarned,
+        type: 'typing_race_complete',
+        source: 'typing_race',
+        sourceId: raceId,
+        description: 'Completed typing race',
+        countsForStreak: true,
+        idempotencyKey: `${userId}:typing_race:${raceId}`,
+      });
+    }
 
     // Get current user stats to check for personal best
     const gameStats = await prisma.game_stats.findUnique({

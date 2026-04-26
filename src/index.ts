@@ -21,6 +21,7 @@ import profileRoutes from './routes/profile.routes';
 import professionalFieldsRoutes from './routes/professional-fields.routes';
 import uploadRoutes from './routes/upload.routes';
 import engagementRoutes from './routes/engagement.routes';
+import progressRoutes from './routes/progress.routes';
 import storiesRoutes from './routes/stories.routes';
 import feedRoutes from './routes/feed.routes';
 import postRoutes from './routes/post.routes';
@@ -32,6 +33,8 @@ import chatRoutes from './routes/chat.routes';
 import peopleRoutes from './routes/people.routes';
 import matchingRoutes from './routes/matching.routes';
 import accountabilityRoutes from './routes/accountability.routes';
+import skillsRoutes from './routes/skills.routes';
+import skillSwapRoutes from './routes/skill-swap.routes';
 import groupsRoutes from './routes/groups.routes';
 import circlesRoutes from './routes/circles.routes';
 import onboardingRoutes from './routes/onboarding.routes';
@@ -1185,7 +1188,7 @@ io.on('connection', async (socket) => {
       }
 
       // Record messaging activity and update streak (non-blocking)
-      recordActivity(senderId, 'message', 1).catch(console.error);
+      recordActivity(senderId, 'message', 1, { sourceId: message.id }).catch(console.error);
       updateEngagementStreak(senderId, 'messaging').catch(console.error);
 
       console.log(`Message sent in conversation ${conversationId} by user ${senderId}`);
@@ -1907,6 +1910,7 @@ app.use('/api', profileRoutes);
 app.use('/api', professionalFieldsRoutes);
 app.use('/api', uploadRoutes);
 app.use('/api/engagement', engagementRoutes);
+app.use('/api/progress', progressRoutes);
 app.use('/api/stories', storiesRoutes);
 app.use('/api/feed', feedRoutes);
 app.use('/api/posts', postRoutes);
@@ -1918,6 +1922,8 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/people', peopleRoutes);
 app.use('/api/matching', matchingRoutes);
 app.use('/api/accountability', accountabilityRoutes);
+app.use('/api/skills', skillsRoutes);
+app.use('/api/skill-swap', skillSwapRoutes);
 app.use('/api/groups', groupsRoutes);
 app.use('/api/circles', circlesRoutes);
 app.use('/api/onboarding', onboardingRoutes);

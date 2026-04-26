@@ -10,3 +10,23 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+  # These background processes must use the same secret env vars as the web service
+  # (DATABASE_URL, REDIS_URL, Firebase creds, etc.) for re-engagement notifications to run.
+  - type: worker
+    runtime: node
+    name: vormex-backend-worker
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+  - type: worker
+    runtime: node
+    name: vormex-backend-scheduler
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:scheduler
+    envVars:
+      - key: NODE_ENV
+        value: production

@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { ensureString } from '../utils/request.util';
 
 /**
@@ -58,6 +59,18 @@ export const addSkill = async (
       return;
     }
 
+    const existingUserSkill = await prisma.userSkill.findFirst({
+      where: {
+        userId,
+        skill: {
+          name: skillName.trim(),
+        },
+      },
+      select: {
+        id: true,
+      },
+    });
+
     // Find or create skill
     const skill = await prisma.skill.upsert({
       where: { name: skillName.trim() },
@@ -87,6 +100,10 @@ export const addSkill = async (
         skill: true,
       },
     });
+
+    if (!existingUserSkill) {
+      queueMatchAvailabilityNotifications(userId, 'skill_add');
+    }
 
     res.status(201).json(userSkill);
   } catch (error) {
@@ -1757,6 +1774,8 @@ export const addInterest = async (
       select: { interests: true },
     });
 
+    queueMatchAvailabilityNotifications(userId, 'interest_add');
+
     res.status(201).json({
       interests: updatedUser.interests || [],
     });
@@ -1856,6 +1875,8 @@ export const updateInterest = async (
       select: { interests: true },
     });
 
+    queueMatchAvailabilityNotifications(userId, 'interest_update');
+
     res.status(200).json({
       interests: updatedUser.interests || [],
     });
@@ -1933,4 +1954,3 @@ export const deleteInterest = async (
     });
   }
 };
-

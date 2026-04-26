@@ -2,6 +2,35 @@
 import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
+
+function normalizeOptionalText(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.toLowerCase() : null;
+}
+
+function normalizeStringList(values: unknown): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      values
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => value.length > 0)
+    )
+  ).sort();
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
 
 type OnboardingData = {
   primaryGoal?: string | null;
@@ -117,6 +146,15 @@ export const updateStep = async (
     const lookingFor = (step === 0 && data.lookingFor != null) ? (data.lookingFor as string[]) : (existing.lookingFor ?? []);
     const wantToLearn = (step === 1 && data.wantToLearn != null) ? (data.wantToLearn as string[]) : (existing.wantToLearn ?? []);
     const canTeach = (step === 1 && data.canTeach != null) ? (data.canTeach as string[]) : (existing.canTeach ?? []);
+    const shouldTriggerMatchNotifications =
+      (step === 0 && (
+        normalizeOptionalText(data.college) !== normalizeOptionalText(user.college) ||
+        normalizeOptionalText(data.primaryGoal) !== normalizeOptionalText(existing.primaryGoal)
+      )) ||
+      (step === 1 && Array.isArray(data.interests) && !arraysEqual(
+        normalizeStringList(data.interests),
+        normalizeStringList(user.interests)
+      ));
 
     await prisma.$transaction([
       prisma.user.update({
@@ -164,6 +202,10 @@ export const updateStep = async (
       return;
     }
 
+    if (shouldTriggerMatchNotifications) {
+      queueMatchAvailabilityNotifications(userId, 'onboarding_update');
+    }
+
     res.status(200).json({
       onboarding: toOnboardingResponse(updatedUser, updatedUser.user_onboarding),
       nextStep: step + 1,
@@ -188,6 +230,17 @@ export const completeOnboarding = async (
       return;
     }
     const userId = String(req.user.userId);
+    const existingUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        onboardingCompleted: true,
+      },
+    });
+
+    if (!existingUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
 
     await prisma.$transaction([
       prisma.user.update({
@@ -224,6 +277,10 @@ export const completeOnboarding = async (
     if (!user) {
       res.status(500).json({ error: 'Failed to fetch updated data' });
       return;
+    }
+
+    if (!existingUser.onboardingCompleted) {
+      queueMatchAvailabilityNotifications(userId, 'onboarding_complete');
     }
 
     res.status(200).json({
