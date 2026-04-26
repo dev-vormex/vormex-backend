@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { randomUUID } from 'crypto';
 import { prisma } from '../config/prisma';
+import { notificationService } from './notification.service';
 
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -53,14 +54,33 @@ class SocialProofService {
         if (viewerId === viewedId) return; // Don't track self-views
 
         try {
-            await prisma.profile_views.create({
-                data: {
-                    id: randomUUID(),
-                    viewerId,
-                    viewedId,
-                    source: source || 'direct',
-                },
+            const payload = await prisma.$transaction(async (tx) => {
+                await tx.profile_views.create({
+                    data: {
+                        id: randomUUID(),
+                        viewerId,
+                        viewedId,
+                        source: source || 'direct',
+                    },
+                });
+
+                return tx.user.findUnique({
+                    where: { id: viewerId },
+                    select: {
+                        id: true,
+                        name: true,
+                        username: true,
+                    },
+                });
             });
+
+            if (payload) {
+                await notificationService.notifyProfileView(
+                    viewedId,
+                    payload.id,
+                    payload.name || payload.username || 'Someone'
+                );
+            }
         } catch (error) {
             // Silently fail - profile views are non-critical
             console.error('Error tracking profile view:', error);

@@ -25,6 +25,7 @@ import {
   enrichLinkMetadataFromUrl,
   type StoredPostMetadata,
 } from '../utils/post.util';
+import { parseStoredMusicAttachment } from '../utils/music.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -39,9 +40,14 @@ function buildMetadataFromRequest(
 ): StoredPostMetadata | null {
   const metadata: StoredPostMetadata = {};
   const mentions = parseStringArrayField(body.mentions);
+  const music = parseStoredMusicAttachment(body.music);
 
   if (mentions.length > 0) {
     metadata.mentions = mentions;
+  }
+
+  if (music) {
+    metadata.music = music;
   }
 
   if (mappedType === 'video' && mediaUrls[0]) {

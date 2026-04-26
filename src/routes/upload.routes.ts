@@ -16,6 +16,7 @@ import {
 import { uploadGroupIcon, uploadGroupCover } from '../controllers/groups.controller';
 
 const router = express.Router();
+const CHAT_VIDEO_MAX_BYTES = 150 * 1024 * 1024;
 
 // Middleware to pass groupId from body to params (for group upload routes)
 const groupIdFromBody = (req: Request, res: Response, next: NextFunction) => {
@@ -33,9 +34,27 @@ const groupIdFromBody = (req: Request, res: Response, next: NextFunction) => {
 const chatUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 25 * 1024 * 1024, // 25 MB limit for chat media
+    fileSize: CHAT_VIDEO_MAX_BYTES, // Videos are capped at 90 seconds client-side.
   },
 });
+
+const handleChatUpload = (req: Request, res: Response, next: NextFunction): void => {
+  chatUpload.single('file')(req, res, (error: unknown) => {
+    if (!error) {
+      next();
+      return;
+    }
+
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({
+        error: 'Videos must be 90 seconds or less and under 150 MB. Other files must be under 25 MB.',
+      });
+      return;
+    }
+
+    next(error);
+  });
+};
 
 // Upload profile picture (requires auth, expects pre-cropped 1:1 image)
 router.post('/upload/avatar', authenticate, uploadMiddleware, uploadProfilePicture);
@@ -62,8 +81,10 @@ router.post('/upload/logo', authenticate, uploadMiddleware, uploadLogo);
 router.post('/upload/group-icon', authenticate, uploadMiddleware, groupIdFromBody, uploadGroupIcon);
 router.post('/upload/group-cover', authenticate, uploadMiddleware, groupIdFromBody, uploadGroupCover);
 
+// Chat media upload compatibility path. Primary chat route is /api/chat/upload.
+router.post('/upload/chat', authenticate, handleChatUpload, uploadChatMedia);
+
 // Generic file delete
 router.delete('/upload', authenticate, deleteFile);
 
 export default router;
-

@@ -1,8 +1,11 @@
 // @ts-nocheck
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { bunnyConfig } from '../config/bunny.config';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
+import { bunnyStorageService } from '../services/bunny-storage.service';
+import { getIO } from '../sockets';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -92,6 +95,119 @@ const chunkArray = <T>(items: T[], size: number): T[][] => {
     chunks.push(items.slice(index, index + size));
   }
   return chunks;
+};
+
+const CHAT_CLEAR_CONFIRMATION = 'CLEAR ALL CHATS';
+const GROUP_CHAT_CLEAR_CONFIRMATION = 'CLEAR GROUP CHAT';
+const BUNNY_CDN_BASE_URL = bunnyConfig.cdn.pullZoneUrl.replace(/\/+$/, '');
+
+const getBunnyStoragePath = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed) && !trimmed.startsWith(BUNNY_CDN_BASE_URL)) {
+    return null;
+  }
+  const storagePath = trimmed.startsWith(BUNNY_CDN_BASE_URL)
+    ? trimmed.slice(BUNNY_CDN_BASE_URL.length).replace(/^\/+/, '')
+    : trimmed.replace(/^\/+/, '');
+  return storagePath || null;
+};
+
+const isBunnyStorageAsset = (value: unknown, allowedPrefixes: string[]): value is string => {
+  const storagePath = getBunnyStoragePath(value);
+  if (!storagePath) return false;
+  return allowedPrefixes.some((prefix) => storagePath.startsWith(prefix));
+};
+
+const isChatUploadUrl = (value: unknown): value is string => {
+  return isBunnyStorageAsset(value, ['chat/']);
+};
+
+const isGroupUploadUrl = (value: unknown): value is string => {
+  return isBunnyStorageAsset(value, ['groups/icons/', 'groups/covers/']);
+};
+
+const collectChatMediaAssets = async () => {
+  const [directMediaRows, groupMediaRows] = await Promise.all([
+    prisma.messages.findMany({
+      where: { mediaUrl: { not: null } },
+      select: { mediaUrl: true, fileSize: true },
+    }),
+    prisma.group_messages.findMany({
+      where: { mediaUrl: { not: null } },
+      select: { mediaUrl: true, fileSize: true },
+    }),
+  ]);
+
+  const assetsByUrl = new Map<string, number>();
+
+  [...directMediaRows, ...groupMediaRows].forEach((row) => {
+    if (!isChatUploadUrl(row.mediaUrl)) return;
+    const url = row.mediaUrl.trim();
+    const size = typeof row.fileSize === 'number' && Number.isFinite(row.fileSize)
+      ? Math.max(row.fileSize, 0)
+      : 0;
+    assetsByUrl.set(url, Math.max(assetsByUrl.get(url) || 0, size));
+  });
+
+  return {
+    urls: Array.from(assetsByUrl.keys()),
+    bytes: Array.from(assetsByUrl.values()).reduce((total, size) => total + size, 0),
+    directMediaRows: directMediaRows.length,
+    groupMediaRows: groupMediaRows.length,
+  };
+};
+
+const collectGroupChatMediaAssets = async (groupId: string) => {
+  const mediaRows = await prisma.group_messages.findMany({
+    where: { groupId, mediaUrl: { not: null } },
+    select: { mediaUrl: true, fileSize: true },
+  });
+
+  const assetsByUrl = new Map<string, number>();
+
+  mediaRows.forEach((row) => {
+    if (!isChatUploadUrl(row.mediaUrl)) return;
+    const url = row.mediaUrl.trim();
+    const size = typeof row.fileSize === 'number' && Number.isFinite(row.fileSize)
+      ? Math.max(row.fileSize, 0)
+      : 0;
+    assetsByUrl.set(url, Math.max(assetsByUrl.get(url) || 0, size));
+  });
+
+  return {
+    urls: Array.from(assetsByUrl.keys()),
+    bytes: Array.from(assetsByUrl.values()).reduce((total, size) => total + size, 0),
+    mediaRows: mediaRows.length,
+  };
+};
+
+const deleteBunnyAssets = async (urls: string[]) => {
+  const result = {
+    deleted: 0,
+    failed: 0,
+    failedUrls: [] as string[],
+  };
+
+  for (const batch of chunkArray(urls, 10)) {
+    const settled = await Promise.allSettled(
+      batch.map((url) => bunnyStorageService.deleteFile(url))
+    );
+
+    settled.forEach((entry, index) => {
+      if (entry.status === 'fulfilled') {
+        result.deleted += 1;
+      } else {
+        result.failed += 1;
+        if (result.failedUrls.length < 10) {
+          result.failedUrls.push(batch[index]);
+        }
+      }
+    });
+  }
+
+  return result;
 };
 
 // ============================================
@@ -840,6 +956,26 @@ export const deleteReel = async (req: AuthRequest, res: Response): Promise<void>
 // GROUPS
 // ============================================
 
+const mapAdminGroup = (group: any) => ({
+  id: group.id,
+  name: group.name,
+  slug: group.slug,
+  description: group.description,
+  privacy: group.isPrivate ? 'private' : 'public',
+  coverImage: group.coverImage || group.imageUrl || null,
+  iconImage: group.iconImage || group.imageUrl || null,
+  imageUrl: group.imageUrl || null,
+  memberCount: group.memberCount,
+  createdAt: group.createdAt,
+  updatedAt: group.updatedAt,
+  createdBy: group.users,
+  _count: {
+    members: group._count?.group_members ?? 0,
+    posts: group._count?.group_messages ?? 0,
+    messages: group._count?.group_messages ?? 0,
+  },
+});
+
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!req.user?.userId) {
@@ -854,7 +990,11 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
 
     const where: any = {};
     if (search) {
-      where.name = { contains: search, mode: 'insensitive' };
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { slug: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+      ];
     }
 
     const [groups, total] = await Promise.all([
@@ -870,8 +1010,11 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
           description: true,
           isPrivate: true,
           coverImage: true,
+          iconImage: true,
+          imageUrl: true,
           memberCount: true,
           createdAt: true,
+          updatedAt: true,
           users: {
             select: {
               id: true,
@@ -890,16 +1033,7 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
       prisma.groups.count({ where }),
     ]);
 
-    const mappedGroups = groups.map((g) => ({
-      ...g,
-      privacy: g.isPrivate ? 'private' : 'public',
-      createdBy: g.users,
-      users: undefined,
-      _count: {
-        members: g._count.group_members,
-        posts: g._count.group_messages,
-      },
-    }));
+    const mappedGroups = groups.map(mapAdminGroup);
 
     res.json({
       groups: mappedGroups,
@@ -923,12 +1057,583 @@ export const deleteGroup = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    await prisma.groups.delete({ where: { id: req.params.id } });
+    const groupId = req.params.id;
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: {
+        id: true,
+        name: true,
+        imageUrl: true,
+        iconImage: true,
+        coverImage: true,
+        _count: {
+          select: {
+            group_members: true,
+            group_messages: true,
+          },
+        },
+      },
+    });
 
-    res.json({ message: 'Group deleted successfully' });
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    const chatMediaAssets = await collectGroupChatMediaAssets(groupId);
+    const groupImageUrls = [group.imageUrl, group.iconImage, group.coverImage]
+      .filter(isGroupUploadUrl)
+      .map((url) => url.trim());
+    const assetUrls = Array.from(new Set([...chatMediaAssets.urls, ...groupImageUrls]));
+    const mediaDeletion = await deleteBunnyAssets(assetUrls);
+
+    if (mediaDeletion.failed > 0) {
+      res.status(502).json({
+        error: 'Some group media files could not be deleted. Database rows were left in place so the delete can be retried.',
+        media: {
+          filesFound: assetUrls.length,
+          deleted: mediaDeletion.deleted,
+          failed: mediaDeletion.failed,
+          failedUrls: mediaDeletion.failedUrls,
+        },
+      });
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.group_messages.updateMany({
+        where: { groupId },
+        data: { replyToId: null },
+      });
+      await tx.group_members.deleteMany({ where: { groupId } });
+      await tx.groups.delete({ where: { id: groupId } });
+    }, {
+      maxWait: 15_000,
+      timeout: 60_000,
+    });
+
+    getIO()?.to(`group:${groupId}`).emit('group:deleted', {
+      groupId,
+      deletedBy: String(req.user.userId),
+      deletedAt: new Date().toISOString(),
+    });
+
+    res.json({
+      message: 'Group deleted successfully',
+      deleted: {
+        groupId,
+        members: group._count.group_members,
+        messages: group._count.group_messages,
+      },
+      media: {
+        filesFound: assetUrls.length,
+        deleted: mediaDeletion.deleted,
+        failed: mediaDeletion.failed,
+      },
+    });
   } catch (error) {
     console.error('deleteGroup error:', error);
     res.status(500).json({ error: 'Failed to delete group' });
+  }
+};
+
+export const getAdminGroupMembers = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const groupId = req.params.id;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const search = normalizeOptionalString(req.query.search);
+    const role = normalizeOptionalString(req.query.role);
+    const skip = (page - 1) * limit;
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        description: true,
+        isPrivate: true,
+        imageUrl: true,
+        iconImage: true,
+        coverImage: true,
+        memberCount: true,
+        createdAt: true,
+        updatedAt: true,
+        users: {
+          select: { id: true, name: true, username: true },
+        },
+        _count: {
+          select: {
+            group_members: true,
+            group_messages: true,
+          },
+        },
+      },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    const memberWhere: any = { groupId };
+    if (role && role !== 'all') {
+      memberWhere.role = role.toLowerCase();
+    }
+
+    if (search) {
+      const matchedUsers = await prisma.user.findMany({
+        where: {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { username: { contains: search, mode: 'insensitive' } },
+            { email: { contains: search, mode: 'insensitive' } },
+          ],
+        },
+        select: { id: true },
+        take: 200,
+      });
+      memberWhere.userId = { in: matchedUsers.map((user) => user.id) };
+    }
+
+    const [members, total] = await Promise.all([
+      prisma.group_members.findMany({
+        where: memberWhere,
+        skip,
+        take: limit,
+        orderBy: { joinedAt: 'desc' },
+      }),
+      prisma.group_members.count({ where: memberWhere }),
+    ]);
+
+    const users = await prisma.user.findMany({
+      where: { id: { in: members.map((member) => member.userId) } },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        profileImage: true,
+        headline: true,
+        isBanned: true,
+      },
+    });
+    const usersById = new Map(users.map((user) => [user.id, user]));
+
+    res.json({
+      group: mapAdminGroup(group),
+      members: members.map((member) => ({
+        id: member.id,
+        groupId: member.groupId,
+        userId: member.userId,
+        role: member.role,
+        joinedAt: member.joinedAt,
+        isCreator: group.users?.id === member.userId,
+        user: usersById.get(member.userId) || {
+          id: member.userId,
+          name: 'Unknown user',
+          username: null,
+          email: null,
+          profileImage: null,
+          headline: null,
+          isBanned: false,
+        },
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error('getAdminGroupMembers error:', error);
+    res.status(500).json({ error: 'Failed to load group members' });
+  }
+};
+
+export const updateAdminGroupMemberRole = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const groupId = req.params.id;
+    const userId = req.params.userId;
+    const role = normalizeOptionalString(req.body?.role)?.toLowerCase();
+    const allowedRoles = ['member', 'moderator', 'admin', 'owner'];
+
+    if (!role || !allowedRoles.includes(role)) {
+      res.status(400).json({ error: 'Choose a valid group role' });
+      return;
+    }
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { creatorId: true },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    if (group.creatorId === userId && role !== 'owner') {
+      res.status(400).json({ error: 'The group creator must remain owner' });
+      return;
+    }
+
+    const member = await prisma.group_members.update({
+      where: { groupId_userId: { groupId, userId } },
+      data: { role },
+    });
+
+    res.json({
+      message: 'Member role updated successfully',
+      member,
+    });
+  } catch (error) {
+    console.error('updateAdminGroupMemberRole error:', error);
+    res.status(500).json({ error: 'Failed to update member role' });
+  }
+};
+
+export const removeAdminGroupMember = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const groupId = req.params.id;
+    const userId = req.params.userId;
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, creatorId: true },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    if (group.creatorId === userId) {
+      res.status(400).json({ error: 'Cannot remove the group creator. Delete the group instead.' });
+      return;
+    }
+
+    const existingMember = await prisma.group_members.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+
+    if (!existingMember) {
+      res.status(404).json({ error: 'Member not found in this group' });
+      return;
+    }
+
+    const nextMemberCount = await prisma.$transaction(async (tx) => {
+      await tx.group_members.delete({
+        where: { groupId_userId: { groupId, userId } },
+      });
+      const memberCount = await tx.group_members.count({ where: { groupId } });
+      await tx.groups.update({
+        where: { id: groupId },
+        data: { memberCount, updatedAt: new Date() },
+      });
+      return memberCount;
+    });
+
+    getIO()?.to(`group:${groupId}`).emit('group:member_removed', {
+      groupId,
+      userId,
+      removedBy: String(req.user.userId),
+      memberCount: nextMemberCount,
+    });
+
+    res.json({
+      message: 'Member removed successfully',
+      memberCount: nextMemberCount,
+    });
+  } catch (error) {
+    console.error('removeAdminGroupMember error:', error);
+    res.status(500).json({ error: 'Failed to remove member' });
+  }
+};
+
+export const clearAdminGroupChat = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const groupId = req.params.id;
+    const confirmText = typeof req.body?.confirmText === 'string'
+      ? req.body.confirmText.trim()
+      : '';
+
+    if (confirmText !== GROUP_CHAT_CLEAR_CONFIRMATION) {
+      res.status(400).json({
+        error: `Type "${GROUP_CHAT_CLEAR_CONFIRMATION}" to clear this group chat.`,
+        confirmationText: GROUP_CHAT_CLEAR_CONFIRMATION,
+      });
+      return;
+    }
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, name: true },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    const chatMediaAssets = await collectGroupChatMediaAssets(groupId);
+    const mediaDeletion = await deleteBunnyAssets(chatMediaAssets.urls);
+
+    if (mediaDeletion.failed > 0) {
+      res.status(502).json({
+        error: 'Some group chat media files could not be deleted. Database rows were left in place so the clear can be retried.',
+        media: {
+          filesFound: chatMediaAssets.urls.length,
+          bytesFromRows: chatMediaAssets.bytes,
+          deleted: mediaDeletion.deleted,
+          failed: mediaDeletion.failed,
+          failedUrls: mediaDeletion.failedUrls,
+        },
+      });
+      return;
+    }
+
+    const deleted = await prisma.$transaction(async (tx) => {
+      const groupMessages = await tx.group_messages.count({ where: { groupId } });
+      const groupReactions = await tx.group_message_reactions.count({
+        where: { group_messages: { groupId } },
+      });
+
+      await tx.group_messages.updateMany({
+        where: { groupId },
+        data: { replyToId: null },
+      });
+      await tx.group_messages.deleteMany({ where: { groupId } });
+      await tx.groups.update({
+        where: { id: groupId },
+        data: { updatedAt: new Date() },
+      });
+
+      return {
+        groupMessages,
+        groupReactions,
+      };
+    }, {
+      maxWait: 15_000,
+      timeout: 60_000,
+    });
+
+    getIO()?.to(`group:${groupId}`).emit('group:chat_cleared', {
+      groupId,
+      clearedBy: String(req.user.userId),
+      clearedAt: new Date().toISOString(),
+    });
+
+    res.json({
+      message: 'Group chat cleared successfully',
+      group: {
+        id: group.id,
+        name: group.name,
+      },
+      deleted,
+      media: {
+        filesFound: chatMediaAssets.urls.length,
+        bytesFromRows: chatMediaAssets.bytes,
+        deleted: mediaDeletion.deleted,
+        failed: mediaDeletion.failed,
+      },
+    });
+  } catch (error) {
+    console.error('clearAdminGroupChat error:', error);
+    res.status(500).json({ error: 'Failed to clear group chat' });
+  }
+};
+
+// ============================================
+// CHAT STORAGE
+// ============================================
+
+export const getChatStorageSummary = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const [
+      conversations,
+      directMessages,
+      groupMessages,
+      directReactions,
+      groupReactions,
+      messageNotifications,
+      moderationChatReports,
+      chatMediaAssets,
+    ] = await Promise.all([
+      prisma.conversations.count(),
+      prisma.messages.count(),
+      prisma.group_messages.count(),
+      prisma.message_reactions.count(),
+      prisma.group_message_reactions.count(),
+      prisma.notifications.count({
+        where: {
+          OR: [
+            { messageId: { not: null } },
+            { type: { in: ['message', 'new_message', 'group_message'] } },
+          ],
+        },
+      }),
+      prisma.moderation_reports.count({
+        where: { conversationId: { not: null } },
+      }),
+      collectChatMediaAssets(),
+    ]);
+
+    res.json({
+      confirmationText: CHAT_CLEAR_CONFIRMATION,
+      summary: {
+        conversations,
+        directMessages,
+        groupMessages,
+        directReactions,
+        groupReactions,
+        messageNotifications,
+        moderationChatReports,
+        mediaMessages: chatMediaAssets.directMediaRows + chatMediaAssets.groupMediaRows,
+        chatUploadFiles: chatMediaAssets.urls.length,
+        chatUploadBytes: chatMediaAssets.bytes,
+      },
+    });
+  } catch (error) {
+    console.error('getChatStorageSummary error:', error);
+    res.status(500).json({ error: 'Failed to load chat storage summary' });
+  }
+};
+
+export const clearAllChats = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const confirmText = typeof req.body?.confirmText === 'string'
+      ? req.body.confirmText.trim()
+      : '';
+
+    if (confirmText !== CHAT_CLEAR_CONFIRMATION) {
+      res.status(400).json({
+        error: `Type "${CHAT_CLEAR_CONFIRMATION}" to clear every chat.`,
+        confirmationText: CHAT_CLEAR_CONFIRMATION,
+      });
+      return;
+    }
+
+    const chatMediaAssets = await collectChatMediaAssets();
+    const mediaDeletion = await deleteBunnyAssets(chatMediaAssets.urls);
+
+    if (mediaDeletion.failed > 0) {
+      res.status(502).json({
+        error: 'Some chat media files could not be deleted. Database rows were left in place so the clear can be retried.',
+        media: {
+          filesFound: chatMediaAssets.urls.length,
+          bytesFromRows: chatMediaAssets.bytes,
+          deleted: mediaDeletion.deleted,
+          failed: mediaDeletion.failed,
+          failedUrls: mediaDeletion.failedUrls,
+        },
+      });
+      return;
+    }
+
+    const deleted = await prisma.$transaction(async (tx) => {
+      const messageNotifications = await tx.notifications.deleteMany({
+        where: {
+          OR: [
+            { messageId: { not: null } },
+            { type: { in: ['message', 'new_message', 'group_message'] } },
+          ],
+        },
+      });
+
+      const moderationReportsDetached = await tx.moderation_reports.updateMany({
+        where: { conversationId: { not: null } },
+        data: { conversationId: null },
+      });
+
+      const outboxEvents = await tx.outboxEvent.deleteMany({
+        where: {
+          OR: [
+            { aggregateType: { in: ['message', 'conversation', 'group_message'] } },
+            { eventType: { startsWith: 'chat.' } },
+            { eventType: { startsWith: 'group.message.' } },
+          ],
+        },
+      });
+
+      await tx.messages.updateMany({ data: { replyToId: null } });
+      await tx.group_messages.updateMany({ data: { replyToId: null } });
+
+      const directReactions = await tx.message_reactions.deleteMany({});
+      const groupReactions = await tx.group_message_reactions.deleteMany({});
+      const directMessages = await tx.messages.deleteMany({});
+      const conversations = await tx.conversations.deleteMany({});
+      const groupMessages = await tx.group_messages.deleteMany({});
+
+      return {
+        conversations: conversations.count,
+        directMessages: directMessages.count,
+        groupMessages: groupMessages.count,
+        directReactions: directReactions.count,
+        groupReactions: groupReactions.count,
+        messageNotifications: messageNotifications.count,
+        moderationReportsDetached: moderationReportsDetached.count,
+        outboxEvents: outboxEvents.count,
+      };
+    }, {
+      maxWait: 15_000,
+      timeout: 120_000,
+    });
+
+    getIO()?.emit('chat:cleared', {
+      clearedBy: String(req.user.userId),
+      clearedAt: new Date().toISOString(),
+    });
+    getIO()?.emit('group:chat_cleared', {
+      clearedBy: String(req.user.userId),
+      clearedAt: new Date().toISOString(),
+    });
+
+    res.json({
+      message: 'All chats cleared successfully',
+      deleted,
+      media: {
+        filesFound: chatMediaAssets.urls.length,
+        bytesFromRows: chatMediaAssets.bytes,
+        deleted: mediaDeletion.deleted,
+        failed: mediaDeletion.failed,
+      },
+    });
+  } catch (error) {
+    console.error('clearAllChats error:', error);
+    res.status(500).json({ error: 'Failed to clear chats' });
   }
 };
 

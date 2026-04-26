@@ -40,6 +40,20 @@ async function processNotificationDelivery(job: Job<{ event: { payload: Notifica
     return;
   }
 
+  if (payload.kind === 'group_message') {
+    await pushNotificationService.pushGroupMessage(
+      payload.userId,
+      payload.groupName || payload.title,
+      payload.senderName || 'Someone',
+      payload.body,
+      payload.groupId || '',
+      payload.senderId,
+      payload.groupImage,
+      payload.senderImage
+    );
+    return;
+  }
+
   await pushNotificationService.sendToUser(payload.userId, {
     title: payload.title,
     body: payload.body,

@@ -19,6 +19,7 @@ const DEFAULT_PREMIUM_FEATURES = [
 ];
 const DEFAULT_PREMIUM_DURATION_DAYS = 31;
 const DEFAULT_SUPPORT_LABEL = '24/7 fast support';
+const DEFAULT_AGENT_PROMPT_LIMIT = 3;
 
 export const ACTIVE_PREMIUM_STATUSES = new Set(['active', 'captured', 'authorized']);
 
@@ -54,7 +55,15 @@ export interface PremiumAccessSnapshot {
   premiumDaysRemaining: number;
   autoPayEnabled: boolean;
   creditsUsed: number;
+  agentPromptLimit: number;
+  agentLimitReached: boolean;
   canCancelPremium: boolean;
+}
+
+export interface AgentAccessState {
+  canUseAgent: boolean;
+  agentPromptLimit: number;
+  agentLimitReached: boolean;
 }
 
 export interface PremiumCheckoutEventInput {
@@ -116,6 +125,20 @@ export function getPremiumSupportLabel() {
   return DEFAULT_SUPPORT_LABEL;
 }
 
+export function getAgentPromptLimit() {
+  const rawLimit = Number(
+    process.env.VORMEX_AGENT_PROMPT_LIMIT ||
+      process.env.VORMEX_AGENT_MESSAGE_LIMIT ||
+      DEFAULT_AGENT_PROMPT_LIMIT
+  );
+
+  if (!Number.isFinite(rawLimit)) {
+    return DEFAULT_AGENT_PROMPT_LIMIT;
+  }
+
+  return Math.max(0, Math.round(rawLimit));
+}
+
 export function getPremiumRenewalModeLabel(autoPayEnabled: boolean) {
   return autoPayEnabled ? 'Auto-pay active' : 'Manual renewal';
 }
@@ -133,6 +156,44 @@ export function normalizeAgentAvailabilityMode(value: string | null | undefined)
   if (normalized === 'selected') return 'selected';
   if (normalized === 'disabled') return 'disabled';
   return 'all';
+}
+
+export function evaluateAgentAccess(params: {
+  isAdmin: boolean;
+  isPremium: boolean;
+  agentMode: AgentAvailabilityMode;
+  agentEnabled: boolean;
+  agentBlocked: boolean;
+  creditsUsed: number;
+  agentPromptLimit?: number;
+}): AgentAccessState {
+  const agentPromptLimit = params.agentPromptLimit ?? getAgentPromptLimit();
+  const baseAccess =
+    params.isAdmin ||
+    (!params.agentBlocked &&
+      params.agentMode !== 'disabled' &&
+      (params.isPremium ||
+        params.agentMode === 'all' ||
+        (params.agentMode === 'selected' && params.agentEnabled)));
+  const agentLimitReached =
+    !params.isAdmin && baseAccess && params.creditsUsed >= agentPromptLimit;
+
+  return {
+    canUseAgent: baseAccess && !agentLimitReached,
+    agentPromptLimit,
+    agentLimitReached,
+  };
+}
+
+export function getAgentAccessDeniedMessage(params: Pick<AgentAccessState, 'agentLimitReached' | 'agentPromptLimit'>) {
+  if (params.agentLimitReached) {
+    if (params.agentPromptLimit > 0) {
+      return `You've reached the current AI Agent limit of ${params.agentPromptLimit} prompts for this account.`;
+    }
+    return 'AI Agent is temporarily unavailable for this account right now.';
+  }
+
+  return 'AI Agent access is not enabled for this account yet.';
 }
 
 export function getPremiumPeriodEnd(startAt: Date, durationDays = getPremiumDurationDays()) {
@@ -276,13 +337,14 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
       },
     },
   });
-  const canUseAgent =
-    user.isAdmin ||
-    (!override?.agentBlocked &&
-      agentMode !== 'disabled' &&
-      (isPremium ||
-        agentMode === 'all' ||
-        (agentMode === 'selected' && Boolean(override?.agentEnabled))));
+  const agentAccess = evaluateAgentAccess({
+    isAdmin: user.isAdmin,
+    isPremium,
+    agentMode,
+    agentEnabled: Boolean(override?.agentEnabled),
+    agentBlocked: Boolean(override?.agentBlocked),
+    creditsUsed,
+  });
   const canAccessProfileCustomization =
     user.isAdmin ||
     (!override?.profileCustomizationBlocked &&
@@ -294,7 +356,7 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     subscription,
     user,
     isPremium,
-    canUseAgent,
+    canUseAgent: agentAccess.canUseAgent,
     canAccessProfileCustomization,
     premiumAmountMinor,
     premiumCurrency,
@@ -307,6 +369,8 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     premiumDaysRemaining,
     autoPayEnabled,
     creditsUsed,
+    agentPromptLimit: agentAccess.agentPromptLimit,
+    agentLimitReached: agentAccess.agentLimitReached,
     canCancelPremium,
   };
 }
@@ -353,6 +417,8 @@ export function serializePremiumSubscription(
     renewalModeLabel: getPremiumRenewalModeLabel(snapshot.autoPayEnabled),
     supportLabel: getPremiumSupportLabel(),
     creditsUsed: snapshot.creditsUsed,
+    agentPromptLimit: snapshot.agentPromptLimit,
+    agentLimitReached: snapshot.agentLimitReached,
     canCancel: snapshot.canCancelPremium,
   };
 }

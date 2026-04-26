@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { parseStoredMusicAttachment, type StoredMusicAttachment } from './music.util';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -10,6 +11,7 @@ export interface StoredPollOption {
 
 export interface StoredPostMetadata {
   mentions?: string[];
+  music?: StoredMusicAttachment | null;
   contentType?: string;
   videoUrl?: string | null;
   videoThumbnail?: string | null;
@@ -195,6 +197,7 @@ export function getPostMetadata(value: unknown): StoredPostMetadata {
 
   return {
     mentions: parseStringArrayField(metadata.mentions),
+    music: parseStoredMusicAttachment(metadata.music),
     contentType: asTrimmedString(metadata.contentType) || DEFAULT_CONTENT_TYPE,
     videoUrl: normalizeUrl(metadata.videoUrl),
     videoThumbnail: normalizeUrl(metadata.videoThumbnail),
@@ -351,6 +354,7 @@ export function mapPostResponse(post: any, currentUserId: string) {
     content: post.content,
     contentType: metadata.contentType || DEFAULT_CONTENT_TYPE,
     mentions: metadata.mentions || [],
+    music: metadata.music ?? null,
     mediaUrls,
     mediaCount: mediaUrls.length,
     videoUrl,

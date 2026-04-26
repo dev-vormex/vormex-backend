@@ -38,13 +38,13 @@ If you configure the service manually in the Render dashboard, use:
 ```bash
 Build Command: npm ci && npm run build
 Pre-Deploy Command: npm run migrate:deploy
-Start Command: node dist/api.js
+Start Command: npm start
 Health Check Path: /api/health
 ```
 
 This package also includes a `postinstall` hook that runs `npm run build`. That makes Render's default Node build behavior safer, because a plain `npm install` will still generate `dist/api.js`.
 
-The most common startup error is setting the start command to `node dist/api.js` without also running the build step first. In that case, Render starts successfully but exits because `dist/api.js` was never generated.
+The startup path also goes through `node scripts/run-compiled.js api`, which rebuilds the compiled entry if `dist/api.js` is missing. That gives Render a safe fallback if the service ever skips the build phase or reuses a bad cache.
 
 ### API Documentation
 

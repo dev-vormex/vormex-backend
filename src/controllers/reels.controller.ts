@@ -13,6 +13,54 @@ interface AuthRequest extends Request {
   user?: { userId: string };
 }
 
+const reelCommentAuthorSelect = {
+  id: true,
+  username: true,
+  name: true,
+  profileImage: true,
+  headline: true,
+};
+
+function mapReelCommentAuthor(author: any) {
+  if (!author) {
+    return {
+      id: '',
+      username: 'unknown',
+      name: 'Unknown user',
+      profileImage: null,
+      headline: null,
+    };
+  }
+
+  return {
+    id: author.id,
+    username: author.username,
+    name: author.name,
+    profileImage: author.profileImage,
+    headline: author.headline,
+  };
+}
+
+function mapReelComment(comment: any, currentUserId?: string) {
+  return {
+    id: comment.id,
+    reelId: comment.reelId,
+    parentId: comment.parentId,
+    author: mapReelCommentAuthor(comment.users),
+    content: comment.content,
+    mentions: comment.mentions || [],
+    likesCount: comment.likesCount || 0,
+    repliesCount: Math.max(comment.repliesCount || 0, comment._count?.other_reel_comments || 0),
+    isLiked: currentUserId
+      ? Boolean(comment.reel_comment_likes?.some((like: any) => like.userId === currentUserId))
+      : false,
+    isPinned: Boolean(comment.isPinned),
+    isAuthorHeart: Boolean(comment.isAuthorHeart),
+    createdAt: comment.createdAt,
+    updatedAt: comment.updatedAt,
+  };
+}
+
 function mapReelResponse(reel: any, currentUserId?: string) {
   const author = reel.users;
   const isLiked = currentUserId
@@ -1326,24 +1374,16 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
     const comments = await prisma.reel_comments.findMany({
       where,
       include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
-          },
-        },
+        users: { select: reelCommentAuthorSelect },
         ...(currentUserId
           ? {
-              likes: {
+              reel_comment_likes: {
                 where: { userId: currentUserId },
                 select: { userId: true },
               },
             }
           : {}),
-        _count: { select: { replies: true } },
+        _count: { select: { other_reel_comments: true } },
       },
       orderBy: [{ isPinned: 'desc' }, { likesCount: 'desc' }, { createdAt: 'desc' }],
       take: limit + 1,
@@ -1354,23 +1394,7 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
     const items = hasMore ? comments.slice(0, limit) : comments;
 
     res.json({
-      comments: items.map((c) => ({
-        id: c.id,
-        reelId: c.reelId,
-        parentId: c.parentId,
-        author: c.author,
-        content: c.content,
-        mentions: c.mentions,
-        likesCount: c.likesCount,
-        repliesCount: c._count.replies,
-        isLiked: currentUserId
-          ? Boolean((c as any).likes?.some((l: any) => l.userId === currentUserId))
-          : false,
-        isPinned: c.isPinned,
-        isAuthorHeart: c.isAuthorHeart,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
-      })),
+      comments: items.map((comment) => mapReelComment(comment, currentUserId)),
       nextCursor: hasMore ? items[items.length - 1].id : null,
       hasMore,
     });
@@ -1424,24 +1448,15 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
         mentions: mentions || [],
       },
       include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
-          },
-        },
-        parent: parentId ? {
+        users: { select: reelCommentAuthorSelect },
+        reel_comments: parentId ? {
           select: {
             authorId: true,
-            author: {
+            users: {
               select: { name: true, username: true },
             },
           },
         } : false,
-        _count: { select: { replies: true } },
       },
     });
 
@@ -1460,6 +1475,11 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
       data: { commentsCount },
     });
 
+    const commentAuthor = mapReelCommentAuthor(comment.users);
+    const parentComment = comment.reel_comments as
+      | { authorId: string; users: { name: string | null; username: string } | null }
+      | null;
+
     const io = getIO();
     if (io) {
       // Broadcast to reel room for real-time updates
@@ -1468,7 +1488,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
         type: 'comment',
         comment: {
           id: comment.id,
-          author: comment.author,
+          author: commentAuthor,
           content: comment.content,
           parentId: comment.parentId,
         },
@@ -1477,12 +1497,11 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     // Send notification to reel author (if not commenting on own reel)
-    const commentWithRelations = comment as typeof comment & { author: { name: string | null; username: string }; parent?: { authorId: string; author: { name: string | null; username: string } } };
     if (reel.authorId !== userId) {
       notificationService.notifyReelComment(
         reel.authorId,
         userId,
-        commentWithRelations.author.name || commentWithRelations.author.username,
+        commentAuthor.name || commentAuthor.username,
         reelId,
         comment.id,
         comment.content
@@ -1490,11 +1509,11 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     // Send notification to parent comment author (if replying)
-    if (parentId && commentWithRelations.parent && commentWithRelations.parent.authorId !== userId) {
+    if (parentId && parentComment && parentComment.authorId !== userId) {
       notificationService.notifyReelCommentReply(
-        commentWithRelations.parent.authorId,
+        parentComment.authorId,
         userId,
-        commentWithRelations.author.name || commentWithRelations.author.username,
+        commentAuthor.name || commentAuthor.username,
         reelId,
         comment.id,
         comment.content
@@ -1513,7 +1532,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
           notificationService.notifyMention(
             mentionedUser.id,
             userId,
-            commentWithRelations.author.name || commentWithRelations.author.username,
+            commentAuthor.name || commentAuthor.username,
             'reel_comment',
             reelId,
             comment.content
@@ -1526,7 +1545,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
       id: comment.id,
       reelId: comment.reelId,
       parentId: comment.parentId,
-      author: commentWithRelations.author,
+      author: commentAuthor,
       content: comment.content,
       mentions: comment.mentions,
       likesCount: 0,

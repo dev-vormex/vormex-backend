@@ -5,6 +5,8 @@ import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { imageProcessingService } from '../services/image-processing.service';
 import { bunnyStorageService } from '../services/bunny-storage.service';
+import { pushNotificationService } from '../services/push-notification.service';
+import { getIO } from '../sockets';
 
 type GroupPrivacy = 'PUBLIC' | 'PRIVATE' | 'SECRET';
 type GroupMemberRole = 'OWNER' | 'ADMIN' | 'MODERATOR' | 'MEMBER';
@@ -83,6 +85,25 @@ const mapRoleToEnum = (role: string): GroupMemberRole => {
     owner: 'OWNER',
   };
   return roleMap[role.toLowerCase()] || 'MEMBER';
+};
+
+const buildGroupMessagePreview = (content: string, contentType: string): string => {
+  if (content && content.trim()) {
+    return content.trim();
+  }
+
+  switch (contentType) {
+    case 'image':
+      return 'Sent a photo';
+    case 'video':
+      return 'Sent a video';
+    case 'file':
+      return 'Sent a file';
+    case 'audio':
+      return 'Sent a voice message';
+    default:
+      return 'Sent a message';
+  }
 };
 
 /**
@@ -1224,6 +1245,28 @@ export const sendGroupMessage = async (
       return;
     }
 
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: {
+        id: true,
+        name: true,
+        iconImage: true,
+        imageUrl: true,
+        coverImage: true,
+        group_members: {
+          where: {
+            userId: { not: String(req.user.userId) },
+          },
+          select: { userId: true },
+        },
+      },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
     // Create message in database
     const message = await prisma.group_messages.create({
       data: {
@@ -1259,7 +1302,7 @@ export const sendGroupMessage = async (
     });
 
     const msg = message as typeof message & { users: unknown; group_messages: unknown };
-    res.status(201).json({
+    const messagePayload = {
       id: msg.id,
       groupId: msg.groupId,
       senderId: msg.senderId,
@@ -1275,7 +1318,34 @@ export const sendGroupMessage = async (
       reactions: [],
       createdAt: msg.createdAt.toISOString(),
       updatedAt: msg.updatedAt.toISOString(),
+    };
+
+    const sender = msg.users as { name?: string | null; username?: string | null; profileImage?: string | null } | null;
+    const senderName = sender?.name || sender?.username || 'Someone';
+    const groupImage = group.iconImage || group.imageUrl || group.coverImage || undefined;
+    const preview = buildGroupMessagePreview(message.content, message.contentType);
+    const recipientIds = group.group_members.map((member) => member.userId);
+
+    getIO()?.to(`group:${groupId}`).emit('group:new_message', {
+      ...messagePayload,
+      groupName: group.name,
+      groupImage: groupImage || '',
     });
+
+    if (recipientIds.length > 0) {
+      pushNotificationService.pushGroupMessageToUsers(
+        recipientIds,
+        group.name,
+        senderName,
+        preview,
+        groupId,
+        String(req.user.userId),
+        groupImage,
+        sender?.profileImage || undefined
+      ).catch(console.error);
+    }
+
+    res.status(201).json(messagePayload);
   } catch (error) {
     console.error('Error sending group message:', error);
     res.status(500).json({ error: 'Failed to send message' });

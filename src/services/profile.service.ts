@@ -1,12 +1,15 @@
 import { prisma } from '../config/prisma';
 import { cacheService } from './cache.service';
 import { isUUID } from '../utils/username.util';
+import { decryptToken } from '../utils/encryption.util';
 import type {
   UnifiedContentItem,
   UnifiedFeedResponse,
   FullProfileResponse,
 } from '../types/profile.types';
 import { getActivityHeatmap } from './activity.service';
+import { getGitHubContributionCalendar } from './github.service';
+import { socialProofService } from './social-proof.service';
 import {
   extractDomain,
   getPostMetadata,
@@ -400,14 +403,21 @@ export async function getFullProfile(
     }
 
     const targetUserId = user.id;
+    const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
+
+    if (requestingUserId && !isOwner) {
+      void socialProofService.trackProfileView(
+        requestingUserId,
+        targetUserId,
+        'profile_open'
+      );
+    }
+
     const cacheKey = `profile:bundle:${requestingUserId || 'anon'}:${targetUserId}`;
     const cached = await cacheService.get<FullProfileResponse>(cacheKey);
     if (cached) {
       return cached;
     }
-
-    // Check if requesting user is the owner
-    const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
 
     // All profiles are public - no privacy checks needed
 
@@ -583,6 +593,32 @@ export async function getFullProfile(
 
     const xpToNextLevel = calculateXpForNextLevel(stats.level) - stats.xp;
 
+    let contributionCalendar = githubStats?.contributionData || null;
+    if (
+      user.githubConnected &&
+      !contributionCalendar &&
+      user.githubAccessToken &&
+      user.githubUsername &&
+      githubStats
+    ) {
+      try {
+        const accessToken = decryptToken(user.githubAccessToken);
+        contributionCalendar = await getGitHubContributionCalendar(
+          user.githubUsername,
+          accessToken
+        );
+        await prisma.gitHubStats.update({
+          where: { userId: targetUserId },
+          data: { contributionData: contributionCalendar as any },
+        });
+      } catch (error) {
+        console.warn(
+          `Failed to backfill GitHub contribution calendar for ${targetUserId}:`,
+          error instanceof Error ? error.message : 'Unknown error'
+        );
+      }
+    }
+
     // Build GitHub object
     const github = {
       connected: user.githubConnected || false,
@@ -600,6 +636,7 @@ export async function getFullProfile(
             topRepos: githubStats.topRepos || [],
           }
         : null,
+      contributionCalendar,
       lastSyncedAt: user.githubLastSyncedAt,
     };
 

@@ -116,6 +116,7 @@ export interface FullProfileResponse {
       topLanguages: any[];
       topRepos: any[];
     } | null;
+    contributionCalendar: any | null;
     lastSyncedAt: Date | null;
   };
   activityHeatmap: any[]; // Array of ActivityHeatmapDay (for backward compatibility, full response available via /activity endpoint)

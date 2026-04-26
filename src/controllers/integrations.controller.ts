@@ -317,6 +317,7 @@ export const getGitHubStats = async (
     connected: boolean;
     username: string | null;
     stats: any;
+    contributionCalendar: any;
     lastSyncedAt: Date | null;
   } | ErrorResponse>
 ): Promise<void> => {
@@ -371,6 +372,7 @@ export const getGitHubStats = async (
         topLanguages: githubStats.topLanguages,
         topRepos: githubStats.topRepos,
       },
+      contributionCalendar: githubStats.contributionData || null,
       lastSyncedAt: user.githubLastSyncedAt,
     });
   } catch (error) {
@@ -380,4 +382,3 @@ export const getGitHubStats = async (
     });
   }
 };
-

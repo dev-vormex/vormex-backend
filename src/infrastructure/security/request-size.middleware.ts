@@ -1,9 +1,12 @@
-import type { RequestHandler } from 'express';
+import type { Request, RequestHandler } from 'express';
 
-export function requestSizeGuard(maxBytes: number): RequestHandler {
+type RequestSizeResolver = number | ((req: Request) => number);
+
+export function requestSizeGuard(maxBytes: RequestSizeResolver): RequestHandler {
   return (req, res, next) => {
+    const limit = typeof maxBytes === 'function' ? maxBytes(req) : maxBytes;
     const contentLength = Number(req.headers['content-length'] || 0);
-    if (contentLength > maxBytes) {
+    if (contentLength > limit) {
       res.status(413).json({
         error: 'Request body is too large',
       });

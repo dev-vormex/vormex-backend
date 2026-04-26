@@ -15,7 +15,7 @@ export interface CacheInvalidationPayload {
 }
 
 export interface NotificationDeliveryPayload {
-  kind: 'generic' | 'new_message';
+  kind: 'generic' | 'new_message' | 'group_message';
   userId: string;
   title: string;
   body: string;
@@ -25,6 +25,9 @@ export interface NotificationDeliveryPayload {
   senderName?: string;
   senderImage?: string;
   conversationId?: string;
+  groupId?: string;
+  groupName?: string;
+  groupImage?: string;
 }
 
 export interface RealtimeFanoutPayload {

@@ -42,6 +42,40 @@ export interface TopRepo {
   forks: number;
   language: string | null;
   description: string | null;
+  updatedAt: string;
+}
+
+export interface GitHubContributionDay {
+  color: string;
+  contributionCount: number;
+  contributionLevel:
+    | 'NONE'
+    | 'FIRST_QUARTILE'
+    | 'SECOND_QUARTILE'
+    | 'THIRD_QUARTILE'
+    | 'FOURTH_QUARTILE';
+  date: string;
+  weekday: number;
+}
+
+export interface GitHubContributionWeek {
+  firstDay: string;
+  contributionDays: GitHubContributionDay[];
+}
+
+export interface GitHubContributionMonth {
+  firstDay: string;
+  name: string;
+  totalWeeks: number;
+  year: number;
+}
+
+export interface GitHubContributionCalendar {
+  colors: string[];
+  contributionYears: number[];
+  months: GitHubContributionMonth[];
+  totalContributions: number;
+  weeks: GitHubContributionWeek[];
 }
 
 export interface GitHubSyncResult {
@@ -50,4 +84,3 @@ export interface GitHubSyncResult {
   stats?: any;
   error?: string;
 }
-

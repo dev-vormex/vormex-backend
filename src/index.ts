@@ -33,6 +33,7 @@ import peopleRoutes from './routes/people.routes';
 import matchingRoutes from './routes/matching.routes';
 import accountabilityRoutes from './routes/accountability.routes';
 import groupsRoutes from './routes/groups.routes';
+import circlesRoutes from './routes/circles.routes';
 import onboardingRoutes from './routes/onboarding.routes';
 import gamesRoutes from './routes/games.routes';
 import locationRoutes from './routes/location.routes';
@@ -71,6 +72,10 @@ import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
 import { createRateLimitMiddleware } from './middleware/rate-limit.middleware';
 import { getPostMetadata, mapPollOptionsForResponse } from './utils/post.util';
 import { pushNotificationService } from './services/push-notification.service';
+import {
+  getAgentAccessDeniedMessage,
+  getPremiumAccessSnapshot,
+} from './services/premium-access.service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from './outbox/helpers';
 
 // Validate required environment variables
@@ -141,12 +146,7 @@ const getSocketUserId = (socket: any): string | null => {
 
 // Helper to emit to user by userId (all their connected sockets)
 const emitToUser = (userId: string, event: string, data: any) => {
-  const userSocketIds = userSockets.get(userId);
-  if (userSocketIds) {
-    userSocketIds.forEach(socketId => {
-      io.to(socketId).emit(event, data);
-    });
-  }
+  io.to(`user:${userId}`).emit(event, data);
 };
 
 // User select for chat queries
@@ -158,6 +158,44 @@ const chatUserSelect = {
   isOnline: true,
   lastActiveAt: true,
 };
+
+const buildGroupMessagePreview = (content: string, contentType: string): string => {
+  if (content && content.trim()) {
+    return content.trim();
+  }
+
+  switch (contentType) {
+    case 'image':
+      return 'Sent a photo';
+    case 'video':
+      return 'Sent a video';
+    case 'file':
+      return 'Sent a file';
+    case 'audio':
+      return 'Sent a voice message';
+    default:
+      return 'Sent a message';
+  }
+};
+
+async function isConversationParticipant(conversationId: string, userId: string): Promise<boolean> {
+  if (!conversationId || !userId) {
+    return false;
+  }
+
+  const conversation = await prisma.conversations.findFirst({
+    where: {
+      id: conversationId,
+      OR: [
+        { participant1Id: userId },
+        { participant2Id: userId },
+      ],
+    },
+    select: { id: true },
+  });
+
+  return Boolean(conversation);
+}
 
 const feedRealtimeRoom = 'feed:global';
 const postCommentAuthorSelect = {
@@ -680,6 +718,7 @@ io.on('connection', async (socket) => {
       
       // Track socket-user mapping
       socketUsers.set(socket.id, userId);
+      const wasOffline = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
       if (!userSockets.has(userId)) {
         userSockets.set(userId, new Set());
       }
@@ -687,6 +726,16 @@ io.on('connection', async (socket) => {
       
       // Join user's personal room for notifications
       socket.join(`user:${userId}`);
+
+      if (wasOffline) {
+        prisma.user.update({
+          where: { id: userId },
+          data: { isOnline: true, lastActiveAt: new Date() },
+        }).catch((error) => {
+          console.error('Failed to mark socket user online:', error);
+        });
+        socket.broadcast.emit('user:online', { userId });
+      }
       
       console.log(`✅ Socket ${socket.id} authenticated as user ${userId}`);
     } catch (error) {
@@ -723,6 +772,15 @@ io.on('connection', async (socket) => {
       if (!sessionId) {
         socket.emit('agent:voice_error', {
           error: 'An agent session is required before starting realtime voice.',
+        });
+        return;
+      }
+
+      const snapshot = await getPremiumAccessSnapshot(authenticatedUserId);
+      if (!snapshot.canUseAgent) {
+        socket.emit('agent:voice_error', {
+          sessionId,
+          error: getAgentAccessDeniedMessage(snapshot),
         });
         return;
       }
@@ -956,11 +1014,28 @@ io.on('connection', async (socket) => {
   // ============================================
 
   // Join chat room (handle both { conversationId } and data?.conversationId for mobile clients)
-  socket.on('chat:join', (data) => {
+  socket.on('chat:join', async (data) => {
+    const userId = getSocketUserId(socket);
+    if (!userId) {
+      socket.emit('error', { message: 'Not authenticated' });
+      return;
+    }
+
     const conversationId = data?.conversationId ?? data;
     if (conversationId && typeof conversationId === 'string') {
-      socket.join(`chat:${conversationId}`);
-      console.log(`Socket ${socket.id} joined chat:${conversationId}`);
+      try {
+        const allowed = await isConversationParticipant(conversationId, userId);
+        if (!allowed) {
+          socket.emit('error', { message: 'Conversation not found' });
+          return;
+        }
+
+        socket.join(`chat:${conversationId}`);
+        console.log(`Socket ${socket.id} joined chat:${conversationId}`);
+      } catch (error) {
+        console.error('chat:join error:', error);
+        socket.emit('error', { message: 'Failed to join conversation' });
+      }
     } else {
       console.warn('chat:join received invalid data:', JSON.stringify(data));
     }
@@ -975,15 +1050,24 @@ io.on('connection', async (socket) => {
   });
 
   // Send chat message
-  socket.on('chat:send_message', async (data) => {
+  socket.on('chat:send_message', async (data, ack) => {
+    const acknowledge = typeof ack === 'function' ? ack : undefined;
+    const failSend = (message: string) => {
+      socket.emit('error', { message });
+      acknowledge?.({ ok: false, error: message });
+    };
     const senderId = getSocketUserId(socket);
     if (!senderId) {
-      socket.emit('error', { message: 'Not authenticated' });
+      failSend('Not authenticated');
       return;
     }
 
     try {
       const { conversationId, content, contentType, mediaUrl, mediaType, fileName, fileSize, replyToId } = data;
+      if (!conversationId || (!content && !mediaUrl)) {
+        failSend('Content or media is required');
+        return;
+      }
 
       // Verify user is part of conversation
       const conversation = await prisma.conversations.findFirst({
@@ -997,7 +1081,7 @@ io.on('connection', async (socket) => {
       });
 
       if (!conversation) {
-        socket.emit('error', { message: 'Conversation not found' });
+        failSend('Conversation not found');
         return;
       }
 
@@ -1105,9 +1189,10 @@ io.on('connection', async (socket) => {
       updateEngagementStreak(senderId, 'messaging').catch(console.error);
 
       console.log(`Message sent in conversation ${conversationId} by user ${senderId}`);
+      acknowledge?.({ ok: true, message: messagePayload });
     } catch (error) {
       console.error('chat:send_message error:', error);
-      socket.emit('error', { message: 'Failed to send message' });
+      failSend('Failed to send message');
     }
   });
 
@@ -1115,6 +1200,7 @@ io.on('connection', async (socket) => {
   socket.on('chat:typing', async ({ conversationId, isTyping }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
+    if (!conversationId || !socket.rooms.has(`chat:${conversationId}`)) return;
 
     socket.to(`chat:${conversationId}`).emit('chat:user_typing', {
       conversationId,
@@ -1398,6 +1484,28 @@ io.on('connection', async (socket) => {
         return;
       }
 
+      const group = await prisma.groups.findUnique({
+        where: { id: groupId },
+        select: {
+          id: true,
+          name: true,
+          iconImage: true,
+          imageUrl: true,
+          coverImage: true,
+          group_members: {
+            where: {
+              userId: { not: userId },
+            },
+            select: { userId: true },
+          },
+        },
+      });
+
+      if (!group) {
+        socket.emit('error', { message: 'Group not found' });
+        return;
+      }
+
       // Create message in database
       const message = await prisma.group_messages.create({
         data: {
@@ -1447,7 +1555,27 @@ io.on('connection', async (socket) => {
       };
 
       // Broadcast to group
-      io.to(`group:${groupId}`).emit('group:new_message', messagePayload);
+      const groupImage = group.iconImage || group.imageUrl || group.coverImage || undefined;
+      io.to(`group:${groupId}`).emit('group:new_message', {
+        ...messagePayload,
+        groupName: group.name,
+        groupImage: groupImage || '',
+      });
+
+      const sender = (message as typeof message & { users: any }).users;
+      const recipientIds = group.group_members.map((member: { userId: string }) => member.userId);
+      if (recipientIds.length > 0) {
+        pushNotificationService.pushGroupMessageToUsers(
+          recipientIds,
+          group.name,
+          sender?.name || sender?.username || 'Someone',
+          buildGroupMessagePreview(message.content, message.contentType),
+          groupId,
+          userId,
+          groupImage,
+          sender?.profileImage || undefined
+        ).catch(console.error);
+      }
 
       console.log(`Group message sent in ${groupId} by user ${userId}`);
     } catch (error) {
@@ -1554,17 +1682,39 @@ io.on('connection', async (socket) => {
       // Don't count own views
       if (story.authorId === viewerUserId) return;
 
-      const newViewsCount = story.viewsCount + 1;
-      await prisma.stories.update({
-        where: { id: storyId },
-        data: { viewsCount: newViewsCount },
+      let isNewView = false;
+      try {
+        await prisma.story_views.create({
+          data: {
+            storyId,
+            viewerId: viewerUserId,
+          },
+        });
+        isNewView = true;
+      } catch (error: any) {
+        if (error.code !== 'P2002') {
+          throw error;
+        }
+      }
+
+      const viewsCount = await prisma.story_views.count({
+        where: { storyId },
       });
 
+      if (story.viewsCount !== viewsCount) {
+        await prisma.stories.update({
+          where: { id: storyId },
+          data: { viewsCount },
+        });
+      }
+
       // Notify story author for live view count update
-      io.to(`user:${story.authorId}`).emit('story:viewed', {
-        storyId,
-        viewsCount: newViewsCount,
-      });
+      if (isNewView) {
+        io.to(`user:${story.authorId}`).emit('story:viewed', {
+          storyId,
+          viewsCount,
+        });
+      }
     } catch (err) {
       console.error('story:view error:', err);
     }
@@ -1589,6 +1739,13 @@ io.on('connection', async (socket) => {
       userSockets.get(userId)?.delete(socket.id);
       if (userSockets.get(userId)?.size === 0) {
         userSockets.delete(userId);
+        prisma.user.update({
+          where: { id: userId },
+          data: { isOnline: false, lastActiveAt: new Date() },
+        }).catch((error) => {
+          console.error('Failed to mark socket user offline:', error);
+        });
+        socket.broadcast.emit('user:offline', { userId });
       }
       socketUsers.delete(socket.id);
 
@@ -1639,11 +1796,24 @@ const generalApiRateLimit = createRateLimitMiddleware((req) => [
       ]
     : []),
 ]);
+const DEFAULT_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
+const CHAT_UPLOAD_MAX_BYTES = 150 * 1024 * 1024;
+
+const isChatMediaUploadRequest = (req: Request): boolean => {
+  if (req.method !== 'POST') {
+    return false;
+  }
+
+  const path = req.path.replace(/\/$/, '');
+  return path === '/api/chat/upload' || path === '/api/upload/chat';
+};
 
 app.use(httpLogger);
 app.use(metricsMiddleware);
 app.use(helmet());
-app.use(requestSizeGuard(5 * 1024 * 1024));
+app.use(requestSizeGuard((req) =>
+  isChatMediaUploadRequest(req) ? CHAT_UPLOAD_MAX_BYTES : DEFAULT_REQUEST_MAX_BYTES
+));
 app.use(compression());
 app.use(cors({
   origin: (origin, callback) => {
@@ -1749,6 +1919,7 @@ app.use('/api/people', peopleRoutes);
 app.use('/api/matching', matchingRoutes);
 app.use('/api/accountability', accountabilityRoutes);
 app.use('/api/groups', groupsRoutes);
+app.use('/api/circles', circlesRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/games', gamesRoutes);
 app.use('/api/location', locationRoutes);
