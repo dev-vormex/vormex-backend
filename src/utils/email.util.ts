@@ -18,6 +18,11 @@ type ResendHeaders = Record<string, string | number | undefined> | null | undefi
 
 let emailServiceCheckCache: EmailServiceCheckCache | null = null;
 
+function getResendResponseHeaders(response: unknown): ResendHeaders {
+  const headers = (response as { headers?: ResendHeaders } | null | undefined)?.headers;
+  return headers ?? null;
+}
+
 class EmailSendError extends Error {
   code: string;
   statusCode: number;
@@ -386,7 +391,7 @@ async function sendEmail(params: {
     });
 
     if (result.error) {
-      throw normalizeResendSendError(result.error, result.headers);
+      throw normalizeResendSendError(result.error, getResendResponseHeaders(result));
     }
 
     if (!result.data) {

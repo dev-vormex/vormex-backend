@@ -745,7 +745,8 @@ DATABASE_URL=postgresql://...
 
 # JWT
 JWT_SECRET=your-secret-key
-JWT_EXPIRES_IN=7d
+JWT_EXPIRES_IN=365d
+AUTH_SESSION_TTL_SECONDS=31536000
 
 # Google OAuth
 GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com

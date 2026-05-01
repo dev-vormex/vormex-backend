@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate, optionalAuth } from '../middleware/auth.middleware';
+import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
 import { uploadMiddleware } from '../controllers/upload.controller';
 import {
   createGroup,
@@ -25,6 +26,20 @@ import {
 } from '../controllers/groups.controller';
 
 const router = Router();
+const mediaWriteLimit = createRateLimitMiddleware((req) => [
+  {
+    keyPrefix: 'rate:ip:media',
+    limit: 60,
+    windowSeconds: 10 * 60,
+  },
+  ...(req.user?.userId
+    ? [{
+        keyPrefix: 'rate:user:media',
+        limit: 30,
+        windowSeconds: 10 * 60,
+      }]
+    : []),
+]);
 
 // Static routes first
 router.get('/my', authenticate, getMyGroups);
@@ -41,8 +56,8 @@ router.get('/', optionalAuth, listGroups);
 // Dynamic routes
 router.get('/:identifier', optionalAuth, getGroup);
 router.put('/:groupId', authenticate, updateGroup);
-router.post('/:groupId/upload/icon', authenticate, uploadMiddleware, uploadGroupIcon);
-router.post('/:groupId/upload/cover', authenticate, uploadMiddleware, uploadGroupCover);
+router.post('/:groupId/upload/icon', authenticate, mediaWriteLimit, uploadMiddleware, uploadGroupIcon);
+router.post('/:groupId/upload/cover', authenticate, mediaWriteLimit, uploadMiddleware, uploadGroupCover);
 router.delete('/:groupId', authenticate, deleteGroup);
 router.post('/:groupId/join', authenticate, joinGroup);
 router.post('/:groupId/leave', authenticate, leaveGroup);

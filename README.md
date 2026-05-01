@@ -6,7 +6,7 @@ Professional social networking platform for students - LinkedIn + Instagram reel
 
 ### Prerequisites
 
-- Node.js 18+ and npm
+- Node.js 20+ and npm
 - PostgreSQL database
 - Environment variables configured (see `.env.example`)
 

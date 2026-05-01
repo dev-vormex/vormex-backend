@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response, Router } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
+import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
 import {
   getConversations,
   getOrCreateConversation,
@@ -24,12 +25,29 @@ import { uploadChatMedia } from '../controllers/upload.controller';
 
 const router = Router();
 const CHAT_VIDEO_MAX_BYTES = 150 * 1024 * 1024;
+const mediaWriteLimit = createRateLimitMiddleware((req) => [
+  {
+    keyPrefix: 'rate:ip:media',
+    limit: 60,
+    windowSeconds: 10 * 60,
+  },
+  ...(req.user?.userId
+    ? [{
+        keyPrefix: 'rate:user:media',
+        limit: 30,
+        windowSeconds: 10 * 60,
+      }]
+    : []),
+]);
 
 // Chat media upload middleware
 const chatUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: CHAT_VIDEO_MAX_BYTES, // Videos are capped at 90 seconds client-side.
+    files: 1,
+    parts: 10,
+    fieldSize: 256 * 1024,
   },
 });
 
@@ -70,6 +88,6 @@ router.get('/requests', getMessageRequests);
 router.get('/requests/count', getMessageRequestsCount);
 router.post('/requests/:conversationId/accept', acceptMessageRequest);
 router.delete('/requests/:conversationId', declineMessageRequest);
-router.post('/upload', handleChatUpload, uploadChatMedia);
+router.post('/upload', mediaWriteLimit, handleChatUpload, uploadChatMedia);
 
 export default router;

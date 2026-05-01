@@ -20,6 +20,9 @@ const voiceUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 20 * 1024 * 1024,
+    files: 1,
+    parts: 5,
+    fieldSize: 128 * 1024,
   },
 });
 

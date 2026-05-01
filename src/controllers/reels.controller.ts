@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { Request, Response } from 'express';
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { bunnyStreamService } from '../services/bunny-stream.service';
@@ -20,6 +20,34 @@ const reelCommentAuthorSelect = {
   profileImage: true,
   headline: true,
 };
+
+function verifyBunnyStreamSignature(req: Request): boolean {
+  const secret = process.env.BUNNY_STREAM_WEBHOOK_SECRET;
+  if (!secret) {
+    return process.env.NODE_ENV !== 'production';
+  }
+
+  const signature = req.headers['x-bunnystream-signature'];
+  const version = req.headers['x-bunnystream-signature-version'];
+  const algorithm = req.headers['x-bunnystream-signature-algorithm'];
+  const rawBody = (req as any).rawBody;
+
+  if (
+    version !== 'v1'
+    || algorithm !== 'hmac-sha256'
+    || typeof signature !== 'string'
+    || !Buffer.isBuffer(rawBody)
+  ) {
+    return false;
+  }
+
+  const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+  if (!/^[0-9a-f]{64}$/.test(signature) || signature.length !== expected.length) {
+    return false;
+  }
+
+  return timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(signature, 'utf8'));
+}
 
 function mapReelCommentAuthor(author: any) {
   if (!author) {
@@ -218,9 +246,10 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
 
     const hasMore = reels.length > limit;
     const pageItems = hasMore ? reels.slice(0, limit) : reels;
+    const rankedItems = mode === 'following' ? pageItems : rankForYouReels(pageItems);
 
     res.json({
-      reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
+      reels: rankedItems.map((reel) => mapReelResponse(reel, currentUserId)),
       nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
       hasMore,
     });
@@ -440,6 +469,40 @@ function safeJsonParse<T>(val: string | undefined, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function boundedNumber(value: unknown, fallback = 0): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function reelForYouScore(reel: any): number {
+  const publishedAt = reel.publishedAt ? new Date(reel.publishedAt).getTime() : Date.now();
+  const ageHours = Math.max(0, (Date.now() - publishedAt) / (60 * 60 * 1000));
+  const durationMs = Math.max(1000, boundedNumber(reel.durationSeconds, 0) * 1000);
+  const averageWatchRatio = Math.min(1, boundedNumber(reel.avgWatchTimeMs, 0) / durationMs);
+  const completionRate = Math.min(1, Math.max(0, boundedNumber(reel.completionRate, 0)));
+  const engagement =
+    Math.log1p(boundedNumber(reel.likesCount)) * 0.9 +
+    Math.log1p(boundedNumber(reel.commentsCount)) * 1.35 +
+    Math.log1p(boundedNumber(reel.savesCount)) * 1.6 +
+    Math.log1p(boundedNumber(reel.sharesCount)) * 1.75;
+  const quality = averageWatchRatio * 2.5 + completionRate * 3.5;
+  const freshness = 4 / (1 + ageHours / 18);
+  const newCreatorBoost =
+    boundedNumber(reel.viewsCount) < 50 && ageHours < 24
+      ? 1.2
+      : 0;
+
+  return freshness + quality + engagement + newCreatorBoost;
+}
+
+function rankForYouReels(reels: any[]): any[] {
+  return [...reels].sort((a, b) => {
+    const delta = reelForYouScore(b) - reelForYouScore(a);
+    if (Math.abs(delta) > 0.0001) return delta;
+    return new Date(b.publishedAt || b.createdAt).getTime() - new Date(a.publishedAt || a.createdAt).getTime();
+  });
 }
 
 export const createReel = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -1218,12 +1281,15 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
   }
 };
 
+const VIEW_BATCH_MAX_ITEMS = Number(process.env.REELS_VIEW_BATCH_MAX_ITEMS || 500);
 let viewBatch: Map<string, { reelId: string; userId?: string; watchTimeMs: number; completed: boolean; source?: string }[]> = new Map();
 let viewBatchTimeout: NodeJS.Timeout | null = null;
+let viewBatchItemCount = 0;
 
 async function flushViewBatch() {
   const batch = viewBatch;
   viewBatch = new Map();
+  viewBatchItemCount = 0;
 
   for (const [reelId, views] of batch) {
     try {
@@ -1332,8 +1398,15 @@ export const trackView = async (req: AuthRequest, res: Response): Promise<void> 
       source,
     });
     viewBatch.set(reelId, reelViews);
+    viewBatchItemCount += 1;
 
-    if (!viewBatchTimeout) {
+    if (viewBatchItemCount >= VIEW_BATCH_MAX_ITEMS) {
+      if (viewBatchTimeout) {
+        clearTimeout(viewBatchTimeout);
+        viewBatchTimeout = null;
+      }
+      setImmediate(() => flushViewBatch().catch(console.error));
+    } else if (!viewBatchTimeout) {
       viewBatchTimeout = setTimeout(() => {
         viewBatchTimeout = null;
         flushViewBatch().catch(console.error);
@@ -2316,6 +2389,11 @@ export const reportReel = async (req: AuthRequest, res: Response): Promise<void>
 
 export const transcodingWebhook = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (!verifyBunnyStreamSignature(req)) {
+      res.status(401).json({ error: 'Invalid webhook signature' });
+      return;
+    }
+
     const { VideoGuid, Status, LibraryId } = req.body;
 
     if (LibraryId !== process.env.BUNNY_STREAM_LIBRARY_ID) {

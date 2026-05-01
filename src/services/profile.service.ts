@@ -115,6 +115,7 @@ function formatUnifiedItem(item: any, contentType: string): UnifiedContentItem {
 
     baseItem.videoUrl = videoUrl || undefined;
     baseItem.videoThumbnail = videoThumbnail || undefined;
+    baseItem.defaultVideoId = metadata.defaultVideoId || undefined;
     baseItem.linkUrl = linkUrl || undefined;
     baseItem.linkTitle = metadata.linkTitle || metadata.linkDomain || undefined;
     baseItem.linkDescription = metadata.linkDescription || undefined;

@@ -27,6 +27,7 @@ export interface UnifiedContentItem {
   tags?: string[];
   videoUrl?: string;
   videoThumbnail?: string;
+  defaultVideoId?: string;
   linkUrl?: string;
   linkTitle?: string;
   linkDescription?: string;

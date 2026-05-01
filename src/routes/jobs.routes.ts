@@ -22,15 +22,18 @@ router.get('/companies/:slug', getCompany);
 router.get('/', getJobs);
 router.get('/featured', getFeaturedJobs);
 router.get('/types', getJobTypes);
-router.get('/:slug', getJob);
 
 // Protected routes
+router.get('/applications/me', authenticate, getMyApplications);
+router.get('/saved', authenticate, getSavedJobs);
+
+router.get('/:slug', getJob);
+
+// Protected routes with dynamic IDs
 router.use(authenticate);
 
 router.post('/:jobId/apply', applyToJob);
-router.get('/applications/me', getMyApplications);
 router.post('/:jobId/save', saveJob);
 router.delete('/:jobId/save', unsaveJob);
-router.get('/saved', getSavedJobs);
 
 export default router;

@@ -1,0 +1,24 @@
+{
+  "description": "Example custom scenario. Copy this file and replace the paths/body with the flow you want to test.",
+  "requiresAuth": false,
+  "requests": [
+    {
+      "name": "health-live",
+      "method": "GET",
+      "path": "/api/health/live",
+      "weight": 2
+    },
+    {
+      "name": "public-reels-feed",
+      "method": "GET",
+      "path": "/api/reels/feed?limit=10",
+      "weight": 4
+    },
+    {
+      "name": "public-people-search",
+      "method": "GET",
+      "path": "/api/people?limit=10",
+      "weight": 3
+    }
+  ]
+}

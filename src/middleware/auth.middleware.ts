@@ -1,7 +1,26 @@
 import { Response, NextFunction } from 'express';
-import { verifyToken } from '../utils/jwt.util';
+import { verifyToken, type JWTPayload } from '../utils/jwt.util';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { getRequestId, getRequestLogger } from '../lib/logger';
+import { getAuthSession } from '../services/auth-session.service';
+
+async function isTokenSessionActive(decoded: JWTPayload): Promise<boolean> {
+  if (!decoded.sessionId) {
+    return true;
+  }
+
+  const session = await getAuthSession(decoded.sessionId);
+  return Boolean(session && session.userId === String(decoded.userId));
+}
+
+export async function verifyAccessToken(token: string): Promise<JWTPayload> {
+  const decoded = verifyToken(token);
+  const sessionActive = await isTokenSessionActive(decoded);
+  if (!sessionActive) {
+    throw new Error('Session is no longer active');
+  }
+  return decoded;
+}
 
 /**
  * Authentication middleware
@@ -47,7 +66,7 @@ export const authenticate = async (
 
     // Verify token
     try {
-      const decoded = verifyToken(token);
+      const decoded = await verifyAccessToken(token);
 
       // Attach user info to request
       req.user = {
@@ -122,7 +141,7 @@ export const optionalAuth = async (
     const token = parts[1];
 
     try {
-      const decoded = verifyToken(token);
+      const decoded = await verifyAccessToken(token);
       req.user = {
         userId: decoded.userId,
       };

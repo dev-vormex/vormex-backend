@@ -73,6 +73,7 @@ import { initializeRealtimeSubscriptions } from './infrastructure/realtime/subsc
 import { requestSizeGuard } from './infrastructure/security/request-size.middleware';
 import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
 import { createRateLimitMiddleware } from './middleware/rate-limit.middleware';
+import { optionalAuth, verifyAccessToken } from './middleware/auth.middleware';
 import { getPostMetadata, mapPollOptionsForResponse } from './utils/post.util';
 import { pushNotificationService } from './services/push-notification.service';
 import {
@@ -130,9 +131,6 @@ if (isRedisEnabled() && redisPub && redisSub) {
       console.error('Failed to initialize Redis realtime infrastructure:', error);
     });
 }
-
-// Import JWT verification for socket auth
-import { verifyToken } from './utils/jwt.util';
 
 // Import activity service for engagement tracking
 import { recordActivity } from './services/activity.service';
@@ -716,7 +714,7 @@ io.on('connection', async (socket) => {
 
   if (token) {
     try {
-      const decoded = verifyToken(token);
+      const decoded = await verifyAccessToken(token);
       userId = String(decoded.userId);
       
       // Track socket-user mapping
@@ -1800,23 +1798,50 @@ const generalApiRateLimit = createRateLimitMiddleware((req) => [
     : []),
 ]);
 const DEFAULT_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
+const IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const STORY_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const POST_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 const CHAT_UPLOAD_MAX_BYTES = 150 * 1024 * 1024;
 
-const isChatMediaUploadRequest = (req: Request): boolean => {
+const getRequestMaxBytes = (req: Request): number => {
   if (req.method !== 'POST') {
-    return false;
+    return DEFAULT_REQUEST_MAX_BYTES;
   }
 
   const path = req.path.replace(/\/$/, '');
-  return path === '/api/chat/upload' || path === '/api/upload/chat';
+  if (path === '/api/posts') {
+    return POST_UPLOAD_MAX_BYTES;
+  }
+  if (path === '/api/reels' || path === '/api/chat/upload' || path === '/api/upload/chat') {
+    return CHAT_UPLOAD_MAX_BYTES;
+  }
+  if (path === '/api/stories') {
+    return STORY_UPLOAD_MAX_BYTES;
+  }
+  if (
+    path === '/api/upload/avatar'
+    || path === '/api/upload/banner'
+    || path === '/api/upload/certificate'
+    || path === '/api/upload/project'
+    || path === '/api/upload/logo'
+    || path === '/api/upload/group-icon'
+    || path === '/api/upload/group-cover'
+    || /^\/api\/groups\/[^/]+\/upload\/(icon|cover)$/.test(path)
+    || path === '/api/users/me/avatar'
+    || path === '/api/users/me/banner'
+  ) {
+    return IMAGE_UPLOAD_MAX_BYTES;
+  }
+  if (/^\/api\/agent\/sessions\/[^/]+\/voice$/.test(path)) {
+    return 20 * 1024 * 1024;
+  }
+  return DEFAULT_REQUEST_MAX_BYTES;
 };
 
 app.use(httpLogger);
 app.use(metricsMiddleware);
 app.use(helmet());
-app.use(requestSizeGuard((req) =>
-  isChatMediaUploadRequest(req) ? CHAT_UPLOAD_MAX_BYTES : DEFAULT_REQUEST_MAX_BYTES
-));
+app.use(requestSizeGuard(getRequestMaxBytes));
 app.use(compression());
 app.use(cors({
   origin: (origin, callback) => {
@@ -1836,7 +1861,12 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({
+  limit: '5mb',
+  verify: (req, _res, buf) => {
+    (req as any).rawBody = Buffer.from(buf);
+  },
+}));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 /**
@@ -1898,7 +1928,7 @@ app.get('/metrics', async (_req: Request, res: Response): Promise<void> => {
 
 // API Documentation (Swagger UI)
 setupSwagger(app, PORT);
-app.use('/api', generalApiRateLimit);
+app.use('/api', optionalAuth, generalApiRateLimit);
 
 // API Routes
 app.use('/api/auth', authRoutes);

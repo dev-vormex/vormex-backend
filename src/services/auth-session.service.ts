@@ -2,9 +2,9 @@ import crypto from 'node:crypto';
 import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
 import { redisCommand } from '../infrastructure/redis/client';
 
-const SESSION_TTL_SECONDS = Number(process.env.AUTH_SESSION_TTL_SECONDS || 60 * 60 * 24 * 30);
+const SESSION_TTL_SECONDS = Number(process.env.AUTH_SESSION_TTL_SECONDS || 60 * 60 * 24 * 365);
 
-type StoredSession = {
+export type StoredSession = {
   sessionId: string;
   userId: string;
   refreshTokenHash: string;
@@ -16,6 +16,20 @@ type StoredSession = {
 
 function sessionKey(sessionId: string): string {
   return `auth:session:${sessionId}`;
+}
+
+export async function getAuthSession(sessionId: string): Promise<StoredSession | null> {
+  const session = await redisCacheService.get<StoredSession>(sessionKey(sessionId));
+  if (!session) {
+    return null;
+  }
+
+  if (new Date(session.expiresAt).getTime() <= Date.now()) {
+    await redisCacheService.del(sessionKey(sessionId));
+    return null;
+  }
+
+  return session;
 }
 
 function userSessionsKey(userId: string): string {
@@ -87,7 +101,7 @@ export async function rotateAuthSession(refreshToken: string): Promise<{
     return null;
   }
 
-  const existing = await redisCacheService.get<StoredSession>(sessionKey(parsed.sessionId));
+  const existing = await getAuthSession(parsed.sessionId);
   if (!existing || existing.refreshTokenHash !== hashSecret(parsed.secret)) {
     return null;
   }

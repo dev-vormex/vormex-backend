@@ -198,33 +198,105 @@ export const getPeople = async (
       prisma.user.count({ where }),
     ]);
 
-    const people: PersonCard[] = await Promise.all(
-      users.map(async (user) => {
-        const connectionStatus = userId
-          ? await getConnectionStatus(userId, user.id)
-          : 'none';
-        const mutualConnections = userId
-          ? await getMutualConnectionsCount(userId, user.id)
-          : 0;
+    const targetIds = users.map((user) => user.id);
+    const targetIdSet = new Set(targetIds);
+    const connectionStatusByUser = new Map<string, PersonCard['connectionStatus']>();
+    const mutualConnectionsByUser = new Map<string, number>();
 
-        return {
-          id: user.id,
-          username: user.username,
-          name: user.name,
-          profileImage: user.profileImage,
-          bannerImageUrl: user.bannerImageUrl,
-          headline: user.headline,
-          college: user.college,
-          branch: user.branch,
-          bio: user.bio,
-          skills: user.skills.map((s) => s.skill.name),
-          interests: user.interests,
-          isOnline: user.isOnline,
-          connectionStatus,
-          mutualConnections,
-        };
-      })
-    );
+    if (userId && targetIds.length > 0) {
+      const [directConnections, currentUserConnections] = await Promise.all([
+        prisma.connections.findMany({
+          where: {
+            OR: [
+              { requesterId: userId, addresseeId: { in: targetIds } },
+              { requesterId: { in: targetIds }, addresseeId: userId },
+            ],
+          },
+          select: { requesterId: true, addresseeId: true, status: true },
+        }),
+        prisma.connections.findMany({
+          where: {
+            status: 'accepted',
+            OR: [
+              { requesterId: userId },
+              { addresseeId: userId },
+            ],
+          },
+          select: { requesterId: true, addresseeId: true },
+        }),
+      ]);
+
+      for (const connection of directConnections) {
+        const targetUserId = connection.requesterId === userId
+          ? connection.addresseeId
+          : connection.requesterId;
+        if (connection.status === 'accepted') {
+          connectionStatusByUser.set(targetUserId, 'connected');
+        } else if (connection.status === 'pending') {
+          connectionStatusByUser.set(
+            targetUserId,
+            connection.requesterId === userId ? 'pending_sent' : 'pending_received'
+          );
+        }
+      }
+
+      const currentConnectionIds = Array.from(new Set(
+        currentUserConnections.map((connection) =>
+          connection.requesterId === userId ? connection.addresseeId : connection.requesterId
+        )
+      ));
+
+      if (currentConnectionIds.length > 0) {
+        const mutualRows = await prisma.connections.findMany({
+          where: {
+            status: 'accepted',
+            OR: [
+              { requesterId: { in: targetIds }, addresseeId: { in: currentConnectionIds } },
+              { requesterId: { in: currentConnectionIds }, addresseeId: { in: targetIds } },
+            ],
+          },
+          select: { requesterId: true, addresseeId: true },
+        });
+
+        const mutualSetsByUser = new Map<string, Set<string>>();
+        for (const connection of mutualRows) {
+          const targetUserId = targetIdSet.has(connection.requesterId)
+            ? connection.requesterId
+            : targetIdSet.has(connection.addresseeId)
+              ? connection.addresseeId
+              : null;
+          if (!targetUserId) continue;
+
+          const mutualUserId = connection.requesterId === targetUserId
+            ? connection.addresseeId
+            : connection.requesterId;
+          const mutualSet = mutualSetsByUser.get(targetUserId) || new Set<string>();
+          mutualSet.add(mutualUserId);
+          mutualSetsByUser.set(targetUserId, mutualSet);
+        }
+
+        for (const [targetUserId, mutualSet] of mutualSetsByUser) {
+          mutualConnectionsByUser.set(targetUserId, mutualSet.size);
+        }
+      }
+    }
+
+    const people: PersonCard[] = users.map((user) => ({
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      profileImage: user.profileImage,
+      bannerImageUrl: user.bannerImageUrl,
+      headline: user.headline,
+      college: user.college,
+      branch: user.branch,
+      bio: user.bio,
+      skills: user.skills.map((s) => s.skill.name),
+      interests: user.interests,
+      isOnline: user.isOnline,
+      connectionStatus: connectionStatusByUser.get(user.id) || 'none',
+      mutualConnections: mutualConnectionsByUser.get(user.id) || 0,
+    }));
 
     const totalPages = Math.ceil(total / limit);
 

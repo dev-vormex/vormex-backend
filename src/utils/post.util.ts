@@ -18,6 +18,7 @@ export interface StoredPostMetadata {
   videoDuration?: number | null;
   videoSize?: number | null;
   videoFormat?: string | null;
+  defaultVideoId?: string | null;
   documentUrl?: string | null;
   documentName?: string | null;
   documentType?: string | null;
@@ -204,6 +205,7 @@ export function getPostMetadata(value: unknown): StoredPostMetadata {
     videoDuration: asNumber(metadata.videoDuration),
     videoSize: asNumber(metadata.videoSize),
     videoFormat: asTrimmedString(metadata.videoFormat),
+    defaultVideoId: asTrimmedString(metadata.defaultVideoId),
     documentUrl: normalizeUrl(metadata.documentUrl),
     documentName: asTrimmedString(metadata.documentName),
     documentType: asTrimmedString(metadata.documentType),
@@ -362,6 +364,7 @@ export function mapPostResponse(post: any, currentUserId: string) {
     videoDuration: metadata.videoDuration ?? null,
     videoSize: metadata.videoSize ?? null,
     videoFormat: metadata.videoFormat ?? null,
+    defaultVideoId: metadata.defaultVideoId ?? null,
     documentUrl,
     documentName: metadata.documentName ?? null,
     documentType: metadata.documentType ?? null,
