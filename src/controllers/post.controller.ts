@@ -50,6 +50,11 @@ function buildMetadataFromRequest(
     metadata.music = music;
   }
 
+  const defaultVideoId = ensureString(body.defaultVideoId);
+  if (defaultVideoId) {
+    metadata.defaultVideoId = defaultVideoId;
+  }
+
   if (mappedType === 'video' && mediaUrls[0]) {
     metadata.videoUrl = mediaUrls[0];
   }
@@ -116,6 +121,46 @@ function buildMetadataFromRequest(
   }
 
   return Object.keys(metadata).length > 0 ? metadata : null;
+}
+
+function collectOwnedPostMediaUrls(post: { mediaUrls?: string[] | null; metadata?: unknown }, userId: string): string[] {
+  const metadata = getPostMetadata(post.metadata);
+  const candidates = [
+    ...(Array.isArray(post.mediaUrls) ? post.mediaUrls : []),
+    metadata.videoUrl,
+    metadata.videoThumbnail,
+    metadata.documentUrl,
+    metadata.documentThumbnail,
+    metadata.articleCoverImage,
+    metadata.celebrationGifUrl,
+  ];
+
+  return Array.from(new Set(
+    candidates
+      .filter((url): url is string => typeof url === 'string' && url.trim().length > 0)
+      .filter((url) => {
+        try {
+          return bunnyStorageService.isUserOwnedPath(url, userId);
+        } catch {
+          return false;
+        }
+      })
+  ));
+}
+
+async function deleteOwnedPostMedia(urls: string[]): Promise<void> {
+  const results = await Promise.allSettled(
+    urls.map((url) => bunnyStorageService.deleteFile(url))
+  );
+
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      console.warn('Failed to delete post media from storage:', {
+        url: urls[index],
+        error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+      });
+    }
+  });
 }
 
 // Get feed
@@ -626,7 +671,12 @@ export const deletePost = async (req: AuthRequest, res: Response): Promise<void>
 
     const existing = await prisma.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true },
+      select: {
+        id: true,
+        authorId: true,
+        mediaUrls: true,
+        metadata: true,
+      },
     });
 
     if (!existing) {
@@ -639,10 +689,24 @@ export const deletePost = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    await prisma.post.update({
-      where: { id: postId },
-      data: { isActive: false },
+    await prisma.$transaction(async (tx) => {
+      await tx.post.update({
+        where: { id: postId },
+        data: { isActive: false },
+      });
+
+      await enqueueCacheInvalidation(tx as any, {
+        aggregateType: 'post',
+        aggregateId: postId,
+        eventType: 'post.deleted.cache.invalidate',
+        tags: [`feed:${userId}`, `user:${userId}`],
+      });
     });
+
+    const mediaUrls = collectOwnedPostMediaUrls(existing, userId);
+    if (mediaUrls.length > 0) {
+      await deleteOwnedPostMedia(mediaUrls);
+    }
 
     res.status(200).json({ success: true });
   } catch (error) {

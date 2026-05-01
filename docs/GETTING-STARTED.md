@@ -40,7 +40,8 @@ DATABASE_URL="postgresql://user:password@localhost:5432/vormex"
 
 # JWT
 JWT_SECRET="your-secret-key-here"
-JWT_EXPIRES_IN="7d"
+JWT_EXPIRES_IN="365d"
+AUTH_SESSION_TTL_SECONDS=31536000
 
 # GitHub OAuth
 GITHUB_CLIENT_ID="your-github-client-id"
@@ -267,4 +268,3 @@ curl -X POST http://localhost:3000/api/auth/login \
 
 - API Documentation: http://localhost:3000/api-docs
 - Email: support@vormex.in
-

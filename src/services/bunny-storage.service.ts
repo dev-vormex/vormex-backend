@@ -13,6 +13,41 @@ export class BunnyStorageService {
     this.cdnUrl = bunnyConfig.cdn.pullZoneUrl;
   }
 
+  getStoragePath(input: string): string {
+    const value = input.trim();
+    const cdnPrefix = this.cdnUrl.replace(/\/$/, '') + '/';
+
+    if (value.startsWith(cdnPrefix)) {
+      return value.slice(cdnPrefix.length).replace(/^\/+/, '');
+    }
+
+    if (/^https?:\/\//i.test(value)) {
+      throw new Error('File URL is outside the configured CDN');
+    }
+
+    return value.replace(/^\/+/, '');
+  }
+
+  isUserOwnedPath(input: string, userId: string): boolean {
+    const filePath = this.getStoragePath(input);
+    const userDirectories = [
+      `certificates/${userId}/`,
+      `projects/${userId}/`,
+      `logos/${userId}/`,
+      `chat/${userId}/`,
+    ];
+    const userFilePrefixes = [
+      'posts/images/',
+      'posts/videos/',
+      'reels/thumbnails/',
+      'stories/images/',
+      'stories/videos/',
+    ];
+
+    return userDirectories.some((prefix) => filePath.startsWith(prefix))
+      || userFilePrefixes.some((prefix) => filePath.startsWith(`${prefix}${userId}-`));
+  }
+
   // Upload file to Bunny Storage
   async uploadFile(
     buffer: Buffer,
@@ -44,8 +79,7 @@ export class BunnyStorageService {
   // Delete file from Bunny Storage
   async deleteFile(path: string): Promise<void> {
     try {
-      // Extract path from CDN URL if full URL provided
-      const filePath = path.replace(this.cdnUrl + '/', '');
+      const filePath = this.getStoragePath(path);
       const deleteUrl = `${this.baseUrl}/${filePath}`;
 
       await axios.delete(deleteUrl, {

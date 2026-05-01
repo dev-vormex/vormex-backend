@@ -474,15 +474,29 @@ export const deleteFile = async (req: AuthenticatedRequest, res: Response): Prom
       return;
     }
 
-    const { fileUrl, type } = req.body;
+    const userId = String(req.user.userId);
+    const { fileUrl } = req.body;
 
     if (!fileUrl) {
       res.status(400).json({ error: 'File URL is required' });
       return;
     }
 
+    let isOwnedFile = false;
     try {
-      await bunnyStorageService.deleteFile(fileUrl);
+      isOwnedFile = bunnyStorageService.isUserOwnedPath(String(fileUrl), userId);
+    } catch {
+      res.status(400).json({ error: 'Invalid file URL' });
+      return;
+    }
+
+    if (!isOwnedFile) {
+      res.status(403).json({ error: 'You can only delete files uploaded by your account' });
+      return;
+    }
+
+    try {
+      await bunnyStorageService.deleteFile(String(fileUrl));
     } catch (error: any) {
       console.warn('Failed to delete file from storage:', error.message);
     }

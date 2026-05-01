@@ -11,12 +11,12 @@ router.get('/categories', audioController.getCategories);
 router.get('/moods', audioController.getMoods);
 router.get('/genre/:genre', optionalAuth, audioController.getAudioByGenre);
 
+// Save audio
+router.get('/saved', authenticate, audioController.getSavedAudio);
+router.post('/:audioId/save', authenticate, audioController.toggleSaveAudio);
+
 // Single audio
 router.get('/:audioId', optionalAuth, audioController.getAudio);
 router.get('/:audioId/reels', optionalAuth, audioController.getAudioReels);
-
-// Save audio
-router.post('/:audioId/save', authenticate, audioController.toggleSaveAudio);
-router.get('/saved', authenticate, audioController.getSavedAudio);
 
 export default router;
