@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
@@ -7,9 +7,15 @@ import { imageProcessingService } from '../services/image-processing.service';
 import { bunnyStorageService } from '../services/bunny-storage.service';
 import { pushNotificationService } from '../services/push-notification.service';
 import { getIO } from '../sockets';
+import { buildGroupVisibilityWhere, canViewGroup } from '../utils/access-control.util';
 
 type GroupPrivacy = 'PUBLIC' | 'PRIVATE' | 'SECRET';
 type GroupMemberRole = 'OWNER' | 'ADMIN' | 'MODERATOR' | 'MEMBER';
+type InviteLinkVisibility = 'ADMINS' | 'MEMBERS';
+type GroupInviteAction = 'accept' | 'decline';
+
+const GROUP_INVITE_EXPIRES_MS = 3 * 24 * 60 * 60 * 1000;
+const GROUP_INVITE_BASE_URL = (process.env.FRONTEND_URL || 'https://vormex.in').replace(/\/+$/, '');
 
 interface GroupUser {
   id: string;
@@ -29,6 +35,7 @@ interface Group {
   privacy: GroupPrivacy;
   category: string | null;
   tags: string[];
+  rules: string[];
   memberCount: number;
   postCount: number;
   createdAt: string;
@@ -54,6 +61,9 @@ interface GroupInvite {
   status: string;
   message: string | null;
   createdAt: string;
+  expiresAt: string;
+  respondedAt: string | null;
+  invitedUser?: GroupUser;
   invitedBy: GroupUser;
   group: {
     id: string;
@@ -63,6 +73,17 @@ interface GroupInvite {
     privacy: GroupPrivacy;
     memberCount: number;
   };
+}
+
+interface GroupJoinRequest {
+  id: string;
+  groupId: string;
+  requesterId: string;
+  inviteCode: string;
+  status: string;
+  requestedAt: string;
+  respondedAt: string | null;
+  requester: GroupUser;
 }
 
 const generateSlug = (name: string): string => {
@@ -77,7 +98,154 @@ const mapGroupPrivacy = (isPrivate: boolean): GroupPrivacy => {
   return isPrivate ? 'PRIVATE' : 'PUBLIC';
 };
 
-const mapRoleToEnum = (role: string): GroupMemberRole => {
+const normalizeOptionalString = (value: unknown): string | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+};
+
+const normalizeStringList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
+const mergeCategoryIntoTags = (tags: string[], category: string | null): string[] => {
+  if (!category) {
+    return tags;
+  }
+
+  return Array.from(new Set([...tags, category]));
+};
+
+export const normalizeInviteLinkVisibility = (value: unknown): InviteLinkVisibility => {
+  return String(value || '').trim().toUpperCase() === 'MEMBERS' ? 'MEMBERS' : 'ADMINS';
+};
+
+export const generateGroupInviteCode = (): string => {
+  return `grp_${randomBytes(18).toString('base64url')}`;
+};
+
+export const buildGroupInviteUrl = (inviteCode: string): string => {
+  return `${GROUP_INVITE_BASE_URL}/groups/invite/${encodeURIComponent(inviteCode)}`;
+};
+
+export const canShareGroupInviteLink = (
+  group: { creatorId?: string | null; inviteLinkVisibility?: string | null },
+  membership: { role?: string | null } | null | undefined,
+  userId: string
+): boolean => {
+  if (hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
+    return true;
+  }
+
+  return normalizeInviteLinkVisibility(group.inviteLinkVisibility) === 'MEMBERS'
+    && hasGroupRoleAtLeast(group, membership, userId, 'member');
+};
+
+const inviteExpiresAt = (): Date => new Date(Date.now() + GROUP_INVITE_EXPIRES_MS);
+
+const normalizeInviteAction = (value: unknown): GroupInviteAction | null => {
+  const action = String(value || '').trim().toLowerCase();
+  return action === 'accept' || action === 'decline' ? action : null;
+};
+
+const selectGroupUser = {
+  id: true,
+  name: true,
+  username: true,
+  profileImage: true,
+  headline: true,
+  isVerified: true,
+};
+
+const mapUser = (user: any): GroupUser => ({
+  id: user.id,
+  name: user.name,
+  username: user.username,
+  profileImage: user.profileImage,
+  headline: user.headline ?? null,
+});
+
+const mapInviteGroup = (group: any) => ({
+  id: group.id,
+  name: group.name,
+  slug: generateSlug(group.name),
+  iconImage: group.iconImage ?? group.imageUrl ?? null,
+  privacy: mapGroupPrivacy(group.isPrivate),
+  memberCount: group.memberCount,
+});
+
+const mapGroupInvite = (invite: any): GroupInvite => ({
+  id: invite.id,
+  groupId: invite.groupId,
+  invitedUserId: invite.invitedUserId,
+  invitedById: invite.invitedById,
+  status: invite.status,
+  message: invite.message,
+  createdAt: invite.createdAt.toISOString(),
+  expiresAt: invite.expiresAt.toISOString(),
+  respondedAt: invite.respondedAt ? invite.respondedAt.toISOString() : null,
+  invitedUser: invite.invitedUser ? mapUser(invite.invitedUser) : undefined,
+  invitedBy: mapUser(invite.invitedBy),
+  group: mapInviteGroup(invite.groups),
+});
+
+const mapGroupJoinRequest = (request: any): GroupJoinRequest => ({
+  id: request.id,
+  groupId: request.groupId,
+  requesterId: request.requesterId,
+  inviteCode: request.inviteCode,
+  status: request.status,
+  requestedAt: request.requestedAt.toISOString(),
+  respondedAt: request.respondedAt ? request.respondedAt.toISOString() : null,
+  requester: mapUser(request.requester),
+});
+
+const buildInviteLinkResponse = (
+  group: any,
+  userId?: string | null,
+  membership?: { role?: string | null } | null
+) => {
+  const memberRole = userId ? getEffectiveGroupRole(group, membership, userId) : null;
+  const isMember = Boolean(membership) || memberRole === 'owner';
+  const inviteCode = group.inviteCode || '';
+
+  return {
+    inviteCode,
+    inviteUrl: inviteCode ? buildGroupInviteUrl(inviteCode) : null,
+    visibility: normalizeInviteLinkVisibility(group.inviteLinkVisibility),
+    canShare: Boolean(userId && canShareGroupInviteLink(group, membership, userId)),
+    requiresApproval: Boolean(group.isPrivate),
+    group: {
+      id: group.id,
+      name: group.name,
+      slug: generateSlug(group.name),
+      description: group.description,
+      coverImage: group.coverImage ?? group.imageUrl,
+      iconImage: group.iconImage ?? group.imageUrl,
+      privacy: mapGroupPrivacy(group.isPrivate),
+      category: group.category,
+      tags: group.tags,
+      rules: group.rules,
+      memberCount: group._count?.group_members ?? group.memberCount,
+      postCount: 0,
+      createdAt: group.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      isMember,
+      memberRole: memberRole ? mapRoleToEnum(memberRole) : null,
+    },
+  };
+};
+
+export const mapRoleToEnum = (role: string): GroupMemberRole => {
   const roleMap: { [key: string]: GroupMemberRole } = {
     admin: 'ADMIN',
     moderator: 'MODERATOR',
@@ -85,6 +253,44 @@ const mapRoleToEnum = (role: string): GroupMemberRole => {
     owner: 'OWNER',
   };
   return roleMap[role.toLowerCase()] || 'MEMBER';
+};
+
+export const GROUP_ROLE_RANK: Record<string, number> = {
+  member: 1,
+  moderator: 2,
+  admin: 3,
+  owner: 4,
+};
+
+export const normalizeGroupRole = (role: unknown): string | null => {
+  if (typeof role !== 'string') {
+    return null;
+  }
+
+  const normalized = role.trim().toLowerCase();
+  return GROUP_ROLE_RANK[normalized] ? normalized : null;
+};
+
+export const getEffectiveGroupRole = (
+  group: { creatorId?: string | null },
+  membership: { role?: string | null } | null | undefined,
+  userId: string
+): string | null => {
+  if (group.creatorId === userId) {
+    return 'owner';
+  }
+
+  return normalizeGroupRole(membership?.role);
+};
+
+export const hasGroupRoleAtLeast = (
+  group: { creatorId?: string | null },
+  membership: { role?: string | null } | null | undefined,
+  userId: string,
+  minimumRole: keyof typeof GROUP_ROLE_RANK
+): boolean => {
+  const role = getEffectiveGroupRole(group, membership, userId);
+  return Boolean(role && GROUP_ROLE_RANK[role] >= GROUP_ROLE_RANK[minimumRole]);
 };
 
 const buildGroupMessagePreview = (content: string, contentType: string): string => {
@@ -121,7 +327,7 @@ export const createGroup = async (
     }
 
     const userId = String(req.user.userId);
-    const { name, description, privacy, category, tags, coverImage, iconImage } = req.body;
+    const { name, description, privacy, category, tags, rules, coverImage, iconImage } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 3) {
       res.status(400).json({ error: 'Group name must be at least 3 characters' });
@@ -130,28 +336,36 @@ export const createGroup = async (
 
     const slug = generateSlug(name);
     const isPrivate = privacy === 'PRIVATE' || privacy === 'SECRET';
+    const normalizedCategory = normalizeOptionalString(category);
+    const normalizedTags = mergeCategoryIntoTags(normalizeStringList(tags), normalizedCategory);
+    const normalizedRules = normalizeStringList(rules);
 
     const group = await prisma.groups.create({
       data: {
         id: randomUUID(),
         name: name.trim(),
-        description: description || null,
+        description: normalizeOptionalString(description),
+        category: normalizedCategory,
+        rules: normalizedRules,
         imageUrl: coverImage || iconImage || null,
+        inviteCode: generateGroupInviteCode(),
+        inviteLinkVisibility: 'ADMINS',
+        inviteLinkUpdatedAt: new Date(),
         creatorId: userId,
         isPrivate,
-        tags: tags || [],
+        tags: normalizedTags,
         updatedAt: new Date(),
         group_members: {
           create: {
             id: randomUUID(),
             userId,
-            role: 'admin',
+            role: 'owner',
           },
         },
       },
       include: {
         users: {
-          select: { id: true, name: true, username: true, profileImage: true },
+          select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
         },
         _count: { select: { group_members: true } },
       },
@@ -165,8 +379,9 @@ export const createGroup = async (
       coverImage: group.coverImage ?? group.imageUrl,
       iconImage: group.iconImage ?? group.imageUrl,
       privacy: mapGroupPrivacy(group.isPrivate),
-      category: category || null,
+      category: group.category,
       tags: group.tags,
+      rules: group.rules,
       memberCount: group._count.group_members,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
@@ -201,7 +416,7 @@ export const getGroup = async (
       },
       include: {
         users: {
-          select: { id: true, name: true, username: true, profileImage: true },
+          select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
         },
         group_members: userId ? { where: { userId } } : false,
         _count: { select: { group_members: true } },
@@ -212,9 +427,14 @@ export const getGroup = async (
       res.status(404).json({ error: 'Group not found' });
       return;
     }
+    if (!(await canViewGroup(group, userId))) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
 
     const groupWithRelations = group as typeof group & { group_members: unknown[]; _count: { group_members: number } };
     const memberRecord = userId && Array.isArray(groupWithRelations.group_members) ? groupWithRelations.group_members[0] : null;
+    const memberRole = userId ? getEffectiveGroupRole(group, memberRecord as any, userId) : null;
 
     res.status(200).json({
       id: group.id,
@@ -224,13 +444,14 @@ export const getGroup = async (
       coverImage: group.coverImage ?? group.imageUrl,
       iconImage: group.iconImage ?? group.imageUrl,
       privacy: mapGroupPrivacy(group.isPrivate),
-      category: null,
+      category: group.category,
       tags: group.tags,
+      rules: group.rules,
       memberCount: groupWithRelations._count.group_members,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
-      isMember: !!memberRecord,
-      memberRole: memberRecord ? mapRoleToEnum(memberRecord.role) : null,
+      isMember: !!memberRecord || memberRole === 'owner',
+      memberRole: memberRole ? mapRoleToEnum(memberRole) : null,
     });
   } catch (error) {
     console.error('Error fetching group:', error);
@@ -267,7 +488,7 @@ export const getMyGroups = async (
           groups: {
             include: {
               users: {
-                select: { id: true, name: true, username: true, profileImage: true },
+                select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
               },
               _count: { select: { group_members: true } },
             },
@@ -285,13 +506,14 @@ export const getMyGroups = async (
       coverImage: m.groups.coverImage ?? m.groups.imageUrl,
       iconImage: m.groups.iconImage ?? m.groups.imageUrl,
       privacy: mapGroupPrivacy(m.groups.isPrivate),
-      category: null,
+      category: m.groups.category,
       tags: m.groups.tags,
+      rules: m.groups.rules,
       memberCount: m.groups._count.group_members,
       postCount: 0,
       createdAt: m.groups.createdAt.toISOString(),
       isMember: true,
-      memberRole: mapRoleToEnum(m.role),
+      memberRole: mapRoleToEnum(getEffectiveGroupRole(m.groups, m, userId) || m.role),
     }));
 
     res.status(200).json({
@@ -334,24 +556,31 @@ export const discoverGroups = async (
       userGroupIds = memberships.map((m) => m.groupId);
     }
 
-    const where: any = {
-      isPrivate: false,
-    };
+    const filters: any[] = [{ isPrivate: false }];
 
     if (userGroupIds.length > 0) {
-      where.id = { notIn: userGroupIds };
+      filters.push({ id: { notIn: userGroupIds } });
     }
 
     if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-      ];
+      filters.push({
+        OR: [
+          { name: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+        ],
+      });
     }
 
     if (category) {
-      where.tags = { has: category };
+      filters.push({
+        OR: [
+          { category: { equals: category, mode: 'insensitive' } },
+          { tags: { has: category } },
+        ],
+      });
     }
+
+    const where: any = { AND: filters };
 
     const [groupsList, total] = await Promise.all([
       prisma.groups.findMany({
@@ -361,7 +590,7 @@ export const discoverGroups = async (
         orderBy: { memberCount: 'desc' },
         include: {
           users: {
-            select: { id: true, name: true, username: true, profileImage: true },
+            select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
           },
           _count: { select: { group_members: true } },
         },
@@ -377,8 +606,9 @@ export const discoverGroups = async (
       coverImage: g.coverImage ?? g.imageUrl,
       iconImage: g.iconImage ?? g.imageUrl,
       privacy: mapGroupPrivacy(g.isPrivate),
-      category: null,
+      category: g.category,
       tags: g.tags,
+      rules: g.rules,
       memberCount: g._count.group_members,
       postCount: 0,
       createdAt: g.createdAt.toISOString(),
@@ -415,12 +645,653 @@ export const getUserPendingInvites = async (
       return;
     }
 
-    // Since we don't have a GroupInvite model in the schema, return empty array for now
-    // This would need a proper model to be added to the Prisma schema
-    res.status(200).json({ invites: [] });
+    const userId = String(req.user.userId);
+    await prisma.group_invites.updateMany({
+      where: {
+        invitedUserId: userId,
+        status: 'pending',
+        expiresAt: { lt: new Date() },
+      },
+      data: { status: 'expired', respondedAt: new Date() },
+    });
+
+    const invites = await prisma.group_invites.findMany({
+      where: {
+        invitedUserId: userId,
+        status: 'pending',
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        groups: true,
+        invitedBy: { select: selectGroupUser },
+        invitedUser: { select: selectGroupUser },
+      },
+    });
+
+    res.status(200).json({ invites: invites.map(mapGroupInvite) });
   } catch (error) {
     console.error('Error fetching pending invites:', error);
     res.status(500).json({ error: 'Failed to fetch pending invites' });
+  }
+};
+
+/**
+ * Preview a group invite link
+ * GET /api/groups/invites/link/:code
+ */
+export const getGroupInviteLinkPreview = async (
+  req: AuthenticatedRequest,
+  res: Response<any | ErrorResponse>
+): Promise<void> => {
+  try {
+    const inviteCode = ensureString(req.params.code);
+    if (!inviteCode) {
+      res.status(400).json({ error: 'Invite code is required' });
+      return;
+    }
+
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const group = await prisma.groups.findUnique({
+      where: { inviteCode },
+      include: {
+        group_members: userId ? { where: { userId } } : false,
+        _count: { select: { group_members: true } },
+      },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Invite link is invalid or has been reset' });
+      return;
+    }
+
+    const groupWithMembership = group as typeof group & { group_members?: Array<{ role: string }> };
+    const membership = Array.isArray(groupWithMembership.group_members) ? groupWithMembership.group_members[0] : null;
+
+    res.status(200).json(buildInviteLinkResponse(group, userId, membership));
+  } catch (error) {
+    console.error('Error previewing group invite link:', error);
+    res.status(500).json({ error: 'Failed to preview invite link' });
+  }
+};
+
+/**
+ * Join a group from an invite link
+ * POST /api/groups/invites/link/:code/join
+ */
+export const joinGroupByInviteLink = async (
+  req: AuthenticatedRequest,
+  res: Response<{ status: string; message: string; groupId: string; requestId?: string } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const inviteCode = ensureString(req.params.code);
+    if (!inviteCode) {
+      res.status(400).json({ error: 'Invite code is required' });
+      return;
+    }
+
+    const group = await prisma.groups.findUnique({
+      where: { inviteCode },
+      include: { group_members: { where: { userId } } },
+    });
+
+    if (!group) {
+      res.status(404).json({ error: 'Invite link is invalid or has been reset' });
+      return;
+    }
+
+    const groupWithMembers = group as typeof group & { group_members: unknown[] };
+    if (groupWithMembers.group_members.length > 0 || group.creatorId === userId) {
+      res.status(200).json({
+        status: 'already_member',
+        message: 'You are already a member of this group',
+        groupId: group.id,
+      });
+      return;
+    }
+
+    if (group.memberCount >= group.maxMembers) {
+      res.status(400).json({ error: 'Group is full' });
+      return;
+    }
+
+    if (group.isPrivate) {
+      const request = await prisma.group_join_requests.upsert({
+        where: { groupId_requesterId: { groupId: group.id, requesterId: userId } },
+        update: {
+          inviteCode,
+          status: 'pending',
+          requestedAt: new Date(),
+          reviewedById: null,
+          respondedAt: null,
+        },
+        create: {
+          id: randomUUID(),
+          groupId: group.id,
+          requesterId: userId,
+          inviteCode,
+          status: 'pending',
+        },
+      });
+
+      res.status(202).json({
+        status: 'pending',
+        message: 'Your request to join this group is waiting for admin approval',
+        groupId: group.id,
+        requestId: request.id,
+      });
+      return;
+    }
+
+    await prisma.$transaction([
+      prisma.group_members.create({
+        data: {
+          id: randomUUID(),
+          groupId: group.id,
+          userId,
+          role: 'member',
+        },
+      }),
+      prisma.groups.update({
+        where: { id: group.id },
+        data: { memberCount: { increment: 1 }, updatedAt: new Date() },
+      }),
+    ]);
+
+    res.status(200).json({
+      status: 'joined',
+      message: 'Successfully joined the group',
+      groupId: group.id,
+    });
+  } catch (error) {
+    console.error('Error joining group by invite link:', error);
+    res.status(500).json({ error: 'Failed to join group from invite link' });
+  }
+};
+
+/**
+ * Get a group's invite link
+ * GET /api/groups/:groupId/invite-link
+ */
+export const getGroupInviteLink = async (
+  req: AuthenticatedRequest,
+  res: Response<any | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
+
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({
+        where: { id: groupId },
+        include: { _count: { select: { group_members: true } } },
+      }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId } } }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!canShareGroupInviteLink(group, membership, userId)) {
+      res.status(403).json({ error: 'Not authorized to view this group invite link' });
+      return;
+    }
+
+    res.status(200).json(buildInviteLinkResponse(group, userId, membership));
+  } catch (error) {
+    console.error('Error fetching group invite link:', error);
+    res.status(500).json({ error: 'Failed to fetch invite link' });
+  }
+};
+
+/**
+ * Update invite link sharing settings
+ * PATCH /api/groups/:groupId/invite-link/settings
+ */
+export const updateGroupInviteLinkSettings = async (
+  req: AuthenticatedRequest,
+  res: Response<any | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
+
+    const visibility = normalizeInviteLinkVisibility(req.body?.visibility);
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true, inviteLinkVisibility: true } }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId } } }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
+      res.status(403).json({ error: 'Not authorized to update invite link settings' });
+      return;
+    }
+
+    const updateData: any = {
+      inviteLinkVisibility: visibility,
+      inviteLinkUpdatedAt: new Date(),
+      updatedAt: new Date(),
+    };
+    if (visibility === 'ADMINS' && normalizeInviteLinkVisibility(group.inviteLinkVisibility) === 'MEMBERS') {
+      updateData.inviteCode = generateGroupInviteCode();
+    }
+
+    const updatedGroup = await prisma.groups.update({
+      where: { id: groupId },
+      data: updateData,
+      include: { _count: { select: { group_members: true } } },
+    });
+
+    res.status(200).json(buildInviteLinkResponse(updatedGroup, userId, membership));
+  } catch (error) {
+    console.error('Error updating group invite link settings:', error);
+    res.status(500).json({ error: 'Failed to update invite link settings' });
+  }
+};
+
+/**
+ * Reset a group's invite link
+ * POST /api/groups/:groupId/invite-link/reset
+ */
+export const resetGroupInviteLink = async (
+  req: AuthenticatedRequest,
+  res: Response<any | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
+
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId } } }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
+      res.status(403).json({ error: 'Not authorized to reset this invite link' });
+      return;
+    }
+
+    const updatedGroup = await prisma.groups.update({
+      where: { id: groupId },
+      data: {
+        inviteCode: generateGroupInviteCode(),
+        inviteLinkUpdatedAt: new Date(),
+        updatedAt: new Date(),
+      },
+      include: { _count: { select: { group_members: true } } },
+    });
+
+    res.status(200).json(buildInviteLinkResponse(updatedGroup, userId, membership));
+  } catch (error) {
+    console.error('Error resetting group invite link:', error);
+    res.status(500).json({ error: 'Failed to reset invite link' });
+  }
+};
+
+/**
+ * Invite a user directly to a group
+ * POST /api/groups/:groupId/invites
+ */
+export const createGroupInvite = async (
+  req: AuthenticatedRequest,
+  res: Response<{ invite: GroupInvite } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const invitedById = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    const invitedUserId = ensureString(req.body?.userId) || ensureString(req.body?.invitedUserId);
+    const message = normalizeOptionalString(req.body?.message);
+    if (!groupId || !invitedUserId) {
+      res.status(400).json({ error: 'Group ID and invited user ID are required' });
+      return;
+    }
+    if (invitedById === invitedUserId) {
+      res.status(400).json({ error: 'You cannot invite yourself' });
+      return;
+    }
+
+    const [group, inviterMembership, invitedUser, existingMembership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, name: true, creatorId: true, memberCount: true, maxMembers: true } }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId: invitedById } } }),
+      prisma.user.findFirst({ where: { id: invitedUserId, isBanned: false }, select: selectGroupUser }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId: invitedUserId } } }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!hasGroupRoleAtLeast(group, inviterMembership, invitedById, 'admin')) {
+      res.status(403).json({ error: 'Not authorized to invite users to this group' });
+      return;
+    }
+    if (!invitedUser) {
+      res.status(404).json({ error: 'Invited user not found' });
+      return;
+    }
+    if (existingMembership) {
+      res.status(400).json({ error: 'User is already a member of this group' });
+      return;
+    }
+    if (group.memberCount >= group.maxMembers) {
+      res.status(400).json({ error: 'Group is full' });
+      return;
+    }
+
+    const invite = await prisma.group_invites.upsert({
+      where: { groupId_invitedUserId: { groupId, invitedUserId } },
+      update: {
+        invitedById,
+        status: 'pending',
+        message,
+        createdAt: new Date(),
+        expiresAt: inviteExpiresAt(),
+        respondedAt: null,
+      },
+      create: {
+        id: randomUUID(),
+        groupId,
+        invitedUserId,
+        invitedById,
+        status: 'pending',
+        message,
+        expiresAt: inviteExpiresAt(),
+      },
+      include: {
+        groups: true,
+        invitedBy: { select: selectGroupUser },
+        invitedUser: { select: selectGroupUser },
+      },
+    });
+
+    pushNotificationService.pushStudyGroupInvite(invitedUserId, group.name, 'Someone', groupId).catch(() => undefined);
+
+    res.status(201).json({ invite: mapGroupInvite(invite) });
+  } catch (error) {
+    console.error('Error creating group invite:', error);
+    res.status(500).json({ error: 'Failed to create group invite' });
+  }
+};
+
+/**
+ * Respond to a direct group invite
+ * POST /api/groups/invites/:inviteId/respond
+ */
+export const respondToGroupInvite = async (
+  req: AuthenticatedRequest,
+  res: Response<{ status: string; message: string; groupId: string } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const inviteId = ensureString(req.params.inviteId);
+    const action = normalizeInviteAction(req.body?.action);
+    if (!inviteId || !action) {
+      res.status(400).json({ error: 'Invite ID and action are required' });
+      return;
+    }
+
+    const invite = await prisma.group_invites.findUnique({
+      where: { id: inviteId },
+      include: { groups: { include: { group_members: { where: { userId } } } } },
+    });
+
+    if (!invite || invite.invitedUserId !== userId) {
+      res.status(404).json({ error: 'Group invite not found' });
+      return;
+    }
+    if (invite.status !== 'pending') {
+      res.status(400).json({ error: 'This invite has already been handled' });
+      return;
+    }
+    if (invite.expiresAt < new Date()) {
+      await prisma.group_invites.update({
+        where: { id: inviteId },
+        data: { status: 'expired', respondedAt: new Date() },
+      });
+      res.status(400).json({ error: 'This invite has expired' });
+      return;
+    }
+
+    if (action === 'decline') {
+      await prisma.group_invites.update({
+        where: { id: inviteId },
+        data: { status: 'declined', respondedAt: new Date() },
+      });
+      res.status(200).json({ status: 'declined', message: 'Invite declined', groupId: invite.groupId });
+      return;
+    }
+
+    const group = invite.groups as typeof invite.groups & { group_members: unknown[] };
+    if (group.group_members.length > 0 || group.creatorId === userId) {
+      await prisma.group_invites.update({
+        where: { id: inviteId },
+        data: { status: 'accepted', respondedAt: new Date() },
+      });
+      res.status(200).json({ status: 'already_member', message: 'You are already a member of this group', groupId: invite.groupId });
+      return;
+    }
+    if (group.memberCount >= group.maxMembers) {
+      res.status(400).json({ error: 'Group is full' });
+      return;
+    }
+
+    await prisma.$transaction([
+      prisma.group_members.create({
+        data: {
+          id: randomUUID(),
+          groupId: invite.groupId,
+          userId,
+          role: 'member',
+        },
+      }),
+      prisma.groups.update({
+        where: { id: invite.groupId },
+        data: { memberCount: { increment: 1 }, updatedAt: new Date() },
+      }),
+      prisma.group_invites.update({
+        where: { id: inviteId },
+        data: { status: 'accepted', respondedAt: new Date() },
+      }),
+    ]);
+
+    res.status(200).json({ status: 'joined', message: 'Successfully joined the group', groupId: invite.groupId });
+  } catch (error) {
+    console.error('Error responding to group invite:', error);
+    res.status(500).json({ error: 'Failed to respond to group invite' });
+  }
+};
+
+/**
+ * Get pending join requests for a private/secret group
+ * GET /api/groups/:groupId/join-requests
+ */
+export const getGroupJoinRequests = async (
+  req: AuthenticatedRequest,
+  res: Response<{ requests: GroupJoinRequest[] } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    const status = ensureString(req.query.status) || 'pending';
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
+
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId } } }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
+      res.status(403).json({ error: 'Not authorized to view join requests' });
+      return;
+    }
+
+    const requests = await prisma.group_join_requests.findMany({
+      where: { groupId, status: status.toLowerCase() },
+      orderBy: { requestedAt: 'desc' },
+      include: { requester: { select: selectGroupUser } },
+    });
+
+    res.status(200).json({ requests: requests.map(mapGroupJoinRequest) });
+  } catch (error) {
+    console.error('Error fetching group join requests:', error);
+    res.status(500).json({ error: 'Failed to fetch join requests' });
+  }
+};
+
+/**
+ * Respond to a private/secret group join request
+ * POST /api/groups/:groupId/join-requests/:requestId/respond
+ */
+export const respondToGroupJoinRequest = async (
+  req: AuthenticatedRequest,
+  res: Response<{ status: string; message: string; groupId: string } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const reviewedById = String(req.user.userId);
+    const groupId = ensureString(req.params.groupId);
+    const requestId = ensureString(req.params.requestId);
+    const action = normalizeInviteAction(req.body?.action);
+    if (!groupId || !requestId || !action) {
+      res.status(400).json({ error: 'Group ID, request ID, and action are required' });
+      return;
+    }
+
+    const [group, reviewerMembership, joinRequest] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true, memberCount: true, maxMembers: true } }),
+      prisma.group_members.findUnique({ where: { groupId_userId: { groupId, userId: reviewedById } } }),
+      prisma.group_join_requests.findUnique({ where: { id: requestId } }),
+    ]);
+
+    if (!group || !joinRequest || joinRequest.groupId !== groupId) {
+      res.status(404).json({ error: 'Join request not found' });
+      return;
+    }
+    if (!hasGroupRoleAtLeast(group, reviewerMembership, reviewedById, 'admin')) {
+      res.status(403).json({ error: 'Not authorized to manage join requests' });
+      return;
+    }
+    if (joinRequest.status !== 'pending') {
+      res.status(400).json({ error: 'This join request has already been handled' });
+      return;
+    }
+
+    if (action === 'decline') {
+      await prisma.group_join_requests.update({
+        where: { id: requestId },
+        data: { status: 'declined', reviewedById, respondedAt: new Date() },
+      });
+      res.status(200).json({ status: 'declined', message: 'Join request declined', groupId });
+      return;
+    }
+
+    const existingMembership = await prisma.group_members.findUnique({
+      where: { groupId_userId: { groupId, userId: joinRequest.requesterId } },
+    });
+    if (existingMembership || group.creatorId === joinRequest.requesterId) {
+      await prisma.group_join_requests.update({
+        where: { id: requestId },
+        data: { status: 'accepted', reviewedById, respondedAt: new Date() },
+      });
+      res.status(200).json({ status: 'already_member', message: 'Requester is already a member', groupId });
+      return;
+    }
+    if (group.memberCount >= group.maxMembers) {
+      res.status(400).json({ error: 'Group is full' });
+      return;
+    }
+
+    await prisma.$transaction([
+      prisma.group_members.create({
+        data: {
+          id: randomUUID(),
+          groupId,
+          userId: joinRequest.requesterId,
+          role: 'member',
+        },
+      }),
+      prisma.groups.update({
+        where: { id: groupId },
+        data: { memberCount: { increment: 1 }, updatedAt: new Date() },
+      }),
+      prisma.group_join_requests.update({
+        where: { id: requestId },
+        data: { status: 'accepted', reviewedById, respondedAt: new Date() },
+      }),
+    ]);
+
+    res.status(200).json({ status: 'joined', message: 'Join request approved', groupId });
+  } catch (error) {
+    console.error('Error responding to group join request:', error);
+    res.status(500).json({ error: 'Failed to respond to join request' });
   }
 };
 
@@ -463,6 +1334,11 @@ export const joinGroup = async (
       return;
     }
 
+    if (group.isPrivate) {
+      res.status(403).json({ error: 'Private groups require an invitation' });
+      return;
+    }
+
     if (group.memberCount >= group.maxMembers) {
       res.status(400).json({ error: 'Group is full' });
       return;
@@ -484,8 +1360,8 @@ export const joinGroup = async (
     ]);
 
     res.status(200).json({
-      status: group.isPrivate ? 'pending' : 'joined',
-      message: group.isPrivate ? 'Join request sent' : 'Successfully joined the group',
+      status: 'joined',
+      message: 'Successfully joined the group',
     });
   } catch (error) {
     console.error('Error joining group:', error);
@@ -514,12 +1390,19 @@ export const leaveGroup = async (
       return;
     }
 
-    const membership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId, userId } },
-    });
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId } },
+      }),
+    ]);
 
-    if (!membership) {
+    if (!group || !membership) {
       res.status(400).json({ error: 'Not a member of this group' });
+      return;
+    }
+    if (group.creatorId === userId) {
+      res.status(400).json({ error: 'Transfer ownership or delete the group before leaving' });
       return;
     }
 
@@ -559,6 +1442,16 @@ export const getGroupMembers = async (
     const skip = (page - 1) * limit;
     const role = ensureString(req.query.role);
     const search = ensureString(req.query.search);
+    const currentUserId = req.user?.userId ? String(req.user.userId) : null;
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, isPrivate: true, creatorId: true },
+    });
+    if (!group || !(await canViewGroup(group, currentUserId))) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
 
     const where: any = { groupId };
     if (role) {
@@ -579,7 +1472,7 @@ export const getGroupMembers = async (
     const userIds = members.map((m) => m.userId);
     const users = await prisma.user.findMany({
       where: { id: { in: userIds } },
-      select: { id: true, name: true, username: true, profileImage: true, headline: true },
+      select: { id: true, name: true, username: true, profileImage: true, headline: true, isVerified: true },
     });
 
     const userMap = new Map(users.map((u) => [u.id, u]));
@@ -629,12 +1522,14 @@ export const getCategories = async (
 ): Promise<void> => {
   try {
     const groups = await prisma.groups.findMany({
-      select: { tags: true },
+      where: { isPrivate: false },
+      select: { category: true, tags: true },
     });
 
     const tagCounts: { [key: string]: number } = {};
     groups.forEach((g) => {
-      g.tags.forEach((tag) => {
+      const groupCategories = Array.from(new Set([g.category, ...g.tags].filter(Boolean) as string[]));
+      groupCategories.forEach((tag) => {
         tagCounts[tag] = (tagCounts[tag] || 0) + 1;
       });
     });
@@ -659,10 +1554,24 @@ export const getGroupPosts = async (
   res: Response<any | ErrorResponse>
 ): Promise<void> => {
   try {
-    const { groupId } = req.params;
+    const currentUserId = req.user?.userId ? String(req.user.userId) : null;
+    const groupId = ensureString(req.params.groupId);
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
     const pinnedFirst = req.query.pinnedFirst === 'true';
+
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, isPrivate: true, creatorId: true },
+    });
+    if (!group || !(await canViewGroup(group, currentUserId))) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
 
     // For now, return empty posts since there's no GroupPost model
     // You can add a GroupPost model to the schema later
@@ -695,8 +1604,28 @@ export const createGroupPost = async (
       return;
     }
 
-    const { groupId } = req.params;
+    const groupId = ensureString(req.params.groupId);
     const { content, mediaUrls, mediaType } = req.body;
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
+
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId: String(req.user.userId) } },
+      }),
+    ]);
+
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!membership) {
+      res.status(403).json({ error: 'Not a member of this group' });
+      return;
+    }
 
     // For now, return a mock response
     // You can add a GroupPost model to the schema later
@@ -735,25 +1664,35 @@ export const listGroups = async (
     const search = req.query.search as string | undefined;
     const category = req.query.category as string | undefined;
     const privacy = req.query.privacy as string | undefined;
+    const userId = req.user?.userId ? String(req.user.userId) : null;
 
-    const where: any = {};
+    const filters: any[] = [await buildGroupVisibilityWhere(userId)];
 
     if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-      ];
+      filters.push({
+        OR: [
+          { name: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+        ],
+      });
     }
 
     if (category) {
-      where.tags = { has: category };
+      filters.push({
+        OR: [
+          { category: { equals: category, mode: 'insensitive' } },
+          { tags: { has: category } },
+        ],
+      });
     }
 
     if (privacy === 'PUBLIC') {
-      where.isPrivate = false;
+      filters.push({ isPrivate: false });
     } else if (privacy === 'PRIVATE' || privacy === 'SECRET') {
-      where.isPrivate = true;
+      filters.push({ isPrivate: true });
     }
+
+    const where: any = { AND: filters };
 
     const [groupsList, total] = await Promise.all([
       prisma.groups.findMany({
@@ -763,30 +1702,40 @@ export const listGroups = async (
         orderBy: { memberCount: 'desc' },
         include: {
           users: {
-            select: { id: true, name: true, username: true, profileImage: true },
+            select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
           },
+          group_members: userId ? { where: { userId } } : false,
           _count: { select: { group_members: true } },
         },
       }),
       prisma.groups.count({ where }),
     ]);
 
-    const groups: Group[] = groupsList.map((g) => ({
-      id: g.id,
-      name: g.name,
-      slug: generateSlug(g.name),
-      description: g.description,
-      coverImage: g.coverImage ?? g.imageUrl,
-      iconImage: g.iconImage ?? g.imageUrl,
-      privacy: mapGroupPrivacy(g.isPrivate),
-      category: null,
-      tags: g.tags,
-      memberCount: g._count.group_members,
-      postCount: 0,
-      createdAt: g.createdAt.toISOString(),
-      isMember: false,
-      memberRole: null,
-    }));
+    const groups: Group[] = groupsList.map((g) => {
+      const groupWithMembership = g as typeof g & { group_members?: Array<{ role: string }> };
+      const memberRecord = Array.isArray(groupWithMembership.group_members)
+        ? groupWithMembership.group_members[0]
+        : null;
+      const memberRole = userId ? getEffectiveGroupRole(g, memberRecord, userId) : null;
+
+      return {
+        id: g.id,
+        name: g.name,
+        slug: generateSlug(g.name),
+        description: g.description,
+        coverImage: g.coverImage ?? g.imageUrl,
+        iconImage: g.iconImage ?? g.imageUrl,
+        privacy: mapGroupPrivacy(g.isPrivate),
+        category: g.category,
+        tags: g.tags,
+        rules: g.rules,
+        memberCount: g._count.group_members,
+        postCount: 0,
+        createdAt: g.createdAt.toISOString(),
+        isMember: Boolean(memberRecord) || memberRole === 'owner',
+        memberRole: memberRole ? mapRoleToEnum(memberRole) : null,
+      };
+    });
 
     res.status(200).json({
       groups,
@@ -825,20 +1774,30 @@ export const updateGroup = async (
     }
     const { name, description, privacy, category, tags, coverImage, iconImage, rules } = req.body;
 
-    const membership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId, userId } },
-    });
+    const [groupRecord, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId } },
+      }),
+    ]);
 
-    if (!membership || !['admin', 'owner'].includes(membership.role)) {
+    if (!groupRecord) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+
+    if (!hasGroupRoleAtLeast(groupRecord, membership, userId, 'admin')) {
       res.status(403).json({ error: 'Not authorized to update this group' });
       return;
     }
 
     const updateData: any = {};
     if (name) updateData.name = name.trim();
-    if (description !== undefined) updateData.description = description;
+    if (description !== undefined) updateData.description = normalizeOptionalString(description);
     if (privacy) updateData.isPrivate = privacy === 'PRIVATE' || privacy === 'SECRET';
-    if (tags) updateData.tags = tags;
+    if (category !== undefined) updateData.category = normalizeOptionalString(category);
+    if (rules !== undefined) updateData.rules = normalizeStringList(rules);
+    if (tags) updateData.tags = mergeCategoryIntoTags(normalizeStringList(tags), updateData.category ?? null);
     if (coverImage) updateData.coverImage = coverImage;
     if (iconImage) updateData.iconImage = iconImage;
 
@@ -860,13 +1819,14 @@ export const updateGroup = async (
       coverImage: group.coverImage ?? group.imageUrl,
       iconImage: group.iconImage ?? group.imageUrl,
       privacy: mapGroupPrivacy(group.isPrivate),
-      category: category || null,
+      category: group.category,
       tags: group.tags,
+      rules: group.rules,
       memberCount: groupWithCount._count.group_members,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
       isMember: true,
-      memberRole: mapRoleToEnum(membership.role),
+      memberRole: mapRoleToEnum(getEffectiveGroupRole(groupRecord, membership, userId) || 'member'),
     });
   } catch (error) {
     console.error('Error updating group:', error);
@@ -946,10 +1906,13 @@ export const uploadGroupIcon = async (
       return;
     }
 
-    const membership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId: rawGroupId, userId } },
-    });
-    if (!membership || !['admin', 'owner'].includes(membership.role)) {
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: rawGroupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId: rawGroupId, userId } },
+      }),
+    ]);
+    if (!group || !hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
       res.status(403).json({ error: 'Not authorized to update this group' });
       return;
     }
@@ -1000,10 +1963,13 @@ export const uploadGroupCover = async (
       return;
     }
 
-    const membership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId: rawGroupId, userId } },
-    });
-    if (!membership || !['admin', 'owner'].includes(membership.role)) {
+    const [group, membership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: rawGroupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId: rawGroupId, userId } },
+      }),
+    ]);
+    if (!group || !hasGroupRoleAtLeast(group, membership, userId, 'admin')) {
       res.status(403).json({ error: 'Not authorized to update this group' });
       return;
     }
@@ -1051,19 +2017,50 @@ export const updateMemberRole = async (
       return;
     }
     const { role } = req.body;
+    const targetRole = normalizeGroupRole(role);
+    if (!targetRole || targetRole === 'owner') {
+      res.status(400).json({ error: 'Role must be member, moderator, or admin' });
+      return;
+    }
 
-    const currentMembership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId, userId: currentUserId } },
-    });
+    if (currentUserId === userId) {
+      res.status(400).json({ error: 'Use group ownership transfer or leave flow for your own role' });
+      return;
+    }
 
-    if (!currentMembership || !['admin', 'owner'].includes(currentMembership.role)) {
+    const [group, currentMembership, targetMembership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId: currentUserId } },
+      }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId } },
+      }),
+    ]);
+
+    if (!group || !targetMembership) {
+      res.status(404).json({ error: 'Group member not found' });
+      return;
+    }
+    if (group.creatorId === userId) {
+      res.status(403).json({ error: 'The group owner role cannot be changed' });
+      return;
+    }
+
+    const currentRole = getEffectiveGroupRole(group, currentMembership, currentUserId);
+    const targetCurrentRole = getEffectiveGroupRole(group, targetMembership, userId);
+    const currentRank = currentRole ? GROUP_ROLE_RANK[currentRole] : 0;
+    const targetCurrentRank = targetCurrentRole ? GROUP_ROLE_RANK[targetCurrentRole] : 0;
+    const targetRank = GROUP_ROLE_RANK[targetRole];
+
+    if (currentRank < GROUP_ROLE_RANK.admin || currentRank <= targetCurrentRank || currentRank <= targetRank) {
       res.status(403).json({ error: 'Not authorized' });
       return;
     }
 
     await prisma.group_members.update({
       where: { groupId_userId: { groupId, userId } },
-      data: { role: role.toLowerCase() },
+      data: { role: targetRole },
     });
 
     res.status(200).json({ success: true });
@@ -1095,11 +2092,36 @@ export const removeMember = async (
       return;
     }
 
-    const currentMembership = await prisma.group_members.findUnique({
-      where: { groupId_userId: { groupId, userId: currentUserId } },
-    });
+    if (currentUserId === userId) {
+      res.status(400).json({ error: 'Use the leave group endpoint to remove yourself' });
+      return;
+    }
 
-    if (!currentMembership || !['admin', 'owner', 'moderator'].includes(currentMembership.role)) {
+    const [group, currentMembership, targetMembership] = await Promise.all([
+      prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, creatorId: true } }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId: currentUserId } },
+      }),
+      prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId, userId } },
+      }),
+    ]);
+
+    if (!group || !targetMembership) {
+      res.status(404).json({ error: 'Group member not found' });
+      return;
+    }
+    if (group.creatorId === userId) {
+      res.status(403).json({ error: 'The group owner cannot be removed' });
+      return;
+    }
+
+    const currentRole = getEffectiveGroupRole(group, currentMembership, currentUserId);
+    const targetRole = getEffectiveGroupRole(group, targetMembership, userId);
+    const currentRank = currentRole ? GROUP_ROLE_RANK[currentRole] : 0;
+    const targetRank = targetRole ? GROUP_ROLE_RANK[targetRole] : 0;
+
+    if (currentRank < GROUP_ROLE_RANK.moderator || currentRank <= targetRank) {
       res.status(403).json({ error: 'Not authorized' });
       return;
     }
@@ -1169,6 +2191,7 @@ export const getGroupMessages = async (
             username: true,
             name: true,
             profileImage: true,
+            isVerified: true,
           },
         },
         group_messages: {
@@ -1230,8 +2253,12 @@ export const sendGroupMessage = async (
       return;
     }
 
-    const groupId = String(req.params.groupId);
+    const groupId = ensureString(req.params.groupId);
     const { content, contentType, mediaUrl, mediaType, fileName, fileSize, replyToId } = req.body;
+    if (!groupId) {
+      res.status(400).json({ error: 'Group ID is required' });
+      return;
+    }
 
     // Verify user is member of group
     const membership = await prisma.group_members.findUnique({
@@ -1267,6 +2294,18 @@ export const sendGroupMessage = async (
       return;
     }
 
+    const replyMessageId = replyToId != null ? ensureString(replyToId) : null;
+    if (replyMessageId) {
+      const replyMessage = await prisma.group_messages.findFirst({
+        where: { id: replyMessageId, groupId, isDeleted: false },
+        select: { id: true },
+      });
+      if (!replyMessage) {
+        res.status(400).json({ error: 'Reply target is not in this group' });
+        return;
+      }
+    }
+
     // Create message in database
     const message = await prisma.group_messages.create({
       data: {
@@ -1279,7 +2318,7 @@ export const sendGroupMessage = async (
         mediaType,
         fileName,
         fileSize,
-        replyToId: replyToId != null ? String(replyToId) : undefined,
+        replyToId: replyMessageId || undefined,
         updatedAt: new Date(),
       },
       include: {
@@ -1289,6 +2328,7 @@ export const sendGroupMessage = async (
             username: true,
             name: true,
             profileImage: true,
+            isVerified: true,
           },
         },
         group_messages: {

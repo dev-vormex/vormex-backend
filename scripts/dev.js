@@ -23,6 +23,7 @@ let keepAliveProcess = null;
 let workerProcess = null;
 let schedulerProcess = null;
 let shuttingDown = false;
+let forcedShutdownTimer = null;
 
 function spawnChild(command, args, name) {
   const child = spawn(command, args, {
@@ -52,17 +53,41 @@ function runBootstrap(command, args, name) {
   }
 }
 
+function waitForExit(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    child.once('exit', () => resolve());
+  });
+}
+
 function shutdown(exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  for (const child of [serverProcess, workerProcess, schedulerProcess, keepAliveProcess]) {
+  const children = [serverProcess, workerProcess, schedulerProcess, keepAliveProcess].filter(Boolean);
+
+  for (const child of children) {
     if (child && !child.killed) {
       child.kill('SIGTERM');
     }
   }
 
-  setTimeout(() => process.exit(exitCode), 250);
+  forcedShutdownTimer = setTimeout(() => {
+    for (const child of children) {
+      if (child && child.exitCode === null && child.signalCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+    }
+    process.exit(exitCode);
+  }, 8_000);
+
+  Promise.allSettled(children.map(waitForExit)).then(() => {
+    if (forcedShutdownTimer) clearTimeout(forcedShutdownTimer);
+    process.exit(exitCode);
+  });
 }
 
 if (shouldKeepDbAwake) {

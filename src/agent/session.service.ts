@@ -8,6 +8,7 @@ import {
   AgentSessionSummary,
   AgentUiIntent,
 } from './types';
+import { redactAgentPayload } from './data-safety';
 
 class AgentSessionService {
   private readonly requiredAgentTables = [
@@ -56,9 +57,13 @@ class AgentSessionService {
 
     this.storageModePromise = (async () => {
       try {
-        const placeholders = this.requiredAgentTables.map((table) => `'${table}'`).join(', ');
-        const rows = await prisma.$queryRawUnsafe<Array<{ table_name: string }>>(
-          `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN (${placeholders})`
+        const rows = await prisma.$queryRaw<Array<{ table_name: string }>>(
+          Prisma.sql`
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name IN (${Prisma.join(this.requiredAgentTables)})
+          `
         );
         const foundTables = new Set(rows.map((row) => row.table_name));
         const missingTables = this.requiredAgentTables.filter((table) => !foundTables.has(table));
@@ -125,7 +130,7 @@ class AgentSessionService {
   ): AgentSessionSummary {
     const requestedSurface = payload.surface || 'global';
     const requestedMode = payload.mode || 'text';
-    const requestedAllowAutonomous = payload.allowAutonomousActions ?? true;
+    const requestedAllowAutonomous = payload.allowAutonomousActions ?? false;
 
     let session =
       (payload.sessionId ? this.fallbackSessions.get(payload.sessionId) : null) ||
@@ -183,7 +188,7 @@ class AgentSessionService {
 
     const requestedSurface = payload.surface || 'global';
     const requestedMode = payload.mode || 'text';
-    const requestedAllowAutonomous = payload.allowAutonomousActions ?? true;
+    const requestedAllowAutonomous = payload.allowAutonomousActions ?? false;
 
     try {
       let session = null;
@@ -353,8 +358,16 @@ class AgentSessionService {
           toolName: params.action.toolName,
           status: params.action.status,
           summary: params.action.summary,
-          input: (params.input || undefined) as any,
-          output: (params.output || undefined) as any,
+          input: (params.input ? redactAgentPayload(params.input) : undefined) as any,
+          output: (params.output
+            ? {
+                ...(redactAgentPayload(params.output) as Record<string, unknown>),
+                policy: {
+                  riskLevel: params.action.riskLevel || null,
+                  autonomyMode: params.action.autonomyMode || null,
+                },
+              }
+            : undefined) as any,
           uiIntents: (params.uiIntents && params.uiIntents.length > 0 ? params.uiIntents : undefined) as any,
         },
       });

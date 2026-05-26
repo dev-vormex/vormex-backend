@@ -10,6 +10,10 @@ export function normalizeAgentSurface(surface?: string | null): string {
       return 'find_people';
     case 'growth':
       return 'growth_hub';
+    case 'talk':
+    case 'talk_with_ai':
+    case 'talk_with_vormex':
+      return 'talk_with_vormex';
     case 'group':
       return 'groups';
     default:
@@ -75,6 +79,8 @@ export function describeNavigationPreview(uiIntents: AgentUiIntent[] = []): stri
           return 'Opening Profile';
         case 'growth_hub':
           return 'Opening Growth Hub';
+        case 'talk_with_vormex':
+          return 'Opening Chat with AI';
         default:
           return 'Switching pages';
       }

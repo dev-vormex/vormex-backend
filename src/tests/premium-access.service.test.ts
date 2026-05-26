@@ -4,7 +4,11 @@ import {
   evaluateAgentAccess,
   getAgentAccessDeniedMessage,
   getPremiumDaysRemaining,
+  getPremiumDurationDaysForBillingCycle,
+  getPremiumPlanOptions,
   getPremiumPeriodEnd,
+  isDeveloperPremiumOverrideAvailable,
+  isDeveloperPremiumOverrideAvailableForUser,
   isPremiumSubscriptionActive,
 } from '../services/premium-access.service';
 
@@ -13,6 +17,21 @@ test('getPremiumPeriodEnd returns a date 31 days after the start date by default
   const end = getPremiumPeriodEnd(start);
 
   assert.equal(end.toISOString(), '2026-05-02T00:00:00.000Z');
+});
+
+test('getPremiumDurationDaysForBillingCycle returns yearly access for yearly plans', () => {
+  assert.equal(getPremiumDurationDaysForBillingCycle('yearly'), 365);
+});
+
+test('getPremiumPlanOptions exposes monthly and yearly premium offers', () => {
+  const plans = getPremiumPlanOptions('INR');
+
+  assert.deepEqual(
+    plans.map((plan) => plan.billingCycle),
+    ['monthly', 'yearly']
+  );
+  assert.equal(plans[0].amountMinor, 19900);
+  assert.equal(plans[1].amountMinor, 99900);
 });
 
 test('isPremiumSubscriptionActive returns false when the subscription has expired', () => {
@@ -82,11 +101,101 @@ test('evaluateAgentAccess lets admins bypass the prompt limit', () => {
   assert.equal(access.agentLimitReached, false);
 });
 
+test('evaluateAgentAccess lets premium users bypass the free prompt limit', () => {
+  const access = evaluateAgentAccess({
+    isAdmin: false,
+    isPremium: true,
+    agentMode: 'all',
+    agentEnabled: false,
+    agentBlocked: false,
+    creditsUsed: 999,
+    agentPromptLimit: 5,
+  });
+
+  assert.equal(access.canUseAgent, true);
+  assert.equal(access.agentLimitReached, false);
+});
+
 test('getAgentAccessDeniedMessage mentions the prompt cap when the quota is exhausted', () => {
   const message = getAgentAccessDeniedMessage({
     agentLimitReached: true,
-    agentPromptLimit: 3,
+    agentPromptLimit: 5,
   });
 
-  assert.match(message, /3 prompts/);
+  assert.match(message, /5 prompts/);
+});
+
+test('developer premium override is disabled in production unless explicitly enabled', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+    assert.equal(isDeveloperPremiumOverrideAvailable(), false);
+
+    process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = 'true';
+    assert.equal(isDeveloperPremiumOverrideAvailable(), true);
+  } finally {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalOverride === undefined) {
+      delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+    } else {
+      process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = originalOverride;
+    }
+  }
+});
+
+test('developer premium override is available for configured owner email in production', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+  const originalAdminEmails = process.env.ADMIN_ALLOWED_EMAILS;
+
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+    process.env.ADMIN_ALLOWED_EMAILS = 'owner@example.com';
+
+    assert.equal(
+      isDeveloperPremiumOverrideAvailableForUser({
+        email: 'owner@example.com',
+        isAdmin: false,
+      }),
+      true
+    );
+    assert.equal(
+      isDeveloperPremiumOverrideAvailableForUser({
+        email: 'student@example.com',
+        isAdmin: false,
+      }),
+      false
+    );
+    assert.equal(
+      isDeveloperPremiumOverrideAvailableForUser({
+        email: 'admin@example.com',
+        isAdmin: true,
+      }),
+      true
+    );
+  } finally {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalOverride === undefined) {
+      delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
+    } else {
+      process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = originalOverride;
+    }
+    if (originalAdminEmails === undefined) {
+      delete process.env.ADMIN_ALLOWED_EMAILS;
+    } else {
+      process.env.ADMIN_ALLOWED_EMAILS = originalAdminEmails;
+    }
+  }
 });

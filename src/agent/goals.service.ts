@@ -41,9 +41,13 @@ class AgentGoalsService {
 
     this.storageModePromise = (async () => {
       try {
-        const placeholders = REQUIRED_TABLES.map((table) => `'${table}'`).join(', ');
-        const rows = await prisma.$queryRawUnsafe<Array<{ table_name: string }>>(
-          `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN (${placeholders})`
+        const rows = await prisma.$queryRaw<Array<{ table_name: string }>>(
+          Prisma.sql`
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name IN (${Prisma.join(REQUIRED_TABLES)})
+          `
         );
         const foundTables = new Set(rows.map((row) => row.table_name));
         const missingTables = REQUIRED_TABLES.filter((table) => !foundTables.has(table));

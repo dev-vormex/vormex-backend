@@ -2,9 +2,21 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { mapPostResponse } from '../utils/post.util';
+import { canViewPost } from '../utils/access-control.util';
+import { cacheService } from '../services/cache.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
+}
+
+const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
+
+function invalidateHomeFeedCache(userId: string): void {
+  cacheService
+    .invalidateTags(HOME_FEED_CACHE_GLOBAL_TAG, `feed:${userId}`)
+    .catch((error: unknown) => {
+      console.error('Failed to invalidate home feed cache:', error);
+    });
 }
 
 export const getSaved = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -22,7 +34,12 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
       include: {
         posts: {
           include: {
-            author: { select: { id: true, username: true, name: true, profileImage: true, headline: true } },
+            author: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true } },
+            collaborators: {
+              include: {
+                user: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true } },
+              },
+            },
             likes: { where: { userId }, select: { userId: true } },
             saved_posts: { where: { userId }, select: { userId: true } },
             pollVotes: { where: { userId }, select: { optionId: true, userId: true } },
@@ -30,15 +47,21 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = saved.length > limit;
     const pageItems = hasMore ? saved.slice(0, limit) : saved;
-    const posts = pageItems
-      .filter((s) => s.posts && s.posts.isActive)
+    const visibleSavedItems = [];
+    for (const item of pageItems) {
+      if (item.posts && item.posts.isActive && await canViewPost(item.posts, userId)) {
+        visibleSavedItems.push(item);
+      }
+    }
+
+    const posts = visibleSavedItems
       .map((s) => {
         const post: any = s.posts;
         return {
@@ -74,9 +97,9 @@ export const toggleSave = async (req: AuthRequest, res: Response): Promise<void>
 
     const post = await prisma.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -98,6 +121,7 @@ export const toggleSave = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     const savesCount = await prisma.saved_posts.count({ where: { postId } });
+    invalidateHomeFeedCache(userId);
 
     res.json({
       message: saved ? 'Post saved' : 'Post unsaved',
@@ -126,9 +150,9 @@ export const savePost = async (req: AuthRequest, res: Response): Promise<void> =
 
     const post = await prisma.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -138,6 +162,7 @@ export const savePost = async (req: AuthRequest, res: Response): Promise<void> =
       create: { userId, postId },
       update: {},
     });
+    invalidateHomeFeedCache(userId);
 
     res.json({ message: 'Post saved' });
   } catch (error) {
@@ -163,6 +188,7 @@ export const unsavePost = async (req: AuthRequest, res: Response): Promise<void>
     await prisma.saved_posts.deleteMany({
       where: { userId, postId },
     });
+    invalidateHomeFeedCache(userId);
 
     res.json({ message: 'Post unsaved' });
   } catch (error) {
@@ -182,6 +208,15 @@ export const checkSaved = async (req: AuthRequest, res: Response): Promise<void>
 
     if (!postId) {
       res.status(400).json({ error: 'Post ID is required' });
+      return;
+    }
+
+    const post = await prisma.post.findFirst({
+      where: { id: postId, isActive: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
+    });
+    if (!post || !(await canViewPost(post, userId))) {
+      res.status(404).json({ error: 'Post not found' });
       return;
     }
 

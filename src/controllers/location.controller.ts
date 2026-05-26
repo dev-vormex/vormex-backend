@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
 
@@ -13,6 +14,8 @@ interface NearbyUser {
   interests: string[];
   distance: number;
   isOnline: boolean;
+  verified: boolean;
+  isVerified: boolean;
   location: {
     lat: number;
     lng: number;
@@ -33,6 +36,11 @@ interface NearbyUsersResponse {
     city: string | null;
   };
 }
+
+type NearbyDistanceRow = {
+  id: string;
+  distance: number | string;
+};
 
 /**
  * Calculate distance between two coordinates using Haversine formula
@@ -97,23 +105,55 @@ export const getNearbyUsers = async (
     // Calculate bounding box for initial filtering (rough approximation)
     // 1 degree latitude ≈ 111km
     const latDelta = radiusKm / 111;
-    const lngDelta = radiusKm / (111 * Math.cos(toRad(userLat)));
+    const lngDelta = radiusKm / (111 * Math.max(0.01, Math.abs(Math.cos(toRad(userLat)))));
 
-    // Get users within bounding box who have location data
+    const nearbyDistanceRows = await prisma.$queryRaw<NearbyDistanceRow[]>(Prisma.sql`
+      SELECT "id", "distance"
+      FROM (
+        SELECT
+          "id",
+          "lastActiveAt",
+          6371 * 2 * ASIN(LEAST(1, SQRT(
+            POWER(SIN(RADIANS(("latitude" - ${userLat}) / 2)), 2) +
+            COS(RADIANS(${userLat})) * COS(RADIANS("latitude")) *
+            POWER(SIN(RADIANS(("longitude" - ${userLng}) / 2)), 2)
+          ))) AS "distance"
+        FROM "users"
+        WHERE "id" <> ${userId}
+          AND "isBanned" = false
+          AND "latitude" IS NOT NULL
+          AND "longitude" IS NOT NULL
+          AND "latitude" BETWEEN ${userLat - latDelta} AND ${userLat + latDelta}
+          AND "longitude" BETWEEN ${userLng - lngDelta} AND ${userLng + lngDelta}
+          AND COALESCE("locationPermission", true) = true
+          AND "shareLocationPublic" = true
+      ) ranked
+      WHERE "distance" <= ${radiusKm}
+      ORDER BY "distance" ASC, "lastActiveAt" DESC NULLS LAST, "id" ASC
+      LIMIT ${limit}
+    `);
+
+    const nearbyIds = nearbyDistanceRows.map((row) => row.id);
+    if (nearbyIds.length === 0) {
+      res.status(200).json({
+        users: [],
+        total: 0,
+        yourLocation: {
+          lat: userLat,
+          lng: userLng,
+          city: currentUser.currentCity,
+        },
+      });
+      return;
+    }
+
+    const distanceByUserId = new Map(
+      nearbyDistanceRows.map((row) => [row.id, Number(row.distance)])
+    );
+
     const usersInBox = await prisma.user.findMany({
       where: {
-        id: { not: userId },
-        isBanned: false,
-        latitude: { 
-          gte: userLat - latDelta,
-          lte: userLat + latDelta,
-        },
-        longitude: {
-          gte: userLng - lngDelta,
-          lte: userLng + lngDelta,
-        },
-        locationPermission: { not: false },
-        shareLocationPublic: true,
+        id: { in: nearbyIds },
       },
       select: {
         id: true,
@@ -128,6 +168,7 @@ export const getNearbyUsers = async (
         currentState: true,
         currentCountry: true,
         isOnline: true,
+        isVerified: true,
         interests: true,
         skills: {
           select: { skill: { select: { name: true } } },
@@ -135,15 +176,12 @@ export const getNearbyUsers = async (
       },
     });
 
-    // Calculate actual distances and filter by radius
-    const nearbyUsers: NearbyUser[] = usersInBox
+    const usersById = new Map(usersInBox.map((user) => [user.id, user]));
+    const nearbyUsers: NearbyUser[] = nearbyIds
+      .map((id) => usersById.get(id))
+      .filter((user): user is NonNullable<typeof user> => Boolean(user))
       .map((user) => {
-        const distance = calculateDistance(
-          userLat,
-          userLng,
-          user.latitude!,
-          user.longitude!
-        );
+        const distance = distanceByUserId.get(user.id) ?? calculateDistance(userLat, userLng, user.latitude!, user.longitude!);
         return {
           id: user.id,
           username: user.username,
@@ -155,7 +193,9 @@ export const getNearbyUsers = async (
           interests: user.interests,
           distance: Math.round(distance * 10) / 10, // Round to 1 decimal
           isOnline: user.isOnline,
-          location: user.latitude && user.longitude ? {
+          verified: Boolean(user.isVerified),
+          isVerified: Boolean(user.isVerified),
+          location: user.latitude !== null && user.longitude !== null ? {
             lat: user.latitude,
             lng: user.longitude,
             city: user.currentCity,
@@ -163,10 +203,7 @@ export const getNearbyUsers = async (
             country: user.currentCountry,
           } : null,
         };
-      })
-      .filter((user) => user.distance <= radiusKm)
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, limit);
+      });
 
     res.status(200).json({
       users: nearbyUsers,

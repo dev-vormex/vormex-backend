@@ -83,6 +83,7 @@ async function getOrCreateConversationForUsers(userId: string, otherUserId: stri
 function buildChatMessagePayload(message: any, sender: any) {
   return {
     id: message.id,
+    clientMessageId: message.clientMessageId || undefined,
     conversationId: message.conversationId,
     senderId: message.senderId,
     receiverId: message.receiverId,
@@ -340,8 +341,39 @@ export const getPremiumAdminUsers = async (
       prisma.user.count({ where }),
     ]);
 
+    const defaultCreditsWindowStart = new Date(
+      Date.now() - getPremiumDurationDays() * 24 * 60 * 60 * 1000
+    );
+    const creditsWindowStartByUserId = new Map(
+      users.map((user) => [
+        user.id,
+        user.subscriptions?.currentPeriodStart || defaultCreditsWindowStart,
+      ])
+    );
+    const creditCountRows =
+      users.length > 0
+        ? await prisma.agent_messages.groupBy({
+            by: ['userId'],
+            where: {
+              role: 'user',
+              OR: users.map((user) => ({
+                userId: user.id,
+                createdAt: {
+                  gte: creditsWindowStartByUserId.get(user.id)!,
+                },
+              })),
+            },
+            _count: {
+              _all: true,
+            },
+          })
+        : [];
+    const creditsUsedByUserId = new Map(
+      creditCountRows.map((row) => [row.userId, row._count._all])
+    );
+
     res.json({
-      users: await Promise.all(users.map(async (user) => {
+      users: users.map((user) => {
         const isPremium = isPremiumSubscriptionActive(user.subscriptions);
         const premiumAmountMinor =
           user.featureAccessOverride?.premiumPriceOverrideMinor ??
@@ -351,18 +383,7 @@ export const getPremiumAdminUsers = async (
           (user.subscriptions?.currentPeriodStart
             ? getPremiumPeriodEnd(user.subscriptions.currentPeriodStart)
             : null);
-        const creditsWindowStart =
-          user.subscriptions?.currentPeriodStart ||
-          new Date(Date.now() - getPremiumDurationDays() * 24 * 60 * 60 * 1000);
-        const creditsUsed = await prisma.agent_messages.count({
-          where: {
-            userId: user.id,
-            role: 'user',
-            createdAt: {
-              gte: creditsWindowStart,
-            },
-          },
-        });
+        const creditsUsed = creditsUsedByUserId.get(user.id) || 0;
         const agentAccess = evaluateAgentAccess({
           isAdmin: user.isAdmin,
           isPremium,
@@ -402,7 +423,7 @@ export const getPremiumAdminUsers = async (
           creditsUsed,
           canCancelPremium: isPremium,
         };
-      })),
+      }),
       pagination: {
         page,
         limit,
@@ -943,7 +964,19 @@ export const sendPremiumAdminUserMessage = async (
           preview,
           conversation.id,
           adminId,
-          sender.profileImage || undefined
+          sender.profileImage || undefined,
+          {
+            id: messagePayload.id,
+            clientMessageId: messagePayload.clientMessageId,
+            content: messagePayload.content,
+            contentType: messagePayload.contentType,
+            mediaUrl: messagePayload.mediaUrl,
+            mediaType: messagePayload.mediaType,
+            fileName: messagePayload.fileName,
+            fileSize: messagePayload.fileSize,
+            createdAt: messagePayload.createdAt,
+            updatedAt: messagePayload.updatedAt,
+          }
         )
         .catch(console.error);
     }

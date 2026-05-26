@@ -1,4 +1,4 @@
-import { redisPub } from '../redis/client';
+import { isRedisEnabled, redisPub } from '../redis/client';
 
 export const REALTIME_CHANNEL = 'vormex:realtime:events';
 
@@ -11,7 +11,7 @@ export interface RealtimeEnvelope {
 }
 
 export async function publishRealtimeEnvelope(envelope: RealtimeEnvelope): Promise<void> {
-  if (!redisPub) {
+  if (!isRedisEnabled() || !redisPub) {
     return;
   }
 

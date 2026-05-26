@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
 import { requireAdmin } from '../middleware/admin.middleware';
+import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
 import {
   verifyAdmin,
   setup2FA,
@@ -51,16 +52,38 @@ import {
 
 const router = Router();
 
+const adminTwoFactorSetupRateLimit = createRateLimitMiddleware(() => [
+  {
+    keyPrefix: 'rate:user:admin:2fa-setup',
+    limit: 3,
+    windowSeconds: 60 * 60,
+  },
+]);
+
+const adminTwoFactorVerifyRateLimit = createRateLimitMiddleware(() => [
+  {
+    keyPrefix: 'rate:ip:admin:2fa',
+    limit: 10,
+    windowSeconds: 15 * 60,
+  },
+  {
+    keyPrefix: 'rate:user:admin:2fa',
+    limit: 6,
+    windowSeconds: 15 * 60,
+  },
+]);
+
 router.use(authenticate);
 
+router.get('/verify', verifyAdmin);
 router.post('/verify', verifyAdmin);
 
-router.use(requireAdmin);
-
 // 2FA
-router.post('/2fa/setup', setup2FA);
-router.post('/2fa/verify', verify2FA);
-router.post('/2fa/validate', validate2FA);
+router.post('/2fa/setup', adminTwoFactorSetupRateLimit, setup2FA);
+router.post('/2fa/verify', adminTwoFactorVerifyRateLimit, verify2FA);
+router.post('/2fa/validate', adminTwoFactorVerifyRateLimit, validate2FA);
+
+router.use(requireAdmin);
 
 // Dashboard
 router.get('/dashboard/stats', getDashboardStats);

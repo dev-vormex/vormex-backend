@@ -5,13 +5,25 @@ import { connectRedisClients, disconnectRedisClients } from './infrastructure/re
 import { logger } from './lib/logger';
 import { registerSchedulerJobs } from './scheduler/index';
 
+let idleTimer: NodeJS.Timeout | null = null;
+
 async function bootstrap(): Promise<void> {
   await connectRedisClients();
-  await registerSchedulerJobs();
+  const registered = await registerSchedulerJobs();
 
   logger.info({
     event: 'scheduler.bootstrap.complete',
+    active: registered,
   });
+
+  if (!registered) {
+    idleTimer = setInterval(() => {
+      logger.debug({
+        event: 'scheduler.idle',
+        reason: 'redis_unavailable',
+      });
+    }, 60_000);
+  }
 }
 
 async function shutdown(signal: string): Promise<void> {
@@ -20,6 +32,9 @@ async function shutdown(signal: string): Promise<void> {
     signal,
   });
 
+  if (idleTimer) {
+    clearInterval(idleTimer);
+  }
   await closeQueues();
   await disconnectRedisClients();
   await disconnectPrisma();

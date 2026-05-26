@@ -7,10 +7,41 @@ import { updateEngagementStreak } from './engagement.controller';
 import { getIO } from '../sockets';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
+import { getConnectionRequestLimitState } from '../services/tier-limits.service';
+import { cacheService } from '../services/cache.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
+
+const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
+
+const discoveryCacheTags = (...userIds: Array<string | null | undefined>): string[] =>
+  uniqueCacheTags(
+    userIds.flatMap((userId) =>
+      userId
+        ? [
+            `people:user:${userId}`,
+            `people:connections:${userId}`,
+            `matching:user:${userId}`,
+            `user:${userId}`,
+          ]
+        : []
+    )
+  );
+
+const invalidateDiscoveryCaches = async (
+  ...userIds: Array<string | null | undefined>
+): Promise<void> => {
+  const tags = discoveryCacheTags(...userIds);
+  if (tags.length === 0) return;
+
+  try {
+    await cacheService.invalidateTags(...tags);
+  } catch (error) {
+    console.error('connection discovery cache invalidation failed:', error);
+  }
+};
 
 export const sendConnectionRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -33,7 +64,7 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
 
     const receiver = await prisma.user.findUnique({
       where: { id: receiverId },
-      select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+      select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
     });
 
     if (!receiver) {
@@ -59,6 +90,18 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
         res.status(400).json({ error: 'Connection request already pending' });
         return;
       }
+    }
+
+    const limitState = await getConnectionRequestLimitState(req.user.userId);
+    if (!limitState.allowed) {
+      res.status(403).json({
+        error: 'Free accounts can send up to 10 connection requests per month. Upgrade to Premium for unlimited requests.',
+        code: 'connection_request_limit_reached',
+        limit: limitState.limit,
+        used: limitState.used,
+        remaining: limitState.remaining,
+      });
+      return;
     }
 
     const connection = await prisma.connections.create({
@@ -90,6 +133,8 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       requester?.name || 'Someone',
       connection.id
     ).catch(console.error);
+
+    await invalidateDiscoveryCaches(req.user.userId, receiverId);
 
     res.status(201).json({
       message: 'Connection request sent',
@@ -124,7 +169,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       where: { id: connectionId },
       include: {
         users_connections_requesterIdTousers: {
-          select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+          select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
         },
       },
     });
@@ -174,7 +219,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       // Get addressee info for the requester's celebration
       const addressee = await prisma.user.findUnique({
         where: { id: req.user.userId },
-        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
       });
       
       io.to(`user:${connection.requesterId}`).emit('connection:accepted', {
@@ -197,6 +242,8 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
         req.user.userId
       ).catch(console.error);
     }
+
+    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 
     res.status(200).json({
       message: 'Connection request accepted',
@@ -255,6 +302,8 @@ export const rejectConnectionRequest = async (req: AuthRequest, res: Response): 
       }),
     ]);
 
+    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
+
     res.status(200).json({ message: 'Connection request rejected' });
   } catch (error) {
     console.error('rejectConnectionRequest error:', error);
@@ -307,6 +356,8 @@ export const cancelConnectionRequest = async (req: AuthRequest, res: Response): 
       }),
     ]);
 
+    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
+
     res.status(200).json({ message: 'Connection request cancelled' });
   } catch (error) {
     console.error('cancelConnectionRequest error:', error);
@@ -355,6 +406,8 @@ export const removeConnection = async (req: AuthRequest, res: Response): Promise
       data: { connectionsCount: { decrement: 1 } },
     });
 
+    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
+
     res.status(200).json({ message: 'Connection removed' });
   } catch (error) {
     console.error('removeConnection error:', error);
@@ -384,10 +437,10 @@ export const getConnections = async (req: AuthRequest, res: Response): Promise<v
         },
         include: {
           users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -452,10 +505,10 @@ export const getUserConnections = async (req: AuthRequest, res: Response): Promi
         },
         include: {
           users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -517,7 +570,7 @@ export const getPendingRequests = async (req: AuthRequest, res: Response): Promi
         },
         include: {
           users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -575,7 +628,7 @@ export const getSentRequests = async (req: AuthRequest, res: Response): Promise<
         },
         include: {
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
           },
         },
         orderBy: { createdAt: 'desc' },

@@ -6,6 +6,7 @@ import { enqueueOutboxEvent } from '../outbox/service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from '../outbox/helpers';
 import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
 import { emitRealtimeEnvelopes } from '../infrastructure/realtime/emitter';
+import { cacheService } from '../services/cache.service';
 import { ensureString } from '../utils/request.util';
 import { isPrismaConnectionError } from '../utils/prisma-error.util';
 
@@ -20,6 +21,44 @@ const userSelect = {
   profileImage: true,
   isOnline: true,
   lastActiveAt: true,
+  isVerified: true,
+};
+
+const uniqueTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
+
+const chatUserCacheTags = (...userIds: Array<string | null | undefined>): string[] =>
+  uniqueTags(userIds.filter(Boolean).map((userId) => `chat:user:${userId}`));
+
+const notificationCacheTags = (...userIds: Array<string | null | undefined>): string[] =>
+  uniqueTags(userIds.filter(Boolean).map((userId) => `notifications:${userId}`));
+
+const conversationCacheTags = (
+  conversationId: string,
+  ...participantIds: Array<string | null | undefined>
+): string[] =>
+  uniqueTags([
+    `conversation:${conversationId}`,
+    ...chatUserCacheTags(...participantIds),
+    ...notificationCacheTags(...participantIds),
+  ]);
+
+const messageCacheTags = (message: {
+  conversationId: string;
+  senderId: string;
+  receiverId: string;
+}): string[] => conversationCacheTags(message.conversationId, message.senderId, message.receiverId);
+
+const invalidateChatCaches = async (tags: string[]): Promise<void> => {
+  const dedupedTags = uniqueTags(tags);
+  if (dedupedTags.length === 0) {
+    return;
+  }
+
+  try {
+    await cacheService.invalidateTags(...dedupedTags);
+  } catch (error) {
+    console.error('chat cache invalidation failed:', error);
+  }
 };
 
 const buildFallbackChatUser = (userId: string) => ({
@@ -29,7 +68,17 @@ const buildFallbackChatUser = (userId: string) => ({
   profileImage: null,
   isOnline: false,
   lastActiveAt: null,
+  isVerified: false,
 });
+
+const normalizeClientMessageId = (clientMessageId: unknown): string | null => {
+  if (typeof clientMessageId !== 'string') {
+    return null;
+  }
+
+  const normalized = clientMessageId.trim();
+  return normalized ? normalized.slice(0, 128) : null;
+};
 
 const mapMessagePayload = (
   message: any,
@@ -37,6 +86,7 @@ const mapMessagePayload = (
   reactions: { id: string; userId: string; emoji: string }[] = []
 ) => ({
   id: message.id,
+  clientMessageId: message.clientMessageId || undefined,
   conversationId: message.conversationId,
   senderId: message.senderId,
   receiverId: message.receiverId,
@@ -209,6 +259,7 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
       return;
     }
 
+    let createdConversation = false;
     let conversation = await prisma.conversations.findFirst({
       where: {
         OR: [
@@ -235,6 +286,7 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
     });
 
     if (!conversation) {
+      createdConversation = true;
       conversation = await prisma.conversations.create({
         data: {
           id: randomUUID(),
@@ -267,6 +319,16 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
         ? convWithRelations.users_conversations_participant2IdTousers
         : convWithRelations.users_conversations_participant1IdTousers;
 
+    if (createdConversation) {
+      await invalidateChatCaches(
+        conversationCacheTags(
+          conversation.id,
+          conversation.participant1Id,
+          conversation.participant2Id
+        )
+      );
+    }
+
     res.status(200).json({
       id: conversation.id,
       participant1Id: conversation.participant1Id,
@@ -283,6 +345,115 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
   } catch (error) {
     console.error('getOrCreateConversation error:', error);
     res.status(500).json({ error: 'Failed to get or create conversation' });
+  }
+};
+
+export const getConversationStatusWithUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const participantId = ensureString(req.params.userId);
+
+    if (!participantId) {
+      res.status(400).json({ error: 'User ID is required' });
+      return;
+    }
+
+    if (participantId === req.user.userId) {
+      res.status(400).json({ error: 'Cannot check conversation with yourself' });
+      return;
+    }
+
+    const participant = await prismaRead.user.findUnique({
+      where: { id: participantId },
+      select: userSelect,
+    });
+
+    if (!participant) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const conversation = await prismaRead.conversations.findFirst({
+      where: {
+        OR: [
+          { participant1Id: req.user.userId, participant2Id: participantId },
+          { participant1Id: participantId, participant2Id: req.user.userId },
+        ],
+      },
+      include: {
+        users_conversations_participant1IdTousers: { select: userSelect },
+        users_conversations_participant2IdTousers: { select: userSelect },
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            content: true,
+            contentType: true,
+            senderId: true,
+            status: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+
+    if (!conversation) {
+      res.status(200).json({
+        hasConversation: false,
+        hasMessages: false,
+        conversation: null,
+      });
+      return;
+    }
+
+    const convWithRelations = conversation as typeof conversation & {
+      users_conversations_participant1IdTousers: unknown;
+      users_conversations_participant2IdTousers: unknown;
+      messages: unknown[];
+    };
+    const otherParticipant =
+      conversation.participant1Id === req.user.userId
+        ? convWithRelations.users_conversations_participant2IdTousers
+        : convWithRelations.users_conversations_participant1IdTousers;
+
+    const unreadCount = await prismaRead.messages.count({
+      where: {
+        conversationId: conversation.id,
+        receiverId: req.user.userId,
+        status: { not: 'READ' },
+      },
+    });
+    const lastMessage = convWithRelations.messages[0] || null;
+
+    res.status(200).json({
+      hasConversation: true,
+      hasMessages: Boolean(lastMessage),
+      conversation: {
+        id: conversation.id,
+        participant1Id: conversation.participant1Id,
+        participant2Id: conversation.participant2Id,
+        participant1: convWithRelations.users_conversations_participant1IdTousers,
+        participant2: convWithRelations.users_conversations_participant2IdTousers,
+        otherParticipant,
+        lastMessage,
+        lastMessageAt: conversation.lastMessageAt?.toISOString() || null,
+        unreadCount,
+        createdAt: conversation.createdAt.toISOString(),
+        updatedAt: conversation.updatedAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('getConversationStatusWithUser error:', error);
+    if (isPrismaConnectionError(error)) {
+      res.status(503).json({ error: 'Database is temporarily unavailable. Please try again in a moment.' });
+      return;
+    }
+    res.status(500).json({ error: 'Failed to get conversation status' });
   }
 };
 
@@ -454,6 +625,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
     const { content, contentType, mediaUrl, mediaType, fileName, fileSize, replyToId } = req.body;
+    const clientMessageId = normalizeClientMessageId(req.body.clientMessageId);
 
     if (!content && !mediaUrl) {
       res.status(400).json({ error: 'Content or media is required' });
@@ -485,10 +657,53 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       select: userSelect,
     });
 
-    const replyToMessage = replyToId
+    if (clientMessageId) {
+      const existingMessage = await prismaRead.messages.findFirst({
+        where: {
+          conversationId,
+          senderId: req.user.userId,
+          clientMessageId,
+        },
+        include: {
+          message_reactions: true,
+          messages: {
+            select: {
+              id: true,
+              content: true,
+              contentType: true,
+              senderId: true,
+            },
+          },
+        },
+      });
+
+      if (existingMessage) {
+        const existingPayload = mapMessagePayload(
+          existingMessage,
+          sender,
+          (existingMessage as typeof existingMessage & { message_reactions: { id: string; userId: string; emoji: string }[] }).message_reactions
+        );
+
+        emitRealtimeEnvelopes([
+          {
+            event: 'chat:new_message',
+            users: [String(req.user.userId), receiverId],
+            payload: {
+              conversationId,
+              message: existingPayload,
+            },
+          },
+        ]);
+        res.status(200).json(existingPayload);
+        return;
+      }
+    }
+
+    const replyToMessageId = replyToId ? ensureString(replyToId) : null;
+    const replyToMessage = replyToMessageId
       ? await prisma.messages.findFirst({
           where: {
-            id: replyToId,
+            id: replyToMessageId,
             conversationId,
           },
           select: {
@@ -500,7 +715,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
         })
       : null;
 
-    if (replyToId && !replyToMessage) {
+    if (replyToMessageId && !replyToMessage) {
       res.status(400).json({ error: 'Reply target is invalid for this conversation' });
       return;
     }
@@ -533,10 +748,11 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
         deliveredAt: null,
         readAt: null,
         isDeleted: false,
-        replyToId: replyToId || null,
+        replyToId: replyToMessageId,
         messages: replyToMessage,
         createdAt: now,
         updatedAt: now,
+        clientMessageId,
       },
       sender,
       []
@@ -545,15 +761,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
     const realtimeEnvelopes: RealtimeEnvelope[] = [
       {
         event: 'chat:new_message',
-        rooms: [`chat:${conversationId}`],
-        payload: {
-          conversationId,
-          message: messagePayload,
-        },
-      },
-      {
-        event: 'chat:new_message',
-        users: [String(req.user.userId)],
+        users: [String(req.user.userId), receiverId],
         payload: {
           conversationId,
           message: messagePayload,
@@ -570,11 +778,17 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
         },
       },
     ];
+    const cacheTags = conversationCacheTags(
+      conversationId,
+      String(req.user.userId),
+      receiverId
+    );
 
     await prisma.$transaction(async (tx) => {
       await tx.messages.create({
         data: {
           id: messageId,
+          clientMessageId,
           conversationId,
           senderId: req.user.userId,
           receiverId,
@@ -584,7 +798,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
           mediaType,
           fileName,
           fileSize: normalizedFileSize,
-          replyToId,
+          replyToId: replyToMessageId,
           status: 'SENT',
           createdAt: now,
           updatedAt: now,
@@ -620,6 +834,16 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
           senderId: String(req.user!.userId),
           senderName: sender?.name || sender?.username || 'Someone',
           senderImage: sender?.profileImage || undefined,
+          messageId,
+          clientMessageId: clientMessageId || undefined,
+          messageContent: normalizedContent,
+          contentType: normalizedContentType,
+          mediaUrl: mediaUrl || undefined,
+          mediaType: mediaType || undefined,
+          fileName: fileName || undefined,
+          fileSize: normalizedFileSize || undefined,
+          messageCreatedAt: now.toISOString(),
+          messageUpdatedAt: now.toISOString(),
         },
       });
 
@@ -629,11 +853,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
         eventType: 'chat.cache.invalidate',
         queueName: queueNames.cacheInvalidation,
         payload: {
-          tags: [
-            `conversation:${conversationId}`,
-            `notifications:${receiverId}`,
-            `notifications:${String(req.user!.userId)}`,
-          ],
+          tags: cacheTags,
         },
       });
 
@@ -644,6 +864,10 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
 
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(201).json(messagePayload);
+
+    void invalidateChatCaches(cacheTags).catch((cacheError) => {
+      console.error('sendMessage cache invalidation failed:', cacheError);
+    });
   } catch (error) {
     console.error('sendMessage error:', error);
     res.status(500).json({ error: 'Failed to send message' });
@@ -664,6 +888,7 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
     }
     const now = new Date();
     let realtimeEnvelopes: RealtimeEnvelope[] = [];
+    let cacheTags: string[] = [];
     const result = await prisma.$transaction(async (tx) => {
       const conversation = await tx.conversations.findFirst({
         where: {
@@ -696,6 +921,11 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
         conversation.participant1Id === req.user!.userId
           ? conversation.participant2Id
           : conversation.participant1Id;
+      cacheTags = conversationCacheTags(
+        conversationId,
+        conversation.participant1Id,
+        conversation.participant2Id
+      );
 
       const payload = {
         conversationId,
@@ -716,24 +946,6 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
         },
       ];
 
-      await enqueueRealtimeFanout(tx as any, {
-        aggregateType: 'conversation',
-        aggregateId: conversationId,
-        eventType: 'chat.messages.read',
-        envelopes: realtimeEnvelopes,
-      });
-
-      await enqueueCacheInvalidation(tx as any, {
-        aggregateType: 'conversation',
-        aggregateId: conversationId,
-        eventType: 'chat.messages.read.cache.invalidate',
-        tags: [
-          `conversation:${conversationId}`,
-          `notifications:${senderId}`,
-          `notifications:${String(req.user!.userId)}`,
-        ],
-      });
-
       return {
         updatedCount: updated.count,
       };
@@ -744,6 +956,28 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    const outboxResults = await Promise.allSettled([
+      enqueueRealtimeFanout(prisma as any, {
+        aggregateType: 'conversation',
+        aggregateId: conversationId,
+        eventType: 'chat.messages.read',
+        envelopes: realtimeEnvelopes,
+      }),
+      enqueueCacheInvalidation(prisma as any, {
+        aggregateType: 'conversation',
+        aggregateId: conversationId,
+        eventType: 'chat.messages.read.cache.invalidate',
+        tags: cacheTags,
+      }),
+    ]);
+
+    outboxResults.forEach((outboxResult) => {
+      if (outboxResult.status === 'rejected') {
+        console.error('markAsRead outbox enqueue failed:', outboxResult.reason);
+      }
+    });
+
+    await invalidateChatCaches(cacheTags);
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({
       updatedCount: result.updatedCount,
@@ -795,6 +1029,7 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
         },
       },
     ];
+    const cacheTags = messageCacheTags(message);
 
     await prisma.$transaction(async (tx) => {
       if (forEveryone) {
@@ -819,10 +1054,11 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
         aggregateType: 'conversation',
         aggregateId: message.conversationId,
         eventType: 'chat.message.deleted.cache.invalidate',
-        tags: [`conversation:${message.conversationId}`],
+        tags: cacheTags,
       });
     });
 
+    await invalidateChatCaches(cacheTags);
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ success: true });
   } catch (error) {
@@ -860,16 +1096,30 @@ export const deleteConversation = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    // Delete all messages in the conversation
-    await prisma.messages.deleteMany({
-      where: { conversationId },
+    const cacheTags = conversationCacheTags(
+      conversationId,
+      conversation.participant1Id,
+      conversation.participant2Id
+    );
+
+    await prisma.$transaction(async (tx) => {
+      await tx.messages.deleteMany({
+        where: { conversationId },
+      });
+
+      await tx.conversations.delete({
+        where: { id: conversationId },
+      });
+
+      await enqueueCacheInvalidation(tx as any, {
+        aggregateType: 'conversation',
+        aggregateId: conversationId,
+        eventType: 'chat.conversation.deleted.cache.invalidate',
+        tags: cacheTags,
+      });
     });
 
-    // Delete the conversation itself
-    await prisma.conversations.delete({
-      where: { id: conversationId },
-    });
-
+    await invalidateChatCaches(cacheTags);
     console.log(`Deleted conversation ${conversationId} and all its messages`);
     res.status(200).json({ success: true });
   } catch (error) {
@@ -916,6 +1166,7 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       select: userSelect,
     });
     let realtimeEnvelopes: RealtimeEnvelope[] = [];
+    const cacheTags = messageCacheTags(message);
     const updated = await prisma.$transaction(async (tx) => {
       const nextMessage = await tx.messages.update({
         where: { id: messageId },
@@ -956,12 +1207,13 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
         aggregateType: 'conversation',
         aggregateId: nextMessage.conversationId,
         eventType: 'chat.message.edited.cache.invalidate',
-        tags: [`conversation:${nextMessage.conversationId}`],
+        tags: cacheTags,
       });
 
       return nextMessage;
     });
 
+    await invalidateChatCaches(cacheTags);
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json(mapMessagePayload(updated, sender, []));
   } catch (error) {
@@ -997,6 +1249,10 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Message not found' });
       return;
     }
+    if (message.isDeleted || (message.senderId !== req.user.userId && message.receiverId !== req.user.userId)) {
+      res.status(404).json({ error: 'Message not found' });
+      return;
+    }
 
     const existingReaction = await prisma.message_reactions.findUnique({
       where: {
@@ -1020,6 +1276,7 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
         },
       },
     ];
+    const cacheTags = messageCacheTags(message);
 
     if (existingReaction) {
       if (existingReaction.emoji === emoji) {
@@ -1035,7 +1292,15 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
             eventType: 'chat.message.reaction.removed',
             envelopes: realtimeEnvelopes,
           });
+
+          await enqueueCacheInvalidation(tx as any, {
+            aggregateType: 'conversation',
+            aggregateId: message.conversationId,
+            eventType: 'chat.message.reaction.removed.cache.invalidate',
+            tags: cacheTags,
+          });
         });
+        await invalidateChatCaches(cacheTags);
         emitRealtimeEnvelopes(realtimeEnvelopes);
         res.status(200).json({ action: 'removed', emoji });
         return;
@@ -1053,7 +1318,15 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
             eventType: 'chat.message.reaction.updated',
             envelopes: realtimeEnvelopes,
           });
+
+          await enqueueCacheInvalidation(tx as any, {
+            aggregateType: 'conversation',
+            aggregateId: message.conversationId,
+            eventType: 'chat.message.reaction.updated.cache.invalidate',
+            tags: cacheTags,
+          });
         });
+        await invalidateChatCaches(cacheTags);
         emitRealtimeEnvelopes(realtimeEnvelopes);
         res.status(200).json({ action: 'updated', emoji });
         return;
@@ -1077,8 +1350,16 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
         eventType: 'chat.message.reaction.added',
         envelopes: realtimeEnvelopes,
       });
+
+      await enqueueCacheInvalidation(tx as any, {
+        aggregateType: 'conversation',
+        aggregateId: message.conversationId,
+        eventType: 'chat.message.reaction.added.cache.invalidate',
+        tags: cacheTags,
+      });
     });
 
+    await invalidateChatCaches(cacheTags);
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ action: 'added', emoji });
   } catch (error) {
@@ -1444,14 +1725,30 @@ export const declineMessageRequest = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
-    await prisma.messages.deleteMany({
-      where: { conversationId },
+    const cacheTags = conversationCacheTags(
+      conversationId,
+      conversation.participant1Id,
+      conversation.participant2Id
+    );
+
+    await prisma.$transaction(async (tx) => {
+      await tx.messages.deleteMany({
+        where: { conversationId },
+      });
+
+      await tx.conversations.delete({
+        where: { id: conversationId },
+      });
+
+      await enqueueCacheInvalidation(tx as any, {
+        aggregateType: 'conversation',
+        aggregateId: conversationId,
+        eventType: 'chat.message_request.declined.cache.invalidate',
+        tags: cacheTags,
+      });
     });
 
-    await prisma.conversations.delete({
-      where: { id: conversationId },
-    });
-
+    await invalidateChatCaches(cacheTags);
     res.status(200).json({ message: 'Message request declined' });
   } catch (error) {
     console.error('declineMessageRequest error:', error);

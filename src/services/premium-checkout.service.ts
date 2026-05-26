@@ -84,6 +84,14 @@ function normalizeText(value: string | undefined) {
   return value?.trim().toLowerCase() ?? '';
 }
 
+function normalizeBillingCycle(value: string | undefined | null) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'yearly' || normalized === 'annual' || normalized === 'annually') {
+    return 'yearly';
+  }
+  return 'monthly';
+}
+
 function currencyMatches(actual: string | undefined, expected: string) {
   return actual?.trim().toUpperCase() === expected.trim().toUpperCase();
 }
@@ -139,7 +147,7 @@ export function validatePremiumCheckoutPayment(
   }
 
   const orderBillingCycle = readNote(order.notes, 'billingCycle');
-  if (orderBillingCycle !== config.billingCycle) {
+  if (normalizeBillingCycle(orderBillingCycle) !== normalizeBillingCycle(config.billingCycle)) {
     return {
       ok: false,
       statusCode: 400,

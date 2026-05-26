@@ -1,16 +1,70 @@
 import { Response, NextFunction } from 'express';
+import { prisma } from '../config/prisma';
 import { verifyToken, type JWTPayload } from '../utils/jwt.util';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { getRequestId, getRequestLogger } from '../lib/logger';
 import { getAuthSession } from '../services/auth-session.service';
+import {
+  getCachedAuthUserStatus,
+  setCachedAuthUserStatus,
+} from '../services/auth-user-status-cache.service';
+import {
+  ACCESS_TOKEN_COOKIE,
+  getCookie,
+  getCsrfTokenFromRequest,
+  isUnsafeHttpMethod,
+  verifyCsrfToken,
+} from '../utils/auth-cookie.util';
+
+function requiresSessionBoundAccessTokens(): boolean {
+  return process.env.AUTH_REQUIRE_SESSION_ID !== 'false';
+}
 
 async function isTokenSessionActive(decoded: JWTPayload): Promise<boolean> {
   if (!decoded.sessionId) {
-    return true;
+    return !requiresSessionBoundAccessTokens();
   }
 
   const session = await getAuthSession(decoded.sessionId);
   return Boolean(session && session.userId === String(decoded.userId));
+}
+
+async function assertUserCanAuthenticate(decoded: JWTPayload): Promise<void> {
+  const userId = String(decoded.userId);
+  const cachedStatus = await getCachedAuthUserStatus(userId);
+  if (cachedStatus === true) {
+    return;
+  }
+  if (cachedStatus === false) {
+    throw new Error('User account is disabled or email verification required');
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      authProvider: true,
+      isBanned: true,
+      isVerified: true,
+    },
+  });
+
+  if (!user) {
+    await setCachedAuthUserStatus(userId, false);
+    throw new Error('User account no longer exists');
+  }
+
+  if (user.isBanned) {
+    await setCachedAuthUserStatus(userId, false);
+    throw new Error('User account is disabled');
+  }
+
+  if (user.authProvider === 'email' && !user.isVerified) {
+    await setCachedAuthUserStatus(userId, false);
+    throw new Error('Email verification required');
+  }
+
+  await setCachedAuthUserStatus(userId, true);
 }
 
 export async function verifyAccessToken(token: string): Promise<JWTPayload> {
@@ -19,7 +73,47 @@ export async function verifyAccessToken(token: string): Promise<JWTPayload> {
   if (!sessionActive) {
     throw new Error('Session is no longer active');
   }
+  await assertUserCanAuthenticate(decoded);
   return decoded;
+}
+
+function getAccessTokenFromRequest(req: AuthenticatedRequest): {
+  token?: string;
+  source: 'authorization' | 'cookie' | 'none';
+  invalidAuthorizationHeader?: boolean;
+} {
+  const authHeader = req.headers.authorization;
+
+  if (authHeader) {
+    const parts = authHeader.split(' ');
+    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      return { source: 'authorization', invalidAuthorizationHeader: true };
+    }
+
+    return {
+      token: parts[1],
+      source: 'authorization',
+    };
+  }
+
+  const cookieToken = getCookie(req, ACCESS_TOKEN_COOKIE);
+  if (cookieToken) {
+    return {
+      token: cookieToken,
+      source: 'cookie',
+    };
+  }
+
+  return { source: 'none' };
+}
+
+function isCookieCsrfValid(req: AuthenticatedRequest, decoded: JWTPayload): boolean {
+  if (!isUnsafeHttpMethod(req.method)) {
+    return true;
+  }
+
+  const csrfToken = getCsrfTokenFromRequest(req);
+  return verifyCsrfToken(csrfToken, decoded.sessionId);
 }
 
 /**
@@ -38,22 +132,9 @@ export const authenticate = async (
   const log = getRequestLogger(req);
 
   try {
-    // Get token from Authorization header
-    const authHeader = req.headers.authorization;
+    const tokenResult = getAccessTokenFromRequest(req);
 
-    if (!authHeader) {
-      res.status(401).json({
-        error: 'No token provided. Authorization header is required.',
-        code: 'unauthorized',
-        requestId,
-      });
-      return;
-    }
-
-    // Extract token from "Bearer <token>"
-    const parts = authHeader.split(' ');
-
-    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+    if (tokenResult.invalidAuthorizationHeader) {
       res.status(401).json({
         error: 'Invalid token format. Use "Bearer <token>".',
         code: 'unauthorized',
@@ -62,15 +143,32 @@ export const authenticate = async (
       return;
     }
 
-    const token = parts[1];
+    if (!tokenResult.token) {
+      res.status(401).json({
+        error: 'No authentication token provided.',
+        code: 'unauthorized',
+        requestId,
+      });
+      return;
+    }
 
     // Verify token
     try {
-      const decoded = await verifyAccessToken(token);
+      const decoded = await verifyAccessToken(tokenResult.token);
+
+      if (tokenResult.source === 'cookie' && !isCookieCsrfValid(req, decoded)) {
+        res.status(403).json({
+          error: 'Invalid or missing CSRF token',
+          code: 'invalid_csrf',
+          requestId,
+        });
+        return;
+      }
 
       // Attach user info to request
       req.user = {
         userId: decoded.userId,
+        sessionId: decoded.sessionId,
       };
 
       // Continue to next middleware/controller
@@ -83,6 +181,34 @@ export const authenticate = async (
           error: 'Token has expired. Please login again.',
           code: 'token_expired',
           requestId,
+        });
+        return;
+      }
+
+      if (errorMessage.includes('disabled or email verification required')) {
+        res.status(403).json({
+          error: 'User account is disabled or email verification is required',
+          code: 'auth_not_allowed',
+          requestId,
+        });
+        return;
+      }
+
+      if (errorMessage.includes('disabled')) {
+        res.status(403).json({
+          error: 'User account is disabled',
+          code: 'account_disabled',
+          requestId,
+        });
+        return;
+      }
+
+      if (errorMessage.includes('verification')) {
+        res.status(403).json({
+          error: 'Please verify your email before continuing.',
+          code: 'email_not_verified',
+          requestId,
+          requiresVerification: true,
         });
         return;
       }
@@ -122,28 +248,24 @@ export const optionalAuth = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const authHeader = req.headers.authorization;
+    const tokenResult = getAccessTokenFromRequest(req);
 
-    if (!authHeader) {
+    if (!tokenResult.token || tokenResult.invalidAuthorizationHeader) {
       // No token provided, continue without user
       next();
       return;
     }
 
-    const parts = authHeader.split(' ');
-
-    if (parts.length !== 2 || parts[0] !== 'Bearer') {
-      // Invalid format, continue without user
-      next();
-      return;
-    }
-
-    const token = parts[1];
-
     try {
-      const decoded = await verifyAccessToken(token);
+      const decoded = await verifyAccessToken(tokenResult.token);
+      if (tokenResult.source === 'cookie' && !isCookieCsrfValid(req, decoded)) {
+        next();
+        return;
+      }
+
       req.user = {
         userId: decoded.userId,
+        sessionId: decoded.sessionId,
       };
     } catch (error) {
       // Token invalid, continue without user

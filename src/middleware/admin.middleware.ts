@@ -1,6 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { prisma } from '../config/prisma';
 import { AuthenticatedRequest } from '../types/auth.types';
+import { isAuthSessionTwoFactorVerified } from '../services/auth-session.service';
 
 export const requireAdmin = async (
   req: AuthenticatedRequest,
@@ -16,11 +17,22 @@ export const requireAdmin = async (
 
     const user = await prisma.user.findUnique({
       where: { id: String(userId) },
-      select: { isAdmin: true, role: true },
+      select: { isAdmin: true, role: true, adminTwoFactorEnabled: true },
     });
 
     if (!user?.isAdmin) {
       res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    if (
+      user.adminTwoFactorEnabled &&
+      !(await isAuthSessionTwoFactorVerified(req.user?.sessionId, String(userId)))
+    ) {
+      res.status(403).json({
+        error: 'Two-factor authentication required',
+        code: 'two_factor_required',
+      });
       return;
     }
 

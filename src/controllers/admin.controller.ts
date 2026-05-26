@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { Request, Response } from 'express';
+import speakeasy from 'speakeasy';
+import QRCode from 'qrcode';
 import { prisma } from '../config/prisma';
 import { bunnyConfig } from '../config/bunny.config';
 import { notificationService } from '../services/notification.service';
@@ -12,11 +14,57 @@ import {
   previewReengagementForUser,
   runReengagementForUser,
 } from '../services/reengagement-notification.service';
-import { isRedisEnabled } from '../infrastructure/redis/client';
+import { isRedisConfigured, isRedisEnabled } from '../infrastructure/redis/client';
 import { getIO } from '../sockets';
+import { decryptToken, encryptToken } from '../utils/encryption.util';
+import {
+  isAuthSessionTwoFactorVerified,
+  markAuthSessionTwoFactorVerified,
+  revokeAllAuthSessions,
+} from '../services/auth-session.service';
+import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.service';
 
 interface AuthRequest extends Request {
-  user?: { userId: string };
+  user?: { userId: string; sessionId?: string };
+}
+
+function encryptAdminTwoFactorSecret(secret: string): string {
+  return `enc:${encryptToken(secret)}`;
+}
+
+function decryptAdminTwoFactorSecret(secret: string | null | undefined): string | null {
+  if (!secret) {
+    return null;
+  }
+
+  if (secret.startsWith('enc:')) {
+    return decryptToken(secret.slice(4));
+  }
+
+  return secret;
+}
+
+function verifyTotpToken(secret: string, token: string): boolean {
+  return speakeasy.totp.verify({
+    secret,
+    encoding: 'base32',
+    token,
+    window: 1,
+  });
+}
+
+async function getAdminTwoFactorUser(userId: string) {
+  return prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      isAdmin: true,
+      adminTwoFactorEnabled: true,
+      adminTwoFactorSecret: true,
+    },
+  });
 }
 
 const parseStringArray = (value: any): string[] => {
@@ -264,6 +312,10 @@ export const verifyAdmin = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
+    const twoFactorVerified = user.adminTwoFactorEnabled
+      ? await isAuthSessionTwoFactorVerified(req.user.sessionId, String(req.user.userId))
+      : true;
+
     res.json({
       isAdmin: true,
       user: {
@@ -274,7 +326,7 @@ export const verifyAdmin = async (req: AuthRequest, res: Response): Promise<void
         role: user.role,
       },
       twoFactorEnabled: user.adminTwoFactorEnabled,
-      requiresTwoFactor: !user.adminTwoFactorEnabled,
+      requiresTwoFactor: user.adminTwoFactorEnabled && !twoFactorVerified,
     });
   } catch (error) {
     console.error('verifyAdmin error:', error);
@@ -283,20 +335,48 @@ export const verifyAdmin = async (req: AuthRequest, res: Response): Promise<void
 };
 
 // ============================================
-// 2FA (stub — returns success for now)
+// 2FA
 // ============================================
 
 export const setup2FA = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!req.user?.userId) {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    if (!userId) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
 
+    const user = await getAdminTwoFactorUser(userId);
+    if (!user?.isAdmin) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    const secret = speakeasy.generateSecret({
+      issuer: 'Vormex',
+      name: `Vormex Admin (${user.email})`,
+      length: 32,
+    });
+
+    if (!secret.base32 || !secret.otpauth_url) {
+      res.status(500).json({ error: 'Failed to generate 2FA secret' });
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        adminTwoFactorEnabled: false,
+        adminTwoFactorSecret: encryptAdminTwoFactorSecret(secret.base32),
+      },
+    });
+
+    const qrCode = await QRCode.toDataURL(secret.otpauth_url);
+
     res.json({
-      secret: 'SETUP_NOT_IMPLEMENTED',
-      qrCode: '',
-      message: '2FA setup placeholder',
+      secret: secret.base32,
+      qrCode,
+      message: 'Scan the QR code and verify a 6-digit code to enable 2FA.',
     });
   } catch (error) {
     console.error('setup2FA error:', error);
@@ -306,10 +386,38 @@ export const setup2FA = async (req: AuthRequest, res: Response): Promise<void> =
 
 export const verify2FA = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!req.user?.userId) {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const token = String(req.body?.token || '').trim();
+
+    if (!userId) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+
+    if (!/^\d{6}$/.test(token)) {
+      res.status(400).json({ error: 'A valid 6-digit code is required' });
+      return;
+    }
+
+    const user = await getAdminTwoFactorUser(userId);
+    if (!user?.isAdmin) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    const secret = decryptAdminTwoFactorSecret(user.adminTwoFactorSecret);
+    if (!secret || !verifyTotpToken(secret, token)) {
+      res.status(401).json({ error: 'Invalid two-factor code' });
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        adminTwoFactorEnabled: true,
+      },
+    });
+    await markAuthSessionTwoFactorVerified(req.user?.sessionId, userId);
 
     res.json({ success: true, message: '2FA verified' });
   } catch (error) {
@@ -320,10 +428,37 @@ export const verify2FA = async (req: AuthRequest, res: Response): Promise<void> 
 
 export const validate2FA = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!req.user?.userId) {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const token = String(req.body?.token || '').trim();
+
+    if (!userId) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+
+    if (!/^\d{6}$/.test(token)) {
+      res.status(400).json({ error: 'A valid 6-digit code is required' });
+      return;
+    }
+
+    const user = await getAdminTwoFactorUser(userId);
+    if (!user?.isAdmin) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    if (!user.adminTwoFactorEnabled) {
+      res.json({ success: true, verified: true });
+      return;
+    }
+
+    const secret = decryptAdminTwoFactorSecret(user.adminTwoFactorSecret);
+    if (!secret || !verifyTotpToken(secret, token)) {
+      res.status(401).json({ error: 'Invalid two-factor code' });
+      return;
+    }
+
+    await markAuthSessionTwoFactorVerified(req.user?.sessionId, userId);
 
     res.json({ success: true, verified: true });
   } catch (error) {
@@ -618,7 +753,8 @@ export const getReengagementNotificationStatus = async (req: AuthRequest, res: R
 
     res.json({
       enabled: isReengagementEnabled(),
-      redisConfigured: isRedisEnabled(),
+      redisConfigured: isRedisConfigured(),
+      redisConnected: isRedisEnabled(),
       fcmConfigured,
       now: now.toISOString(),
       currentIstHour: window.currentIstHour,
@@ -845,6 +981,9 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
       where: { id },
       data,
     });
+    if (Object.prototype.hasOwnProperty.call(data, 'isVerified')) {
+      await invalidateAuthUserStatus(id);
+    }
 
     res.json({ user, message: 'User updated successfully' });
   } catch (error) {
@@ -871,6 +1010,8 @@ export const banUser = async (req: AuthRequest, res: Response): Promise<void> =>
       where: { id },
       data: { isBanned: true },
     });
+    await invalidateAuthUserStatus(id);
+    await revokeAllAuthSessions(id);
 
     res.json({ message: 'User banned successfully' });
   } catch (error) {
@@ -886,10 +1027,12 @@ export const unbanUser = async (req: AuthRequest, res: Response): Promise<void> 
       return;
     }
 
+    const { id } = req.params;
     await prisma.user.update({
-      where: { id: req.params.id },
+      where: { id },
       data: { isBanned: false },
     });
+    await invalidateAuthUserStatus(id);
 
     res.json({ message: 'User unbanned successfully' });
   } catch (error) {
@@ -905,10 +1048,12 @@ export const verifyUser = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    const { id } = req.params;
     await prisma.user.update({
-      where: { id: req.params.id },
+      where: { id },
       data: { isVerified: true },
     });
+    await invalidateAuthUserStatus(id);
 
     res.json({ message: 'User verified successfully' });
   } catch (error) {
@@ -931,7 +1076,9 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    await revokeAllAuthSessions(id);
     await prisma.user.delete({ where: { id } });
+    await invalidateAuthUserStatus(id);
 
     res.json({ message: 'User deleted successfully' });
   } catch (error) {
@@ -2005,12 +2152,14 @@ export const takeReportAction = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
+    let bannedUserId: string | null = null;
     await prisma.$transaction(async (tx) => {
       if (action === 'USER_BANNED' && report.reportedUserId && report.reportedUserId !== adminId) {
         await tx.user.update({
           where: { id: report.reportedUserId },
           data: { isBanned: true },
         });
+        bannedUserId = report.reportedUserId;
       }
       await tx.moderation_reports.update({
         where: { id },
@@ -2024,6 +2173,7 @@ export const takeReportAction = async (req: AuthRequest, res: Response): Promise
         },
       });
     });
+    await invalidateAuthUserStatus(bannedUserId);
 
     const updated = await prisma.moderation_reports.findUnique({
       where: { id },

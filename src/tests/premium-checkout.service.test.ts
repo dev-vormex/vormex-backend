@@ -10,7 +10,7 @@ const baseConfig: PremiumPlanConfig = {
   amountMinor: 19900,
   currency: 'INR',
   plan: 'premium',
-  billingCycle: 'one_time',
+  billingCycle: 'monthly',
 };
 
 const baseOrder = {
@@ -23,7 +23,7 @@ const baseOrder = {
   notes: {
     userId: 'user_123',
     plan: 'premium',
-    billingCycle: 'one_time',
+    billingCycle: 'monthly',
   },
 };
 

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { canViewGroup, canViewPost } from '../utils/access-control.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -43,8 +44,11 @@ export const reportPost = async (req: AuthRequest, res: Response): Promise<void>
     }
     const { reason, description } = req.body;
 
-    const post = await prisma.post.findUnique({ where: { id: postId } });
-    if (!post) {
+    const post = await prisma.post.findUnique({
+      where: { id: postId },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
+    });
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -85,8 +89,13 @@ export const reportComment = async (req: AuthRequest, res: Response): Promise<vo
     }
     const { reason, description } = req.body;
 
-    const comment = await prisma.post_comments.findUnique({ where: { id: commentId } });
-    if (!comment) {
+    const comment = await prisma.post_comments.findUnique({
+      where: { id: commentId },
+      include: {
+        posts: { select: { authorId: true, visibility: true, isActive: true } },
+      },
+    });
+    if (!comment || !(await canViewPost(comment.posts, userId))) {
       res.status(404).json({ error: 'Comment not found' });
       return;
     }
@@ -140,10 +149,20 @@ export const reportChat = async (req: AuthRequest, res: Response): Promise<void>
     const reportedUserId =
       conv.participant1Id === userId ? conv.participant2Id : conv.participant1Id;
 
-    const extra =
-      Array.isArray(messageIds) && messageIds.length > 0
-        ? { messageIds: messageIds.map(String).slice(0, 50) }
-        : undefined;
+    const reportMessageIds = Array.isArray(messageIds)
+      ? messageIds.map(String).filter(Boolean).slice(0, 50)
+      : [];
+    if (reportMessageIds.length > 0) {
+      const matchingMessages = await prisma.messages.count({
+        where: { id: { in: reportMessageIds }, conversationId },
+      });
+      if (matchingMessages !== new Set(reportMessageIds).size) {
+        res.status(400).json({ error: 'One or more messages do not belong to this conversation' });
+        return;
+      }
+    }
+
+    const extra = reportMessageIds.length > 0 ? { messageIds: reportMessageIds } : undefined;
 
     const row = await prisma.moderation_reports.create({
       data: {
@@ -230,8 +249,11 @@ export const reportGroup = async (req: AuthRequest, res: Response): Promise<void
     }
     const { reason, description } = req.body;
 
-    const group = await prisma.groups.findUnique({ where: { id: groupId } });
-    if (!group) {
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, isPrivate: true, creatorId: true },
+    });
+    if (!group || !(await canViewGroup(group, userId))) {
       res.status(404).json({ error: 'Group not found' });
       return;
     }

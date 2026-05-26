@@ -76,8 +76,11 @@ export interface UserResponse {
  */
 export interface AuthSuccessResponse {
   user: UserResponse;
-  token: string;
+  token?: string;
   refreshToken?: string;
+  csrfToken?: string;
+  message?: string;
+  requiresVerification?: boolean;
   session?: {
     id: string;
     expiresAt: string;
@@ -103,6 +106,7 @@ export interface ErrorResponse {
 export interface AuthenticatedRequest extends Request {
   user?: {
     userId: string | number; // Supports both String (UUID) and Number (legacy) IDs
+    sessionId?: string;
   };
 }
 
@@ -115,9 +119,9 @@ export interface ForgotPasswordRequestBody {
 
 /**
  * Reset Password Request Body Interface
- * Note: token comes from query params, newPassword from body
  */
 export interface ResetPasswordRequestBody {
+  token?: string;
   newPassword: string;
 }
 

@@ -13,6 +13,33 @@ export class BunnyStorageService {
     this.cdnUrl = bunnyConfig.cdn.pullZoneUrl;
   }
 
+  private assertSafeStoragePath(value: string): string {
+    const normalized = value.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (
+      !normalized
+      || normalized.includes('..')
+      || /[\u0000-\u001f\u007f]/.test(normalized)
+      || !/^[a-zA-Z0-9/_.,@ -]+$/.test(normalized)
+    ) {
+      throw new Error('Invalid storage path');
+    }
+    return normalized;
+  }
+
+  private assertSafeFileName(value: string): string {
+    const fileName = value.split(/[\\/]/).pop() || '';
+    if (
+      !fileName
+      || fileName.length > 180
+      || fileName.includes('..')
+      || /[\u0000-\u001f\u007f]/.test(fileName)
+      || !/^[a-zA-Z0-9._@ -]+$/.test(fileName)
+    ) {
+      throw new Error('Invalid file name');
+    }
+    return fileName;
+  }
+
   getStoragePath(input: string): string {
     const value = input.trim();
     const cdnPrefix = this.cdnUrl.replace(/\/$/, '') + '/';
@@ -25,7 +52,7 @@ export class BunnyStorageService {
       throw new Error('File URL is outside the configured CDN');
     }
 
-    return value.replace(/^\/+/, '');
+    return this.assertSafeStoragePath(value);
   }
 
   isUserOwnedPath(input: string, userId: string): boolean {
@@ -56,7 +83,9 @@ export class BunnyStorageService {
     contentType = 'application/octet-stream'
   ): Promise<string> {
     try {
-      const fullPath = `${path}/${filename}`;
+      const safePath = this.assertSafeStoragePath(path);
+      const safeFileName = this.assertSafeFileName(filename);
+      const fullPath = `${safePath}/${safeFileName}`;
       const uploadUrl = `${this.baseUrl}/${fullPath}`;
 
       // Upload to Bunny Storage via PUT request

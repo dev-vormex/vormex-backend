@@ -13,12 +13,20 @@ import {
   buildPremiumPlanConfig,
   cancelPremiumSubscription,
   getPremiumAccessSnapshot,
-  getPremiumBillingCycle,
+  getPremiumDurationDaysForBillingCycle,
   getPremiumPlan,
   getPremiumPeriodEnd,
+  isDeveloperPremiumOverrideAvailableForUser,
   logPremiumCheckoutEvent,
+  normalizePremiumBillingCycle,
   serializePremiumSubscription,
+  setDeveloperPremiumOverride,
 } from '../services/premium-access.service';
+import {
+  GooglePlayPremiumVerificationError,
+  isGooglePlayPremiumConfigured,
+  verifyGooglePlayPremiumPurchase,
+} from '../services/google-play-premium.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -26,6 +34,10 @@ interface AuthRequest extends Request {
 
 function isRazorpayConfigured() {
   return Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+}
+
+function isPremiumCheckoutConfigured() {
+  return isRazorpayConfigured() || isGooglePlayPremiumConfigured();
 }
 
 function getRazorpayAuth() {
@@ -65,10 +77,65 @@ export const getPremiumSubscription = async (req: AuthRequest, res: Response): P
     }
 
     const snapshot = await getPremiumAccessSnapshot(userId);
-    res.json(serializePremiumSubscription(snapshot, isRazorpayConfigured()));
+    res.json(serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()));
   } catch (error) {
     console.error('Failed to fetch premium subscription', error);
     res.status(500).json({ error: 'Failed to fetch premium subscription' });
+  }
+};
+
+export const setDeveloperPremiumOverrideForMe = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const currentSnapshot = await getPremiumAccessSnapshot(userId);
+    if (!isDeveloperPremiumOverrideAvailableForUser(currentSnapshot.user)) {
+      res.status(403).json({
+        error: 'Developer premium override is not enabled on this server.',
+        code: 'developer_premium_override_disabled',
+      });
+      return;
+    }
+
+    if (typeof req.body?.enabled !== 'boolean') {
+      res.status(400).json({
+        error: 'enabled must be a boolean.',
+        code: 'developer_premium_override_invalid_payload',
+      });
+      return;
+    }
+
+    await setDeveloperPremiumOverride(userId, req.body.enabled);
+    await logPremiumCheckoutEvent({
+      userId,
+      eventType: 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED',
+      outcome: 'success',
+      message: req.body.enabled
+        ? 'Developer premium override enabled.'
+        : 'Developer premium override disabled.',
+      metadata: {
+        enabled: req.body.enabled,
+      },
+    });
+
+    const snapshot = await getPremiumAccessSnapshot(userId);
+    res.json({
+      message: snapshot.isPremium
+        ? 'Premium mode is on for this account.'
+        : 'Premium mode is off for this account.',
+      subscription: serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()),
+    });
+  } catch (error) {
+    console.error('Failed to update developer premium override', error);
+    res.status(500).json({ error: 'Failed to update premium mode' });
   }
 };
 
@@ -127,12 +194,14 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       });
       res.status(409).json({
         error: 'Premium is already active for this account.',
-        subscription: serializePremiumSubscription(snapshot, isRazorpayConfigured()),
+        subscription: serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()),
       });
       return;
     }
 
-    const config = buildPremiumPlanConfig(snapshot);
+    const requestedBillingCycle = normalizePremiumBillingCycle(req.body?.billingCycle);
+    const config = buildPremiumPlanConfig(snapshot, requestedBillingCycle);
+    const durationDays = getPremiumDurationDaysForBillingCycle(config.billingCycle);
     const receipt = `premium_${userId.slice(0, 8)}_${Date.now().toString(36)}`.slice(0, 40);
     const notes = {
       userId,
@@ -140,6 +209,7 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       billingCycle: config.billingCycle,
       amountMinor: String(config.amountMinor),
       currency: config.currency,
+      durationDays: String(durationDays),
     };
 
     const orderResponse = await axios.post<RazorpayOrderEntity>(
@@ -165,6 +235,7 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       metadata: {
         orderId: orderResponse.data.id,
         receipt,
+        billingCycle: config.billingCycle,
       },
     });
 
@@ -177,6 +248,7 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       title: config.title,
       description: config.description,
       billingCycle: config.billingCycle,
+      premiumDurationDays: durationDays,
       prefill: {
         name: user.name,
         email: user.email,
@@ -269,7 +341,7 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
           : snapshot.premiumAmountMinor,
       currency: String(order.notes?.currency || order.currency || snapshot.premiumCurrency).toUpperCase(),
       plan: String(order.notes?.plan || getPremiumPlan()),
-      billingCycle: String(order.notes?.billingCycle || getPremiumBillingCycle()),
+      billingCycle: normalizePremiumBillingCycle(String(order.notes?.billingCycle || 'monthly')),
     };
 
     const validation = validatePremiumCheckoutPayment({
@@ -298,7 +370,8 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
     }
 
     const now = new Date();
-    const currentPeriodEnd = getPremiumPeriodEnd(now);
+    const durationDays = Number(order.notes?.durationDays) || getPremiumDurationDaysForBillingCycle(config.billingCycle);
+    const currentPeriodEnd = getPremiumPeriodEnd(now, durationDays);
 
     const subscription = await prisma.subscriptions.upsert({
       where: { userId },
@@ -310,6 +383,7 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
         amount: config.amountMinor,
         currency: config.currency,
         billingCycle: config.billingCycle,
+        provider: 'razorpay',
         currentPeriodStart: now,
         currentPeriodEnd,
         cancelledAt: null,
@@ -317,6 +391,13 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
         razorpaySubscriptionId: null,
         razorpayCustomerId: null,
         razorpayPlanId: null,
+        googlePlayPurchaseToken: null,
+        googlePlayOrderId: null,
+        googlePlayProductId: null,
+        googlePlayBasePlanId: null,
+        googlePlaySubscriptionState: null,
+        googlePlayAcknowledgementState: null,
+        lastProviderSyncAt: now,
       },
       update: {
         plan: config.plan,
@@ -324,6 +405,7 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
         amount: config.amountMinor,
         currency: config.currency,
         billingCycle: config.billingCycle,
+        provider: 'razorpay',
         currentPeriodStart: now,
         currentPeriodEnd,
         cancelledAt: null,
@@ -331,6 +413,13 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
         razorpaySubscriptionId: null,
         razorpayCustomerId: null,
         razorpayPlanId: null,
+        googlePlayPurchaseToken: null,
+        googlePlayOrderId: null,
+        googlePlayProductId: null,
+        googlePlayBasePlanId: null,
+        googlePlaySubscriptionState: null,
+        googlePlayAcknowledgementState: null,
+        lastProviderSyncAt: now,
       },
     });
 
@@ -360,7 +449,7 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
 
     res.json({
       message: 'Premium unlocked successfully.',
-      subscription: serializePremiumSubscription(updatedSnapshot, isRazorpayConfigured()),
+      subscription: serializePremiumSubscription(updatedSnapshot, isPremiumCheckoutConfigured()),
     });
   } catch (error) {
     console.error('Failed to verify premium checkout', error);
@@ -373,6 +462,78 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       });
     }
     res.status(500).json({ error: 'Failed to verify premium checkout' });
+  }
+};
+
+export const verifyGooglePlayPremiumCheckout = async (
+  req: AuthRequest,
+  res: Response
+): Promise<void> => {
+  const userId = req.user?.userId;
+
+  try {
+    const body = req.body as {
+      productId?: string;
+      purchaseToken?: string;
+    };
+
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const productId = body.productId?.trim();
+    const purchaseToken = body.purchaseToken?.trim();
+
+    if (!productId || !purchaseToken) {
+      await logPremiumCheckoutEvent({
+        userId,
+        eventType: 'CHECKOUT_FAILED',
+        outcome: 'failure',
+        message: 'Missing Google Play purchase verification details.',
+        metadata: {
+          provider: 'google_play',
+        },
+      });
+      res.status(400).json({
+        error: 'Missing Google Play purchase verification details.',
+        code: 'google_play_details_missing',
+      });
+      return;
+    }
+
+    const result = await verifyGooglePlayPremiumPurchase({
+      userId,
+      productId,
+      purchaseToken,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to verify Google Play premium checkout', error);
+    if (userId) {
+      await logPremiumCheckoutEvent({
+        userId,
+        eventType: 'CHECKOUT_FAILED',
+        outcome: 'failure',
+        message: error instanceof Error ? error.message : 'Failed to verify Google Play purchase',
+        metadata:
+          error instanceof GooglePlayPremiumVerificationError
+            ? { provider: 'google_play', code: error.code }
+            : { provider: 'google_play' },
+      });
+    }
+    const statusCode =
+      error instanceof GooglePlayPremiumVerificationError ? error.statusCode : 500;
+    res.status(statusCode).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : 'Failed to verify Google Play purchase',
+      code:
+        error instanceof GooglePlayPremiumVerificationError
+          ? error.code
+          : 'google_play_verification_failed',
+    });
   }
 };
 
@@ -392,7 +553,7 @@ export const cancelMyPremiumSubscription = async (
     if (!snapshot.subscription || !snapshot.canCancelPremium) {
       res.status(409).json({
         error: 'There is no active premium plan to cancel on this account.',
-        subscription: serializePremiumSubscription(snapshot, isRazorpayConfigured()),
+        subscription: serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()),
       });
       return;
     }
@@ -410,7 +571,7 @@ export const cancelMyPremiumSubscription = async (
     const updatedSnapshot = await getPremiumAccessSnapshot(userId);
     res.json({
       message: 'Premium cancelled. You can buy it again anytime.',
-      subscription: serializePremiumSubscription(updatedSnapshot, isRazorpayConfigured()),
+      subscription: serializePremiumSubscription(updatedSnapshot, isPremiumCheckoutConfigured()),
     });
   } catch (error) {
     console.error('Failed to cancel premium subscription', error);

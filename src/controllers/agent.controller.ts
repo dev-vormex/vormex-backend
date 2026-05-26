@@ -7,6 +7,12 @@ import { pendingActionsService } from '../agent/pending-actions.service';
 import { agentGoalsService } from '../agent/goals.service';
 import { emitAgentEvent, serializeAgentAction, serializeGoal, serializePendingAction } from '../agent/socket-events';
 import { AIServiceError } from '../services/ai.service';
+import { getPremiumAccessSnapshot } from '../services/premium-access.service';
+import {
+  applyAutonomyPolicyToSession,
+  resolveAgentAutonomyPolicy,
+} from '../agent/action-policy.service';
+import type { AgentAutonomyMode } from '../agent/types';
 
 function parseBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value;
@@ -33,6 +39,20 @@ function parseObject(value: unknown): Record<string, unknown> {
     }
   }
   return {};
+}
+
+async function resolveRequestAutonomyPolicy(
+  userId: string,
+  body: any,
+  fallbackMode: AgentAutonomyMode = 'approval'
+) {
+  const snapshot = await getPremiumAccessSnapshot(userId);
+  return resolveAgentAutonomyPolicy({
+    requestedAutonomyMode: body?.autonomyMode,
+    allowAutonomousActions: body?.allowAutonomousActions,
+    fallbackMode,
+    isPremium: snapshot.isPremium,
+  });
 }
 
 function ensureUserId(req: AuthenticatedRequest, res: Response): string | null {
@@ -76,18 +96,25 @@ export const createOrResumeSession = async (
   if (!userId) return;
 
   try {
+    const autonomyPolicy = await resolveRequestAutonomyPolicy(userId, req.body);
     const session = await agentSessionService.createOrResumeSession(userId, {
       sessionId: req.body?.sessionId,
       mode: req.body?.mode,
       surface: req.body?.surface,
-      allowAutonomousActions: parseBoolean(req.body?.allowAutonomousActions, true),
+      allowAutonomousActions: autonomyPolicy.allowAutonomousActions,
+      autonomyMode: autonomyPolicy.effectiveAutonomyMode,
       metadata: parseObject(req.body?.metadata),
     });
+    const sessionState = applyAutonomyPolicyToSession(session, autonomyPolicy);
 
     res.status(200).json({
-      sessionId: session.sessionId,
-      mode: session.mode,
-      sessionState: session,
+      sessionId: sessionState.sessionId,
+      mode: sessionState.mode,
+      requestedAutonomyMode: autonomyPolicy.requestedAutonomyMode,
+      effectiveAutonomyMode: autonomyPolicy.effectiveAutonomyMode,
+      powerModeEligible: autonomyPolicy.powerModeEligible,
+      isPremium: autonomyPolicy.isPremium,
+      sessionState,
     });
   } catch (error) {
     console.error('createOrResumeSession error:', error);
@@ -122,7 +149,11 @@ export const runAgentTurn = async (
         inputText,
         surface: req.body?.surface,
         surfaceContext: parseObject(req.body?.surfaceContext),
-        allowAutonomousActions: parseBoolean(req.body?.allowAutonomousActions, true),
+        allowAutonomousActions:
+          typeof req.body?.allowAutonomousActions === 'boolean'
+            ? parseBoolean(req.body?.allowAutonomousActions, false)
+            : undefined,
+        autonomyMode: req.body?.autonomyMode,
       },
       getRequestId(req)
     );
@@ -172,7 +203,11 @@ export const runAgentVoiceTurn = async (
         inputText: '',
         surface: req.body?.surface,
         surfaceContext: parseObject(req.body?.surfaceContext),
-        allowAutonomousActions: parseBoolean(req.body?.allowAutonomousActions, true),
+        allowAutonomousActions:
+          typeof req.body?.allowAutonomousActions === 'boolean'
+            ? parseBoolean(req.body?.allowAutonomousActions, false)
+            : undefined,
+        autonomyMode: req.body?.autonomyMode,
       },
     });
 

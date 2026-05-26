@@ -2,6 +2,12 @@ import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import {
+  chatUploadRule,
+  imageUploadRule,
+  validateUploadedFiles,
+} from '../middleware/upload-security.middleware';
 import {
   uploadMiddleware,
   uploadProfilePicture,
@@ -74,33 +80,45 @@ const handleChatUpload = (req: Request, res: Response, next: NextFunction): void
   });
 };
 
+const validateImageUpload = validateUploadedFiles({
+  defaultRule: imageUploadRule(10 * 1024 * 1024),
+  maxFiles: 1,
+});
+const validateChatUpload = validateUploadedFiles({
+  fields: {
+    file: chatUploadRule(CHAT_VIDEO_MAX_BYTES),
+  },
+  maxFiles: 1,
+  requireKnownField: true,
+});
+
 // Upload profile picture (requires auth, expects pre-cropped 1:1 image)
-router.post('/upload/avatar', authenticate, mediaWriteLimit, uploadMiddleware, uploadProfilePicture);
+router.post('/upload/avatar', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, uploadProfilePicture);
 
 // Delete profile picture (requires auth)
 router.delete('/upload/avatar', authenticate, deleteProfilePicture);
 
 // Upload banner image (requires auth, expects pre-cropped 3:1 image)
-router.post('/upload/banner', authenticate, mediaWriteLimit, uploadMiddleware, uploadBanner);
+router.post('/upload/banner', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, uploadBanner);
 
 // Delete banner image (requires auth)
 router.delete('/upload/banner', authenticate, deleteBanner);
 
 // Upload certificate image
-router.post('/upload/certificate', authenticate, mediaWriteLimit, uploadMiddleware, uploadCertificate);
+router.post('/upload/certificate', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, uploadCertificate);
 
 // Upload project image
-router.post('/upload/project', authenticate, mediaWriteLimit, uploadMiddleware, uploadProject);
+router.post('/upload/project', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, uploadProject);
 
 // Upload logo image
-router.post('/upload/logo', authenticate, mediaWriteLimit, uploadMiddleware, uploadLogo);
+router.post('/upload/logo', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, uploadLogo);
 
 // Group image uploads (alternative path - groupId in form body)
-router.post('/upload/group-icon', authenticate, mediaWriteLimit, uploadMiddleware, groupIdFromBody, uploadGroupIcon);
-router.post('/upload/group-cover', authenticate, mediaWriteLimit, uploadMiddleware, groupIdFromBody, uploadGroupCover);
+router.post('/upload/group-icon', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, validateMultipartFields, groupIdFromBody, uploadGroupIcon);
+router.post('/upload/group-cover', authenticate, mediaWriteLimit, uploadMiddleware, validateImageUpload, validateMultipartFields, groupIdFromBody, uploadGroupCover);
 
 // Chat media upload compatibility path. Primary chat route is /api/chat/upload.
-router.post('/upload/chat', authenticate, mediaWriteLimit, handleChatUpload, uploadChatMedia);
+router.post('/upload/chat', authenticate, mediaWriteLimit, handleChatUpload, validateChatUpload, validateMultipartFields, uploadChatMedia);
 
 // Generic file delete
 router.delete('/upload', authenticate, deleteFile);

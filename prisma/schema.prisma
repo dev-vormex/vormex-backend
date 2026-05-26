@@ -103,16 +103,27 @@ model User {
   follows_follows_followerIdTousers                        follows[]              @relation("follows_followerIdTousers")
   follows_follows_followingIdTousers                       follows[]              @relation("follows_followingIdTousers")
   game_stats                                               game_stats?
+  arcade_rooms_host                                        arcade_rooms[]         @relation("arcade_rooms_host")
+  arcade_rooms_guest                                       arcade_rooms[]         @relation("arcade_rooms_guest")
+  arcade_rooms_winner                                      arcade_rooms[]         @relation("arcade_rooms_winner")
+  arcade_results_user                                      arcade_results[]       @relation("arcade_results_user")
+  arcade_results_opponent                                  arcade_results[]       @relation("arcade_results_opponent")
   contactSync                                              ContactSync?
   matchedContactEntries                                    ContactSyncEntry[]     @relation("MatchedContactEntries")
   githubStats                                              GitHubStats?
   group_messages                                           group_messages[]
+  group_invites_received                                   group_invites[]       @relation("group_invites_invitedUser")
+  group_invites_sent                                       group_invites[]       @relation("group_invites_invitedBy")
+  group_join_requests                                      group_join_requests[] @relation("group_join_requests_requester")
+  group_join_requests_reviewed                             group_join_requests[] @relation("group_join_requests_reviewedBy")
   groups                                                   groups[]
   mentorship_matches_mentorship_matches_menteeIdTousers    mentorship_matches[]   @relation("mentorship_matches_menteeIdTousers")
   mentorship_matches_mentorship_matches_mentorIdTousers    mentorship_matches[]   @relation("mentorship_matches_mentorIdTousers")
   notifications_notifications_actorIdTousers               notifications[]        @relation("notifications_actorIdTousers")
   notifications_notifications_userIdTousers                notifications[]        @relation("notifications_userIdTousers")
   onboarding_profiles                                      onboarding_profiles?
+  postCollaborations                                       PostCollaborator[]     @relation("post_collaborators_user")
+  postCollabInvitesSent                                    PostCollaborator[]     @relation("post_collaborators_invitedBy")
   post_comments                                            post_comments[]
   postLikes                                                PostLike[]
   postPollVotes                                            PostPollVote[]
@@ -131,6 +142,7 @@ model User {
   saved_posts                                              saved_posts[]
   social_activity_feed                                     social_activity_feed[]
   stories                                                  stories[]
+  story_reactions                                          story_reactions[]
   subscriptions                                            subscriptions?
   user_activities                                          user_activities?
   dailyActivity                                            UserDailyActivity[]
@@ -145,6 +157,17 @@ model User {
   @@index([isAdmin])
   @@index([isBanned])
   @@index([onboardingCompleted])
+  @@index([resetToken])
+  @@index([verificationToken])
+  @@index([lastActiveAt, id])
+  @@index([isBanned, lastActiveAt, id])
+  @@index([college, lastActiveAt])
+  @@index([branch, lastActiveAt])
+  @@index([graduationYear, lastActiveAt])
+  @@index([isOpenToOpportunities, lastActiveAt])
+  @@index([shareLocationPublic, latitude, longitude])
+  @@index([shareLocationPublic, locationPermission, latitude, longitude])
+  @@index([currentCity, lastActiveAt])
   @@map("users")
 }
 
@@ -317,6 +340,24 @@ model SkillEndorsement {
   @@map("skill_endorsements")
 }
 
+model SkillVerificationLink {
+  id         String    @id @default(uuid())
+  userId     String
+  provider   String
+  username   String
+  profileUrl String?
+  status     String    @default("verified")
+  metadata   Json?
+  verifiedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([userId, provider])
+  @@index([userId, status])
+  @@index([provider, username])
+  @@map("skill_verification_links")
+}
+
 model SkillSwapRequest {
   id                   String    @id @default(uuid())
   requesterId          String
@@ -479,6 +520,7 @@ model Post {
   updatedAt     DateTime  @updatedAt
   notifications notifications[]
   post_comments post_comments[]
+  collaborators PostCollaborator[]
   likes         PostLike[]
   pollVotes     PostPollVote[]
   author        User            @relation(fields: [authorId], references: [id], onDelete: Cascade)
@@ -490,6 +532,26 @@ model Post {
   @@index([isActive, createdAt])
   @@index([authorId, isActive, createdAt])
   @@map("posts")
+}
+
+model PostCollaborator {
+  id          String    @id @default(uuid())
+  postId      String
+  userId      String
+  invitedById String
+  status      String    @default("pending")
+  respondedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  post        Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user        User      @relation("post_collaborators_user", fields: [userId], references: [id], onDelete: Cascade)
+  invitedBy   User      @relation("post_collaborators_invitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@unique([postId, userId])
+  @@index([postId, status])
+  @@index([userId, status])
+  @@index([invitedById])
+  @@map("post_collaborators")
 }
 
 model PostLike {
@@ -696,8 +758,114 @@ model campus_events {
   event_attendees event_attendees[]
 
   @@index([campus])
+  @@index([campus, startsAt])
+  @@index([organizerId])
   @@index([circleId])
   @@index([startsAt])
+}
+
+model hackathons {
+  id                   String                       @id @default(uuid())
+  slug                 String                       @unique
+  title                String
+  organizer            String?
+  source               String                       @default("college_fest")
+  sourceUrl            String?
+  sourceId             String?
+  college              String?
+  description          String
+  theme                String?
+  location             String?
+  isOnline             Boolean                      @default(false)
+  startsAt             DateTime
+  endsAt               DateTime
+  registrationDeadline DateTime?
+  teamMin              Int                          @default(1)
+  teamMax              Int                          @default(4)
+  prizeSummary         String?
+  tags                 String[]
+  skills               String[]
+  bannerUrl            String?
+  status               String                       @default("active")
+  isActive             Boolean                      @default(true)
+  createdById          String?
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+  teams                hackathon_teams[]
+  saves                hackathon_saves[]
+
+  @@index([status, startsAt])
+  @@index([source, startsAt])
+  @@unique([source, sourceId])
+  @@index([college, startsAt])
+  @@index([isActive, startsAt])
+  @@index([createdAt])
+}
+
+model hackathon_teams {
+  id              String                         @id @default(uuid())
+  hackathonId     String
+  ownerId         String
+  groupId         String?
+  name            String
+  pitch           String?
+  lookingForRoles String[]
+  requiredSkills  String[]
+  maxMembers      Int                            @default(4)
+  status          String                         @default("open")
+  createdAt       DateTime                       @default(now())
+  updatedAt       DateTime                       @updatedAt
+  hackathon       hackathons                     @relation(fields: [hackathonId], references: [id], onDelete: Cascade)
+  members         hackathon_team_members[]
+  applications    hackathon_team_applications[]
+
+  @@index([hackathonId, status])
+  @@index([ownerId, createdAt])
+  @@index([groupId])
+}
+
+model hackathon_team_members {
+  id       String          @id @default(uuid())
+  teamId   String
+  userId   String
+  role     String          @default("member")
+  status   String          @default("accepted")
+  joinedAt DateTime        @default(now())
+  team     hackathon_teams @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId, status])
+  @@index([userId, joinedAt])
+}
+
+model hackathon_team_applications {
+  id          String          @id @default(uuid())
+  teamId      String
+  applicantId String
+  role        String?
+  message     String?
+  skills      String[]
+  status      String          @default("pending")
+  respondedAt DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  team        hackathon_teams @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, applicantId])
+  @@index([applicantId, status, createdAt])
+  @@index([teamId, status, createdAt])
+}
+
+model hackathon_saves {
+  id          String     @id @default(uuid())
+  hackathonId String
+  userId      String
+  createdAt   DateTime   @default(now())
+  hackathon   hackathons @relation(fields: [hackathonId], references: [id], onDelete: Cascade)
+
+  @@unique([hackathonId, userId])
+  @@index([userId, createdAt])
+  @@index([hackathonId])
 }
 
 model circle_challenges {
@@ -787,6 +955,53 @@ model circles {
   @@index([type])
 }
 
+model college_communities {
+  id               String                      @id @default(uuid())
+  college          String
+  slug             String                      @unique
+  description      String?
+  groupId          String                      @unique
+  emailDomains     String[]
+  verificationMode String                      @default("profile_college")
+  memberCount      Int                         @default(0)
+  createdById      String?
+  createdAt        DateTime                    @default(now())
+  updatedAt        DateTime                    @updatedAt
+  members          college_community_members[]
+
+  @@index([college])
+  @@index([memberCount])
+}
+
+model college_community_members {
+  id          String              @id @default(uuid())
+  communityId String
+  userId      String
+  role        String              @default("member")
+  joinedAt    DateTime            @default(now())
+  community   college_communities @relation(fields: [communityId], references: [id], onDelete: Cascade)
+
+  @@unique([communityId, userId])
+  @@index([userId, joinedAt])
+  @@index([communityId])
+}
+
+model college_student_verifications {
+  id           String    @id @default(uuid())
+  userId       String
+  college      String
+  studentEmail String?
+  status       String    @default("verified")
+  method       String    @default("profile_college")
+  verifiedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([userId, college])
+  @@index([college, status])
+  @@index([userId, status])
+}
+
 model coding_problems {
   id             String         @id @default(uuid())
   title          String
@@ -871,6 +1086,8 @@ model connections {
   @@index([status])
   @@index([requesterId, status])
   @@index([addresseeId, status])
+  @@index([requesterId, status, addresseeId])
+  @@index([addresseeId, status, requesterId])
   }
 
 model conversations {
@@ -1089,6 +1306,62 @@ model game_stats {
   @@index([userId])
 }
 
+model arcade_rooms {
+  id           String            @id @default(uuid())
+  gameType     String
+  hostId       String
+  guestId      String?
+  inviteCode   String            @unique
+  status       String            @default("waiting")
+  hostReady    Boolean           @default(false)
+  guestReady   Boolean           @default(false)
+  seed         Int               @default(0)
+  hostScore    Int               @default(0)
+  guestScore   Int               @default(0)
+  winnerId     String?
+  metadata     Json?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  startedAt    DateTime?
+  completedAt  DateTime?
+  expiresAt    DateTime?
+  host         User              @relation("arcade_rooms_host", fields: [hostId], references: [id], onDelete: Cascade)
+  guest        User?             @relation("arcade_rooms_guest", fields: [guestId], references: [id], onDelete: SetNull)
+  winner       User?             @relation("arcade_rooms_winner", fields: [winnerId], references: [id], onDelete: SetNull)
+  results      arcade_results[]
+
+  @@index([gameType, status])
+  @@index([hostId])
+  @@index([guestId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model arcade_results {
+  id              String        @id @default(uuid())
+  roomId          String
+  gameType        String
+  userId          String
+  opponentId      String?
+  result          String
+  score           Int           @default(0)
+  opponentScore   Int           @default(0)
+  xpEarned        Int           @default(0)
+  coinsEarned     Int           @default(0)
+  durationSeconds Int           @default(0)
+  metadata        Json?
+  createdAt       DateTime      @default(now())
+  room            arcade_rooms  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user            User          @relation("arcade_results_user", fields: [userId], references: [id], onDelete: Cascade)
+  opponent        User?         @relation("arcade_results_opponent", fields: [opponentId], references: [id], onDelete: SetNull)
+
+  @@unique([roomId, userId])
+  @@index([gameType])
+  @@index([userId, createdAt])
+  @@index([opponentId])
+  @@index([result])
+}
+
 model group_members {
   id       String   @id
   groupId  String
@@ -1100,6 +1373,46 @@ model group_members {
   @@unique([groupId, userId])
   @@index([groupId])
   @@index([userId])
+}
+
+model group_invites {
+  id            String    @id @default(uuid())
+  groupId       String
+  invitedUserId String
+  invitedById   String
+  status        String    @default("pending")
+  message       String?
+  createdAt     DateTime  @default(now())
+  expiresAt     DateTime
+  respondedAt   DateTime?
+  groups        groups    @relation("group_invites_group", fields: [groupId], references: [id], onDelete: Cascade)
+  invitedUser   User      @relation("group_invites_invitedUser", fields: [invitedUserId], references: [id], onDelete: Cascade)
+  invitedBy     User      @relation("group_invites_invitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, invitedUserId])
+  @@index([groupId, status])
+  @@index([invitedUserId, status])
+  @@index([invitedById])
+  @@index([expiresAt])
+}
+
+model group_join_requests {
+  id           String    @id @default(uuid())
+  groupId      String
+  requesterId  String
+  inviteCode   String
+  status       String    @default("pending")
+  requestedAt  DateTime  @default(now())
+  reviewedById String?
+  respondedAt  DateTime?
+  groups       groups    @relation("group_join_requests_group", fields: [groupId], references: [id], onDelete: Cascade)
+  requester    User      @relation("group_join_requests_requester", fields: [requesterId], references: [id], onDelete: Cascade)
+  reviewedBy   User?     @relation("group_join_requests_reviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@unique([groupId, requesterId])
+  @@index([groupId, status])
+  @@index([requesterId, status])
+  @@index([reviewedById])
 }
 
 model group_message_reactions {
@@ -1145,9 +1458,14 @@ model groups {
   name           String
   slug           String?          @unique
   description    String?
+  category       String?
+  rules          String[]         @default([])
   imageUrl       String?
   iconImage      String?
   coverImage     String?
+  inviteCode     String?          @unique
+  inviteLinkVisibility String     @default("ADMINS")
+  inviteLinkUpdatedAt DateTime?
   creatorId      String
   isPrivate      Boolean          @default(false)
   memberCount    Int              @default(1)
@@ -1156,11 +1474,14 @@ model groups {
   createdAt      DateTime         @default(now())
   updatedAt      DateTime  @updatedAt
   group_members  group_members[]
+  group_invites  group_invites[]  @relation("group_invites_group")
+  group_join_requests group_join_requests[] @relation("group_join_requests_group")
   group_messages group_messages[]
   users          User             @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   @@index([creatorId])
   @@index([isPrivate])
+  @@index([inviteLinkVisibility])
   @@index([slug])
 }
 
@@ -1198,6 +1519,7 @@ model message_reactions {
 
 model messages {
   id                String              @id
+  clientMessageId   String?
   conversationId    String
   senderId          String
   receiverId        String
@@ -1219,6 +1541,7 @@ model messages {
   messages          messages?           @relation("messagesTomessages", fields: [replyToId], references: [id])
   other_messages    messages[]          @relation("messagesTomessages")
 
+  @@unique([conversationId, senderId, clientMessageId])
   @@index([conversationId, createdAt])
   @@index([conversationId])
   @@index([receiverId])
@@ -1277,6 +1600,7 @@ model onboarding_profiles {
 
   @@index([isCompleted])
   @@index([userId])
+  @@index([primaryGoal])
 }
 
 model onboarding_stats {
@@ -1477,6 +1801,7 @@ model reel_comments {
   @@index([authorId])
   @@index([parentId])
   @@index([reelId])
+  @@index([reelId, parentId, isPinned, likesCount, createdAt, id])
 }
 
 model reel_likes {
@@ -1488,7 +1813,9 @@ model reel_likes {
   users     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([reelId, userId])
+  @@index([reelId])
   @@index([userId])
+  @@index([userId, createdAt, id])
 }
 
 model reel_poll_votes {
@@ -1672,6 +1999,8 @@ model reels {
   @@index([status])
   @@index([viewsCount])
   @@index([visibility])
+  @@index([status, visibility, publishedAt, viewsCount, id])
+  @@index([authorId, status, visibility, publishedAt])
 }
 
 model saved_posts {
@@ -1685,6 +2014,7 @@ model saved_posts {
   @@unique([userId, postId])
   @@index([postId])
   @@index([userId])
+  @@index([userId, createdAt, id])
 }
 
 model social_activity_feed {
@@ -1736,10 +2066,12 @@ model stories {
   createdAt       DateTime      @default(now())
   users           User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
   story_views     story_views[]
+  story_reactions story_reactions[]
 
   @@index([authorId, createdAt])
   @@index([authorId])
   @@index([expiresAt])
+  @@index([expiresAt, createdAt, id])
 }
 
 // Story views tracking - unique per story per viewer (Instagram-style)
@@ -1756,14 +2088,38 @@ model story_views {
   @@index([viewedAt])
 }
 
+model story_reactions {
+  id           String   @id @default(uuid())
+  storyId      String
+  userId       String
+  reactionType String   @default("LIKE")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  story        stories  @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([storyId, userId])
+  @@index([storyId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
 model subscriptions {
   id                     String    @id
   userId                 String    @unique
   plan                   String    @default("free")
   status                 String    @default("active")
+  provider               String    @default("manual")
   razorpaySubscriptionId String?
   razorpayCustomerId     String?
   razorpayPlanId         String?
+  googlePlayPurchaseToken String?   @unique
+  googlePlayOrderId      String?
+  googlePlayProductId    String?
+  googlePlayBasePlanId   String?
+  googlePlaySubscriptionState String?
+  googlePlayAcknowledgementState String?
+  lastProviderSyncAt     DateTime?
   amount                 Int?
   currency               String    @default("INR")
   billingCycle           String?
@@ -1777,7 +2133,10 @@ model subscriptions {
 
   @@index([plan])
   @@index([status])
+  @@index([provider])
   @@index([userId])
+  @@index([googlePlayProductId])
+  @@index([googlePlayBasePlanId])
 }
 
 model app_feature_settings {

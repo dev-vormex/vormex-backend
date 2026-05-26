@@ -1,6 +1,41 @@
 import type { UserResponse } from '../types/auth.types';
 import { getPremiumAccessSnapshot } from './premium-access.service';
 
+export const safeUserResponseSelect = {
+  id: true,
+  email: true,
+  username: true,
+  name: true,
+  profileImage: true,
+  bio: true,
+  college: true,
+  branch: true,
+  graduationYear: true,
+  isVerified: true,
+  authProvider: true,
+  googleId: true,
+  appleId: true,
+  githubUsername: true,
+  githubId: true,
+  githubConnected: true,
+  githubAvatarUrl: true,
+  githubProfileUrl: true,
+  githubLastSyncedAt: true,
+  headline: true,
+  bannerImageUrl: true,
+  location: true,
+  currentYear: true,
+  degree: true,
+  portfolioUrl: true,
+  linkedinUrl: true,
+  otherSocialUrls: true,
+  isOpenToOpportunities: true,
+  interests: true,
+  onboardingCompleted: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
 export async function buildUserResponse(user: any): Promise<UserResponse> {
   const snapshot = await getPremiumAccessSnapshot(String(user.id));
 

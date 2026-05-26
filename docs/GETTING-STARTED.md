@@ -39,9 +39,11 @@ Required environment variables:
 DATABASE_URL="postgresql://user:password@localhost:5432/vormex"
 
 # JWT
-JWT_SECRET="your-secret-key-here"
-JWT_EXPIRES_IN="365d"
-AUTH_SESSION_TTL_SECONDS=31536000
+JWT_SECRET="replace-with-at-least-32-random-bytes"
+AUTH_CSRF_SECRET="replace-with-a-different-32-byte-random-secret"
+AUTH_ACCESS_TOKEN_TTL="365d"
+AUTH_REFRESH_TOKEN_TTL_SECONDS=31536000
+AUTH_PASSWORD_MIN_LENGTH=12
 
 # GitHub OAuth
 GITHUB_CLIENT_ID="your-github-client-id"
@@ -256,7 +258,7 @@ kill -9 <PID>
 
 ### JWT Token Expired
 
-Tokens expire after 7 days. Re-login to get a new token:
+Tokens expire after 365 days. Re-login to get a new token:
 
 ```bash
 curl -X POST http://localhost:3000/api/auth/login \

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { parseStoredMusicAttachment, type StoredMusicAttachment } from './music.util';
+import { validateHttpUrlLike } from './input-security.util';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -11,6 +12,8 @@ export interface StoredPollOption {
 
 export interface StoredPostMetadata {
   mentions?: string[];
+  collaboratorIds?: string[];
+  pendingCollaboratorIds?: string[];
   music?: StoredMusicAttachment | null;
   contentType?: string;
   videoUrl?: string | null;
@@ -118,11 +121,14 @@ export function normalizeUrl(value: unknown): string | null {
   if (!raw) return null;
 
   if (/^https?:\/\//i.test(raw)) {
+    if (!validateHttpUrlLike(raw).ok) return null;
     return raw;
   }
 
   if (/^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(raw)) {
-    return `https://${raw}`;
+    const normalized = `https://${raw}`;
+    if (!validateHttpUrlLike(normalized).ok) return null;
+    return normalized;
   }
 
   return raw;
@@ -198,6 +204,8 @@ export function getPostMetadata(value: unknown): StoredPostMetadata {
 
   return {
     mentions: parseStringArrayField(metadata.mentions),
+    collaboratorIds: parseStringArrayField(metadata.collaboratorIds),
+    pendingCollaboratorIds: parseStringArrayField(metadata.pendingCollaboratorIds),
     music: parseStoredMusicAttachment(metadata.music),
     contentType: asTrimmedString(metadata.contentType) || DEFAULT_CONTENT_TYPE,
     videoUrl: normalizeUrl(metadata.videoUrl),
@@ -252,6 +260,7 @@ function pickTitleFromHtml(html: string): string | null {
 export async function enrichLinkMetadataFromUrl(metadata: StoredPostMetadata): Promise<void> {
   const url = metadata.linkUrl;
   if (!url) return;
+  if (!validateHttpUrlLike(url).ok) return;
 
   try {
     const res = await axios.get<string>(url, {
@@ -327,6 +336,37 @@ export function mapPollOptionsForResponse(
 export function mapPostResponse(post: any, currentUserId: string) {
   const metadata = getPostMetadata(post.metadata);
   const mediaUrls = Array.isArray(post.mediaUrls) ? post.mediaUrls.filter(Boolean) : [];
+  const collaboratorRows = Array.isArray(post.collaborators) ? post.collaborators : [];
+  const acceptedCollaboratorRows = collaboratorRows.filter(
+    (collaboration: any) => String(collaboration?.status || '').toLowerCase() === 'accepted'
+  );
+  const pendingCollaboratorRows = collaboratorRows.filter(
+    (collaboration: any) => String(collaboration?.status || '').toLowerCase() === 'pending'
+  );
+  const acceptedCollaborators = acceptedCollaboratorRows
+    .map((collaboration: any) => collaboration?.user)
+    .filter(Boolean);
+  const acceptedCollaboratorIds = acceptedCollaboratorRows
+    .map((collaboration: any) => collaboration?.userId || collaboration?.user?.id)
+    .filter(Boolean);
+  const legacyPendingCollaboratorIds = collaboratorRows.length === 0 ? metadata.collaboratorIds || [] : [];
+  const collaboratorIds = acceptedCollaboratorIds;
+  const pendingCollaboratorIds = Array.from(
+    new Set([
+      ...(metadata.pendingCollaboratorIds || []),
+      ...legacyPendingCollaboratorIds,
+      ...pendingCollaboratorRows
+        .map((collaboration: any) => collaboration?.userId || collaboration?.user?.id)
+        .filter(Boolean),
+    ])
+  );
+  const visiblePendingCollaboratorIds =
+    post.authorId !== currentUserId && pendingCollaboratorIds.includes(currentUserId)
+      ? [currentUserId]
+      : [];
+  const currentUserCollaboration = collaboratorRows.find(
+    (collaboration: any) => collaboration?.userId === currentUserId || collaboration?.user?.id === currentUserId
+  );
   const normalizedType = (post.type || 'text').toLowerCase();
   const isVideo = normalizedType === 'video';
   const isDocument = normalizedType === 'document';
@@ -352,10 +392,27 @@ export function mapPostResponse(post: any, currentUserId: string) {
       name: post.author.name,
       profileImage: post.author.profileImage,
       headline: post.author.headline,
+      verified: Boolean(post.author.isVerified),
+      isVerified: Boolean(post.author.isVerified),
     },
     content: post.content,
     contentType: metadata.contentType || DEFAULT_CONTENT_TYPE,
     mentions: metadata.mentions || [],
+    collaboratorIds,
+    pendingCollaboratorIds: visiblePendingCollaboratorIds,
+    collaborators: acceptedCollaborators.map((user: any) => ({
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      profileImage: user.profileImage,
+      headline: user.headline,
+      verified: Boolean(user.isVerified),
+      isVerified: Boolean(user.isVerified),
+    })),
+    collaborationStatus: currentUserCollaboration?.status ??
+      (visiblePendingCollaboratorIds.includes(currentUserId)
+          ? 'pending'
+          : null),
     music: metadata.music ?? null,
     mediaUrls,
     mediaCount: mediaUrls.length,

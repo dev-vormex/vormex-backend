@@ -1,11 +1,15 @@
 import { Request, Response } from 'express';
-import crypto from 'node:crypto';
-import bcrypt from 'bcryptjs';
 import { prisma } from '../config/prisma';
+import { sendPasswordResetEmail } from '../utils/email.util';
 import {
-  isEmailServiceUnavailableError,
-  sendPasswordResetEmail,
-} from '../utils/email.util';
+  generateOpaqueToken,
+  hashOpaqueToken,
+  hashPassword,
+  isLikelyOpaqueToken,
+  validatePasswordStrength,
+  verifyLegacyBcryptToken,
+} from '../utils/auth-security.util';
+import { revokeAllAuthSessions } from '../services/auth-session.service';
 import {
   ForgotPasswordRequestBody,
   ResetPasswordRequestBody,
@@ -19,19 +23,40 @@ import {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * Minimum password length
- */
-const MIN_PASSWORD_LENGTH = 8;
-
-/**
- * Hash password rounds
- */
-const SALT_ROUNDS = 10;
-
-/**
  * Reset token expiry time (1 hour in milliseconds)
  */
 const RESET_TOKEN_EXPIRY = 3600000; // 1 hour
+
+async function findUserByResetToken(token: string) {
+  const now = new Date();
+  const tokenHash = hashOpaqueToken(token);
+  const user = await prisma.user.findFirst({
+    where: {
+      resetToken: tokenHash,
+      resetTokenExpiry: { gt: now },
+    },
+  });
+
+  if (user) {
+    return user;
+  }
+
+  const usersWithLegacyResetTokens = await prisma.user.findMany({
+    where: {
+      resetToken: { startsWith: '$2' },
+      resetTokenExpiry: { gt: now },
+    },
+    take: 100,
+  });
+
+  for (const legacyUser of usersWithLegacyResetTokens) {
+    if (await verifyLegacyBcryptToken(token, legacyUser.resetToken)) {
+      return legacyUser;
+    }
+  }
+
+  return null;
+}
 
 /**
  * Forgot Password - Send password reset email
@@ -78,11 +103,9 @@ export const forgotPassword = async (
       let resetTokenStored = false;
 
       try {
-        // Generate secure random token
-        const plainToken = crypto.randomBytes(32).toString('hex');
-
-        // Hash token before storing in database
-        const hashedToken = await bcrypt.hash(plainToken, SALT_ROUNDS);
+        // Generate secure random token and store only a deterministic hash.
+        const plainToken = generateOpaqueToken();
+        const hashedToken = hashOpaqueToken(plainToken);
 
         // Set expiry time (1 hour from now)
         const resetTokenExpiry = new Date(Date.now() + RESET_TOKEN_EXPIRY);
@@ -119,16 +142,6 @@ export const forgotPassword = async (
         // Log error but still return success message (security)
         console.error('Error processing password reset request:', error);
 
-        if (isEmailServiceUnavailableError(error)) {
-          res.status(error.statusCode).json({
-            error: error.message,
-            code: error.code,
-            ...(error.retryAfterSeconds
-              ? { retryAfterSeconds: error.retryAfterSeconds }
-              : {}),
-          });
-          return;
-        }
       }
     }
 
@@ -148,8 +161,8 @@ export const forgotPassword = async (
 /**
  * Reset Password - Reset password using token
  * 
- * POST /api/auth/reset-password?token=<reset-token>
- * Body: { newPassword }
+ * POST /api/auth/reset-password
+ * Body: { token, newPassword }
  * 
  * Validates token (from query), checks expiry, and updates password
  */
@@ -158,8 +171,7 @@ export const resetPassword = async (
   res: Response<SuccessMessageResponse | ErrorResponse>
 ): Promise<void> => {
   try {
-    // Get token from query parameters
-    const token = req.query.token as string | undefined;
+    const token = req.body?.token || (req.query.token as string | undefined);
     const { newPassword } = req.body;
 
     // Validate required fields
@@ -172,7 +184,7 @@ export const resetPassword = async (
 
     // Trim inputs
     const trimmedToken = token.trim();
-    const trimmedPassword = newPassword.trim();
+    const candidatePassword = newPassword;
 
     // Validate token is not empty
     if (!trimmedToken) {
@@ -182,35 +194,14 @@ export const resetPassword = async (
       return;
     }
 
-    // Validate password length
-    if (trimmedPassword.length < MIN_PASSWORD_LENGTH) {
+    if (!isLikelyOpaqueToken(trimmedToken)) {
       res.status(400).json({
-        error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters long`,
+        error: 'Invalid or expired reset token',
       });
       return;
     }
 
-    // Hash the received token to compare with stored hash
-    // We need to check all users with reset tokens and compare hashes
-    const usersWithResetTokens = await prisma.user.findMany({
-      where: {
-        resetToken: { not: null },
-        resetTokenExpiry: { gt: new Date() }, // Not expired
-      },
-    });
-
-    // Find user with matching token
-    let userWithValidToken = null;
-
-    for (const user of usersWithResetTokens) {
-      if (user.resetToken) {
-        const isTokenValid = await bcrypt.compare(trimmedToken, user.resetToken);
-        if (isTokenValid) {
-          userWithValidToken = user;
-          break;
-        }
-      }
-    }
+    const userWithValidToken = await findUserByResetToken(trimmedToken);
 
     // Check if valid token found
     if (!userWithValidToken) {
@@ -220,8 +211,20 @@ export const resetPassword = async (
       return;
     }
 
+    const passwordError = validatePasswordStrength(candidatePassword, [
+      userWithValidToken.email,
+      userWithValidToken.name,
+      userWithValidToken.username,
+    ]);
+    if (passwordError) {
+      res.status(400).json({
+        error: passwordError,
+      });
+      return;
+    }
+
     // Hash new password
-    const hashedPassword = await bcrypt.hash(trimmedPassword, SALT_ROUNDS);
+    const hashedPassword = await hashPassword(candidatePassword);
 
     // Update user: set new password, clear reset token and expiry
     await prisma.user.update({
@@ -232,6 +235,7 @@ export const resetPassword = async (
         resetTokenExpiry: null,
       },
     });
+    await revokeAllAuthSessions(userWithValidToken.id);
 
     console.log('Password reset successful for user:', userWithValidToken.email);
 

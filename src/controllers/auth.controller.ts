@@ -1,8 +1,6 @@
-import { Response } from 'express';
-import crypto from 'node:crypto';
-import bcrypt from 'bcryptjs';
+import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { generateAccessToken } from '../utils/jwt.util';
+import { generateAccessToken, getAccessTokenTtlSeconds } from '../utils/jwt.util';
 import { sendVerificationEmail } from '../utils/email.util';
 import {
   validateUsername,
@@ -10,16 +8,36 @@ import {
   generateUsernameFromName,
 } from '../utils/username.util';
 import { hashEmail } from '../utils/email-hash.util';
+import {
+  compareWithDummyPassword,
+  getPasswordMaxLength,
+  generateOpaqueToken,
+  hashOpaqueToken,
+  hashPassword,
+  passwordHashNeedsRehash,
+  validatePasswordStrength,
+  verifyPassword,
+} from '../utils/auth-security.util';
+import {
+  clearAuthCookies,
+  getCookie,
+  REFRESH_TOKEN_COOKIE,
+  setAuthCookies,
+} from '../utils/auth-cookie.util';
 import { recordActivity } from '../services/activity.service';
 import {
-  createAuthSession,
   revokeAllAuthSessions,
   revokeAuthSession,
   rotateAuthSession,
 } from '../services/auth-session.service';
+import {
+  authTokensForResponse,
+  issueAuthTransport,
+  type IssuedAuthTransport,
+} from '../services/auth-transport.service';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { processPeopleYouKnowJoinForUser } from '../services/people-you-know-join.service';
-import { buildUserResponse } from '../services/user-response.service';
+import { buildUserResponse, safeUserResponseSelect } from '../services/user-response.service';
 import { updateEngagementStreak } from './engagement.controller';
 import {
   RegisterRequestBody,
@@ -34,16 +52,6 @@ import {
  * Email validation regex
  */
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-/**
- * Minimum password length
- */
-const MIN_PASSWORD_LENGTH = 8;
-
-/**
- * Hash password rounds
- */
-const SALT_ROUNDS = 10;
 
 async function generateUniqueUsernameFromName(name: string): Promise<string> {
   let username = normalizeUsername(generateUsernameFromName(name));
@@ -87,9 +95,9 @@ export const getCurrentUser = async (
 
     const userId = String(req.user.userId);
 
-    // Fetch user from database (all fields)
     const user = await prisma.user.findUnique({
       where: { id: userId },
+      select: safeUserResponseSelect,
     });
 
     if (!user) {
@@ -99,19 +107,7 @@ export const getCurrentUser = async (
       return;
     }
 
-    // Remove sensitive fields before sending response
-    // Exclude: password, githubAccessToken, resetToken, verificationToken, and their expiry fields
-    const {
-      password: _password,
-      githubAccessToken,
-      resetToken: _resetToken,
-      resetTokenExpiry: _resetTokenExpiry,
-      verificationToken: _verificationToken,
-      verificationTokenExpiry: _verificationTokenExpiry,
-      ...safeUser
-    } = user;
-
-    const userResponse = await buildUserResponse(safeUser);
+    const userResponse = await buildUserResponse(user);
 
     res.status(200).json(userResponse);
   } catch (error) {
@@ -131,34 +127,36 @@ export const getCurrentUser = async (
  * Body: { email, password, name, college?, branch? }
  */
 export const register = async (
-  req: { body: RegisterRequestBody },
+  req: Request<{}, AuthSuccessResponse | ErrorResponse, RegisterRequestBody>,
   res: Response<AuthSuccessResponse | ErrorResponse>
 ): Promise<void> => {
   try {
     const { email, password, name, username, college, branch } = req.body;
 
     // Validate required fields
-    if (!email || !password || !name) {
+    if (!email || !password || !name?.trim()) {
       res.status(400).json({
         error: 'Email, password, and name are required',
       });
       return;
     }
 
-    const normalizedEmail = email.toLowerCase();
+    const normalizedEmail = email.trim().toLowerCase();
+    const displayName = name.trim();
 
     // Validate email format
-    if (!EMAIL_REGEX.test(email)) {
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
       res.status(400).json({
         error: 'Invalid email format',
       });
       return;
     }
 
-    // Validate password length
-    if (password.length < MIN_PASSWORD_LENGTH) {
+    // Validate password strength
+    const passwordError = validatePasswordStrength(password, [normalizedEmail, displayName, username]);
+    if (passwordError) {
       res.status(400).json({
-        error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters long`,
+        error: passwordError,
       });
       return;
     }
@@ -197,15 +195,15 @@ export const register = async (
         return;
       }
     } else {
-      normalizedUsername = await generateUniqueUsernameFromName(name);
+      normalizedUsername = await generateUniqueUsernameFromName(displayName);
     }
 
     // Hash password
-    const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+    const hashedPassword = await hashPassword(password);
 
     // Generate verification token
-    const plainVerificationToken = crypto.randomBytes(32).toString('hex');
-    const hashedVerificationToken = await bcrypt.hash(plainVerificationToken, SALT_ROUNDS);
+    const plainVerificationToken = generateOpaqueToken();
+    const hashedVerificationToken = hashOpaqueToken(plainVerificationToken);
     const verificationTokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
     // Create user
@@ -215,7 +213,7 @@ export const register = async (
         emailHash: hashEmail(normalizedEmail),
         username: normalizedUsername,
         password: hashedPassword,
-        name,
+        name: displayName,
         college: college || null,
         branch: branch || null,
         authProvider: 'email',
@@ -223,11 +221,12 @@ export const register = async (
         verificationToken: hashedVerificationToken,
         verificationTokenExpiry,
       },
+      select: safeUserResponseSelect,
     });
 
     // Send verification email (don't block registration if email fails)
     try {
-      await sendVerificationEmail(normalizedEmail, plainVerificationToken, name);
+      await sendVerificationEmail(normalizedEmail, plainVerificationToken, displayName);
     } catch (emailError) {
       // Log error but don't fail registration
       console.error('Failed to send verification email:', emailError);
@@ -242,46 +241,13 @@ export const register = async (
 
     queueMatchAvailabilityNotifications(user.id, 'signup');
 
-    // Generate JWT token
-    const session = await createAuthSession({
-      userId: user.id,
-      userAgent: (req as any)?.headers?.['user-agent'],
-      ip: (req as any)?.ip,
-    });
-    const token = generateAccessToken(user.id, session.sessionId);
-
-    // Remove sensitive fields before sending response
-    // Note: password and verificationTokenExpiry from above are already used, so we rename them here to avoid conflict
-      if (!user.emailHash) {
-        await prisma.user.update({
-          where: { id: user.id },
-          data: {
-            emailHash: hashEmail(user.email),
-          },
-        });
-      }
-
-      const {
-      password: _password, // Rename to avoid conflict with req.body password
-      githubAccessToken,
-      resetToken,
-      resetTokenExpiry: _resetTokenExpiry,
-      verificationToken: _verificationToken,
-      verificationTokenExpiry: _verificationTokenExpiry, // Rename to avoid conflict with local variable
-      ...safeUser
-    } = user;
-
-    const userResponse = await buildUserResponse(safeUser);
+    const userResponse = await buildUserResponse(user);
 
     // Return success response
     res.status(201).json({
       user: userResponse,
-      token,
-      refreshToken: session.refreshToken,
-      session: {
-        id: session.sessionId,
-        expiresAt: session.expiresAt.toISOString(),
-      },
+      message: 'Registration successful. Please verify your email before logging in.',
+      requiresVerification: true,
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -298,16 +264,23 @@ export const register = async (
  * Body: { email, password }
  */
 export const login = async (
-  req: { body: LoginRequestBody },
+  req: Request<{}, AuthSuccessResponse | ErrorResponse, LoginRequestBody>,
   res: Response<AuthSuccessResponse | ErrorResponse>
 ): Promise<void> => {
   try {
     const { email, username, emailOrUsername, password } = req.body;
 
     // Validate required fields
-    if (!password) {
+    if (!password || typeof password !== 'string') {
       res.status(400).json({
         error: 'Password is required',
+      });
+      return;
+    }
+
+    if (password.length > getPasswordMaxLength()) {
+      res.status(401).json({
+        error: 'Invalid email or password',
       });
       return;
     }
@@ -331,8 +304,9 @@ export const login = async (
 
     // Determine if loginIdentifier is email (contains @) or username
     const isEmail = loginIdentifier.includes('@');
-    const normalizedIdentifier = isEmail 
-      ? loginIdentifier.toLowerCase() 
+    const trimmedIdentifier = loginIdentifier.trim();
+    const normalizedIdentifier = isEmail
+      ? trimmedIdentifier.toLowerCase()
       : normalizeUsername(loginIdentifier);
 
     // Find user by email or username
@@ -340,10 +314,17 @@ export const login = async (
       where: isEmail
         ? { email: normalizedIdentifier }
         : { username: normalizedIdentifier },
+      select: {
+        ...safeUserResponseSelect,
+        password: true,
+        emailHash: true,
+        isBanned: true,
+      },
     });
 
     // Check if user exists
     if (!user) {
+      await compareWithDummyPassword(password);
       res.status(401).json({
         error: 'Invalid email or password',
       });
@@ -352,18 +333,27 @@ export const login = async (
 
     // Check if user has a password (not OAuth user)
     if (!user.password) {
+      await compareWithDummyPassword(password);
       res.status(401).json({
-        error: 'This account uses OAuth authentication. Please sign in with your OAuth provider.',
+        error: 'Invalid email or password',
       });
       return;
     }
 
     // Verify password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
+    const isPasswordValid = await verifyPassword(password, user.password);
 
     if (!isPasswordValid) {
       res.status(401).json({
         error: 'Invalid email or password',
+      });
+      return;
+    }
+
+    if (user.isBanned) {
+      res.status(403).json({
+        error: 'User account is disabled',
+        code: 'account_disabled',
       });
       return;
     }
@@ -378,6 +368,17 @@ export const login = async (
       return;
     }
 
+    if (passwordHashNeedsRehash(user.password)) {
+      try {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { password: await hashPassword(password) },
+        });
+      } catch (rehashError) {
+        console.error('Failed to upgrade password hash:', rehashError);
+      }
+    }
+
     // Generate JWT token
     if (!user.emailHash) {
       await prisma.user.update({
@@ -386,22 +387,12 @@ export const login = async (
       });
     }
 
-    const session = await createAuthSession({
-      userId: user.id,
-      userAgent: (req as any)?.headers?.['user-agent'],
-      ip: (req as any)?.ip,
-    });
-    const token = generateAccessToken(user.id, session.sessionId);
+    const authTransport = await issueAuthTransport(req, res, user.id);
 
-    // Remove sensitive fields before sending response
-    // Note: password from req.body is already used, so we rename it here to avoid conflict
     const {
-      password: _password, // Rename to avoid conflict with req.body password
-      githubAccessToken,
-      resetToken,
-      resetTokenExpiry: _resetTokenExpiry,
-      verificationToken: _verificationToken,
-      verificationTokenExpiry: _verificationTokenExpiry,
+      password: _password,
+      emailHash: _emailHash,
+      isBanned: _isBanned,
       ...safeUser
     } = user;
 
@@ -414,12 +405,7 @@ export const login = async (
     // Return success response
     res.status(200).json({
       user: userResponse,
-      token,
-      refreshToken: session.refreshToken,
-      session: {
-        id: session.sessionId,
-        expiresAt: session.expiresAt.toISOString(),
-      },
+      ...authTokensForResponse(req, authTransport),
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -430,51 +416,84 @@ export const login = async (
 };
 
 export const refreshSession = async (
-  req: { body: { refreshToken?: string } },
+  req: Request<{}, AuthSuccessResponse | ErrorResponse, { refreshToken?: string }>,
   res: Response<AuthSuccessResponse | ErrorResponse>
 ): Promise<void> => {
   try {
-    const refreshToken = req.body?.refreshToken;
+    const refreshToken = req.body?.refreshToken || getCookie(req, REFRESH_TOKEN_COOKIE);
     if (!refreshToken) {
+      clearAuthCookies(res);
       res.status(400).json({ error: 'refreshToken is required' });
       return;
     }
 
     const rotated = await rotateAuthSession(refreshToken);
     if (!rotated) {
+      clearAuthCookies(res);
       res.status(401).json({ error: 'Invalid or expired refresh token' });
       return;
     }
 
     const user = await prisma.user.findUnique({
       where: { id: rotated.userId },
+      select: {
+        ...safeUserResponseSelect,
+        isBanned: true,
+      },
     });
 
     if (!user) {
+      await revokeAuthSession(rotated.refreshToken);
+      clearAuthCookies(res);
       res.status(404).json({ error: 'User not found' });
       return;
     }
 
-    const {
-      password: _password,
-      githubAccessToken,
-      resetToken,
-      resetTokenExpiry: _resetTokenExpiry,
-      verificationToken: _verificationToken,
-      verificationTokenExpiry: _verificationTokenExpiry,
-      ...safeUser
-    } = user;
+    if (user.isBanned) {
+      await revokeAllAuthSessions(user.id);
+      clearAuthCookies(res);
+      res.status(403).json({
+        error: 'User account is disabled',
+        code: 'account_disabled',
+      });
+      return;
+    }
 
+    if (user.authProvider === 'email' && !user.isVerified) {
+      await revokeAllAuthSessions(user.id);
+      clearAuthCookies(res);
+      res.status(403).json({
+        error: 'Please verify your email before continuing.',
+        code: 'email_not_verified',
+        requiresVerification: true,
+      });
+      return;
+    }
+
+    const { isBanned: _isBanned, ...safeUser } = user;
     const userResponse = await buildUserResponse(safeUser);
 
-    res.status(200).json({
-      user: userResponse,
-      token: generateAccessToken(rotated.userId, rotated.sessionId),
+    const accessToken = generateAccessToken(rotated.userId, rotated.sessionId);
+    const csrfToken = setAuthCookies(res, {
+      accessToken,
+      accessMaxAgeSeconds: getAccessTokenTtlSeconds(),
       refreshToken: rotated.refreshToken,
+      refreshExpiresAt: rotated.expiresAt,
+      sessionId: rotated.sessionId,
+    });
+    const authTransport: IssuedAuthTransport = {
+      token: accessToken,
+      refreshToken: rotated.refreshToken,
+      csrfToken,
       session: {
         id: rotated.sessionId,
         expiresAt: rotated.expiresAt.toISOString(),
       },
+    };
+
+    res.status(200).json({
+      user: userResponse,
+      ...authTokensForResponse(req, authTransport),
     });
   } catch (error) {
     console.error('Refresh session error:', error);
@@ -485,17 +504,16 @@ export const refreshSession = async (
 };
 
 export const logout = async (
-  req: { body?: { refreshToken?: string } },
+  req: Request<{}, { success: boolean } | ErrorResponse, { refreshToken?: string }>,
   res: Response<{ success: boolean } | ErrorResponse>
 ): Promise<void> => {
   try {
-    const refreshToken = req.body?.refreshToken;
-    if (!refreshToken) {
-      res.status(400).json({ error: 'refreshToken is required' });
-      return;
+    const refreshToken = req.body?.refreshToken || getCookie(req, REFRESH_TOKEN_COOKIE);
+    if (refreshToken) {
+      await revokeAuthSession(refreshToken);
     }
 
-    await revokeAuthSession(refreshToken);
+    clearAuthCookies(res);
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Logout error:', error);
@@ -515,6 +533,7 @@ export const logoutAll = async (
     }
 
     await revokeAllAuthSessions(userId);
+    clearAuthCookies(res);
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Logout all error:', error);

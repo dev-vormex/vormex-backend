@@ -30,23 +30,26 @@ function isMissingOutboxTableError(error: unknown): boolean {
 }
 
 async function pickPendingEvents(limit: number): Promise<OutboxRow[]> {
-  return prismaWrite.$queryRawUnsafe<OutboxRow[]>(`
-    WITH picked AS (
-      SELECT id
-      FROM outbox_events
-      WHERE status = 'pending'
-        AND "availableAt" <= NOW()
-      ORDER BY "createdAt" ASC
-      FOR UPDATE SKIP LOCKED
-      LIMIT ${Math.max(1, Math.min(limit, 200))}
-    )
-    UPDATE outbox_events o
-    SET status = 'processing',
-        "updatedAt" = NOW()
-    FROM picked
-    WHERE o.id = picked.id
-    RETURNING o.id, o."aggregateType", o."aggregateId", o."eventType", o."queueName", o.payload, o.attempts;
-  `);
+  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  return prismaWrite.$queryRaw<OutboxRow[]>(
+    Prisma.sql`
+      WITH picked AS (
+        SELECT id
+        FROM outbox_events
+        WHERE status = 'pending'
+          AND "availableAt" <= NOW()
+        ORDER BY "createdAt" ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT ${boundedLimit}
+      )
+      UPDATE outbox_events o
+      SET status = 'processing',
+          "updatedAt" = NOW()
+      FROM picked
+      WHERE o.id = picked.id
+      RETURNING o.id, o."aggregateType", o."aggregateId", o."eventType", o."queueName", o.payload, o.attempts;
+    `
+  );
 }
 
 export async function dispatchOutboxBatch(limit = DEFAULT_BATCH_SIZE): Promise<number> {

@@ -39,6 +39,8 @@ function profileInterestArraysEqual(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
+
 /**
  * Get full user profile
  * GET /api/users/:userId/profile
@@ -119,6 +121,7 @@ export const getProfileFeed = async (
 ): Promise<void> => {
   try {
     let userId = ensureString(req.params.userId);
+    const requestingUserId = req.user?.userId ? String(req.user.userId) : null;
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = Math.min(parseInt(ensureString(req.query.limit) || '20') || 20, 100); // Max 100
     const filter = ensureString(req.query.filter) || 'all';
@@ -162,7 +165,8 @@ export const getProfileFeed = async (
       user.id,
       page,
       limit,
-      filter as any
+      filter as any,
+      requestingUserId
     );
 
     res.status(200).json(feed);
@@ -203,6 +207,7 @@ export const updateProfile = async (
       graduationYear,
       portfolioUrl,
       linkedinUrl,
+      githubProfileUrl,
       otherSocialUrls,
       isOpenToOpportunities,
       interests,
@@ -294,7 +299,11 @@ export const updateProfile = async (
     }
 
     // Validate URLs
-    const urlFields = { portfolioUrl, linkedinUrl };
+    const urlFields = {
+      portfolioUrl,
+      linkedinUrl,
+      githubProfileUrl,
+    };
     for (const [field, url] of Object.entries(urlFields)) {
       if (url !== undefined && url !== null && url !== '') {
         try {
@@ -374,6 +383,7 @@ export const updateProfile = async (
     if (graduationYear !== undefined) updateData.graduationYear = graduationYear;
     if (portfolioUrl !== undefined) updateData.portfolioUrl = portfolioUrl;
     if (linkedinUrl !== undefined) updateData.linkedinUrl = linkedinUrl;
+    if (githubProfileUrl !== undefined) updateData.githubProfileUrl = githubProfileUrl;
     if (otherSocialUrls !== undefined) updateData.otherSocialUrls = otherSocialUrls;
     if (isOpenToOpportunities !== undefined)
       updateData.isOpenToOpportunities = isOpenToOpportunities;
@@ -384,6 +394,35 @@ export const updateProfile = async (
     }
     if (college !== undefined) updateData.college = college?.trim() || null;
     if (branch !== undefined) updateData.branch = branch?.trim() || null;
+
+    const affectsPeopleCards =
+      name !== undefined ||
+      headline !== undefined ||
+      bio !== undefined ||
+      location !== undefined ||
+      college !== undefined ||
+      branch !== undefined ||
+      graduationYear !== undefined ||
+      isOpenToOpportunities !== undefined ||
+      processedInterests !== undefined;
+    const affectsMatchRanking =
+      college !== undefined ||
+      branch !== undefined ||
+      graduationYear !== undefined ||
+      processedInterests !== undefined;
+    const affectsPeopleFilters =
+      college !== undefined ||
+      branch !== undefined ||
+      location !== undefined ||
+      graduationYear !== undefined;
+    const cacheInvalidationTags = uniqueCacheTags([
+      `user:${userId}`,
+      `people:user:${userId}`,
+      `matching:user:${userId}`,
+      affectsPeopleCards ? 'people:global' : '',
+      affectsMatchRanking ? 'matching:global' : '',
+      affectsPeopleFilters ? 'people:filters' : '',
+    ]);
 
     // Update user
     const updatedUser = await prisma.$transaction(async (tx) => {
@@ -422,7 +461,7 @@ export const updateProfile = async (
         eventType: 'profile.updated',
         queueName: queueNames.cacheInvalidation,
         payload: {
-          tags: [`user:${userId}`],
+          tags: cacheInvalidationTags,
         },
       });
 
@@ -508,7 +547,13 @@ export const uploadBanner = async (
         eventType: 'profile.banner.updated',
         queueName: queueNames.cacheInvalidation,
         payload: {
-          tags: [`user:${userId}`],
+          tags: [
+            `user:${userId}`,
+            `people:user:${userId}`,
+            `matching:user:${userId}`,
+            'people:global',
+            'matching:global',
+          ],
         },
       });
 
@@ -577,7 +622,13 @@ export const uploadAvatar = async (
         eventType: 'profile.avatar.updated',
         queueName: queueNames.cacheInvalidation,
         payload: {
-          tags: [`user:${userId}`],
+          tags: [
+            `user:${userId}`,
+            `people:user:${userId}`,
+            `matching:user:${userId}`,
+            'people:global',
+            'matching:global',
+          ],
         },
       });
 

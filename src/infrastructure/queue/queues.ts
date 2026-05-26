@@ -1,7 +1,7 @@
 import { Queue } from 'bullmq';
 import type { JobsOptions } from 'bullmq';
-import { redisCommand } from '../redis/client';
-import { queueNames, type QueueName } from './queue-names';
+import { isRedisEnabled, redisCommand } from '../redis/client';
+import type { QueueName } from './queue-names';
 
 const defaultJobOptions: JobsOptions = {
   attempts: 5,
@@ -15,14 +15,29 @@ const defaultJobOptions: JobsOptions = {
 
 const queues = new Map<QueueName, Queue>();
 
+export class QueueUnavailableError extends Error {
+  constructor(name: QueueName) {
+    super(`Queue "${name}" is unavailable because Redis is not connected`);
+    this.name = 'QueueUnavailableError';
+  }
+}
+
+export function isQueueingEnabled(): boolean {
+  return isRedisEnabled() && Boolean(redisCommand);
+}
+
 export function getQueue(name: QueueName): Queue {
+  if (!isQueueingEnabled() || !redisCommand) {
+    throw new QueueUnavailableError(name);
+  }
+
   const existing = queues.get(name);
   if (existing) {
     return existing;
   }
 
   const queue = new Queue(name, {
-    connection: redisCommand || undefined,
+    connection: redisCommand,
     defaultJobOptions,
   });
 
@@ -31,9 +46,10 @@ export function getQueue(name: QueueName): Queue {
 }
 
 export function getAllQueues(): Queue[] {
-  return (Object.values(queueNames) as QueueName[]).map((name) => getQueue(name));
+  return Array.from(queues.values());
 }
 
 export async function closeQueues(): Promise<void> {
   await Promise.allSettled(getAllQueues().map((queue) => queue.close()));
+  queues.clear();
 }

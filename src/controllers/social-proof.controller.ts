@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
 import { socialProofService } from '../services/social-proof.service';
 import { ensureString } from '../utils/request.util';
+import { canViewGroup } from '../utils/access-control.util';
 
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -134,6 +136,15 @@ export const getGroupStats = async (req: Request, res: Response) => {
       return;
     }
     const userId = (req as any).user?.userId;
+    const group = await prisma.groups.findUnique({
+      where: { id: groupId },
+      select: { id: true, isPrivate: true, creatorId: true },
+    });
+    if (!group || !(await canViewGroup(group, userId))) {
+      res.status(404).json({ success: false, error: 'Group not found' });
+      return;
+    }
+
     const stats = await socialProofService.getGroupStats(groupId, userId);
 
     if (!stats) {

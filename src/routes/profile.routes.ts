@@ -26,7 +26,7 @@ const router = express.Router();
 
 // Public routes (support both UUID and username; optionalAuth for "me" resolution)
 router.get('/users/:userId/profile', optionalAuth, getProfile); // Public but respects privacy settings
-router.get('/users/:userId/feed', getProfileFeed); // Public
+router.get('/users/:userId/feed', optionalAuth, getProfileFeed); // Public, with scoped visibility for signed-in viewers
 router.get('/users/:userId/activity', getUserActivity); // Public - GitHub-style contribution calendar
 router.get('/users/:userId/activity/years', getUserActivityYears); // Public - Available years for dropdown
 
@@ -36,4 +36,3 @@ router.post('/users/me/banner', authenticate, uploadBanner);
 router.post('/users/me/avatar', authenticate, uploadAvatar);
 
 export default router;
-

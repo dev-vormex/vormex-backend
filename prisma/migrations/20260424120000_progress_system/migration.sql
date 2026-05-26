@@ -9,7 +9,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS "xp_transactions_idempotencyKey_key"
 CREATE INDEX IF NOT EXISTS "xp_transactions_currency_idx"
   ON "xp_transactions"("currency");
 
-UPDATE "User"
+UPDATE "users"
 SET "coinsBalance" = "xpBalance"
 WHERE "coinsBalance" = 0
   AND "xpBalance" > 0;

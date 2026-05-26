@@ -6,20 +6,28 @@ import type { PremiumPlanConfig } from './premium-checkout.service';
 const SETTINGS_ID = 'default';
 const DEFAULT_PREMIUM_TITLE = 'Vormex Premium';
 const DEFAULT_PREMIUM_DESCRIPTION =
-  'Unlock AI Agent access, premium profile styling, new sections, standout posts, custom visitor looks, featured cards, themes, blocking tools, and fast support.';
+  'Priority discovery, profile reach boosts, unlimited outreach, profile projects, collaboration applications, and AI help for serious student builders.';
 const DEFAULT_PREMIUM_FEATURES = [
-  'AI Agent access',
-  'Unlock new sections',
-  'Premium themes',
-  'Premium post styling',
-  'Custom profile visitor look',
-  'Featured card designs',
-  'Block people controls',
-  '24/7 fast support',
+  'Priority discovery placement',
+  'Premium badge for higher trust',
+  'Profile reach boosts',
+  'Better chances of profile views',
+  'Unlimited connection requests',
+  'Unlimited teammate post applications',
+  'Unlimited hackathon team applications',
+  'Up to 10 profile projects',
+  'Featured project showcase',
+  'Unlimited AI Agent prompts',
+  'AI teammate finder',
+  'AI pitch, bio, and hackathon idea generator',
+  'Open to collaborate badge',
+  'Profile frames and visitor animations',
 ];
 const DEFAULT_PREMIUM_DURATION_DAYS = 31;
 const DEFAULT_SUPPORT_LABEL = '24/7 fast support';
-const DEFAULT_AGENT_PROMPT_LIMIT = 3;
+const DEFAULT_AGENT_PROMPT_LIMIT = 5;
+const DEFAULT_YEARLY_PREMIUM_AMOUNT_MINOR = 99900;
+const DEVELOPER_PREMIUM_PROVIDER = 'developer_override';
 
 export const ACTIVE_PREMIUM_STATUSES = new Set(['active', 'captured', 'authorized']);
 
@@ -33,6 +41,7 @@ type SubscriptionRecord = Awaited<ReturnType<typeof prisma.subscriptions.findUni
 type AccessUserRecord = {
   id: string;
   isAdmin: boolean;
+  email: string;
 };
 
 export type AgentAvailabilityMode = 'all' | 'selected' | 'disabled';
@@ -58,6 +67,18 @@ export interface PremiumAccessSnapshot {
   agentPromptLimit: number;
   agentLimitReached: boolean;
   canCancelPremium: boolean;
+  canManageInGooglePlay: boolean;
+  provider: string;
+}
+
+export interface PremiumPlanOption {
+  billingCycle: string;
+  amountMinor: number;
+  currency: string;
+  displayAmount: string;
+  durationDays: number;
+  label: string;
+  savingsLabel: string | null;
 }
 
 export interface AgentAccessState {
@@ -75,7 +96,8 @@ export interface PremiumCheckoutEventInput {
     | 'CHECKOUT_BLOCKED'
     | 'CHECKOUT_VERIFIED'
     | 'SUBSCRIPTION_CANCELLED'
-    | 'ADMIN_CANCELLED_SUBSCRIPTION';
+    | 'ADMIN_CANCELLED_SUBSCRIPTION'
+    | 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED';
   outcome?: 'info' | 'success' | 'failure';
   message?: string;
   amountMinor?: number | null;
@@ -83,9 +105,24 @@ export interface PremiumCheckoutEventInput {
   metadata?: Prisma.InputJsonValue | null;
 }
 
-function getDefaultPremiumAmountMinor() {
-  const amountMinor = Number(process.env.VORMEX_PREMIUM_AMOUNT_MINOR || 19900);
-  return Number.isFinite(amountMinor) && amountMinor > 0 ? Math.round(amountMinor) : 19900;
+function readPositiveIntEnv(name: string, fallback: number) {
+  const value = Number(process.env[name] || fallback);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : fallback;
+}
+
+function getDefaultPremiumAmountMinor(billingCycle = getPremiumBillingCycle()) {
+  const normalizedBillingCycle = normalizePremiumBillingCycle(billingCycle);
+  if (normalizedBillingCycle === 'yearly') {
+    return readPositiveIntEnv(
+      'VORMEX_PREMIUM_YEARLY_AMOUNT_MINOR',
+      DEFAULT_YEARLY_PREMIUM_AMOUNT_MINOR
+    );
+  }
+
+  return readPositiveIntEnv(
+    'VORMEX_PREMIUM_MONTHLY_AMOUNT_MINOR',
+    readPositiveIntEnv('VORMEX_PREMIUM_AMOUNT_MINOR', 19900)
+  );
 }
 
 function getDefaultPremiumCurrency() {
@@ -101,12 +138,32 @@ export function getPremiumDurationDays() {
     : DEFAULT_PREMIUM_DURATION_DAYS;
 }
 
+export function getPremiumDurationDaysForBillingCycle(billingCycle = getPremiumBillingCycle()) {
+  const normalizedBillingCycle = normalizePremiumBillingCycle(billingCycle);
+  if (normalizedBillingCycle === 'yearly') {
+    return readPositiveIntEnv('VORMEX_PREMIUM_YEARLY_DURATION_DAYS', 365);
+  }
+
+  return readPositiveIntEnv(
+    'VORMEX_PREMIUM_MONTHLY_DURATION_DAYS',
+    getPremiumDurationDays()
+  );
+}
+
 export function getPremiumPlan() {
   return process.env.VORMEX_PREMIUM_PLAN || 'premium';
 }
 
 export function getPremiumBillingCycle() {
-  return process.env.VORMEX_PREMIUM_BILLING_CYCLE || 'one_time';
+  return normalizePremiumBillingCycle(process.env.VORMEX_PREMIUM_BILLING_CYCLE || 'monthly');
+}
+
+export function normalizePremiumBillingCycle(value: string | null | undefined) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'yearly' || normalized === 'annual' || normalized === 'annually') {
+    return 'yearly';
+  }
+  return 'monthly';
 }
 
 export function getPremiumTitle() {
@@ -123,6 +180,49 @@ export function getPremiumFeatureLabels() {
 
 export function getPremiumSupportLabel() {
   return DEFAULT_SUPPORT_LABEL;
+}
+
+export function isDeveloperPremiumOverrideAvailable() {
+  const explicitFlag = String(process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE || '')
+    .trim()
+    .toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(explicitFlag)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(explicitFlag)) {
+    return false;
+  }
+
+  return process.env.NODE_ENV !== 'production';
+}
+
+function getAdminAllowedEmailSet() {
+  return new Set(
+    String(process.env.ADMIN_ALLOWED_EMAILS || '')
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+export function isDeveloperPremiumOverrideAvailableForUser(
+  user: Pick<AccessUserRecord, 'email' | 'isAdmin'> | null | undefined
+) {
+  if (isDeveloperPremiumOverrideAvailable()) {
+    return true;
+  }
+
+  if (!user) {
+    return false;
+  }
+
+  return user.isAdmin || getAdminAllowedEmailSet().has(user.email.trim().toLowerCase());
+}
+
+export function isDeveloperPremiumOverrideSubscription(
+  subscription: Pick<NonNullable<SubscriptionRecord>, 'provider'> | null | undefined
+) {
+  return subscription?.provider === DEVELOPER_PREMIUM_PROVIDER;
 }
 
 export function getAgentPromptLimit() {
@@ -175,8 +275,9 @@ export function evaluateAgentAccess(params: {
       (params.isPremium ||
         params.agentMode === 'all' ||
         (params.agentMode === 'selected' && params.agentEnabled)));
+  const hasUnlimitedAgentAccess = params.isAdmin || params.isPremium;
   const agentLimitReached =
-    !params.isAdmin && baseAccess && params.creditsUsed >= agentPromptLimit;
+    !hasUnlimitedAgentAccess && baseAccess && params.creditsUsed >= agentPromptLimit;
 
   return {
     canUseAgent: baseAccess && !agentLimitReached,
@@ -202,6 +303,33 @@ export function getPremiumPeriodEnd(startAt: Date, durationDays = getPremiumDura
   return endAt;
 }
 
+export function getPremiumPlanOptions(currency = getDefaultPremiumCurrency()): PremiumPlanOption[] {
+  const monthlyAmount = getDefaultPremiumAmountMinor('monthly');
+  const yearlyAmount = getDefaultPremiumAmountMinor('yearly');
+  const yearlySavings = Math.max(0, monthlyAmount * 12 - yearlyAmount);
+
+  return [
+    {
+      billingCycle: 'monthly',
+      amountMinor: monthlyAmount,
+      currency,
+      displayAmount: formatCurrency(monthlyAmount, currency),
+      durationDays: getPremiumDurationDaysForBillingCycle('monthly'),
+      label: 'Monthly',
+      savingsLabel: null,
+    },
+    {
+      billingCycle: 'yearly',
+      amountMinor: yearlyAmount,
+      currency,
+      displayAmount: formatCurrency(yearlyAmount, currency),
+      durationDays: getPremiumDurationDaysForBillingCycle('yearly'),
+      label: 'Yearly',
+      savingsLabel: yearlySavings > 0 ? `Save ${formatCurrency(yearlySavings, currency)}` : null,
+    },
+  ];
+}
+
 export function getPremiumDaysRemaining(
   currentPeriodEnd: Date | null | undefined,
   now = new Date()
@@ -224,7 +352,7 @@ export async function getOrCreateAppFeatureSettings(): Promise<AppFeatureSetting
     update: {},
     create: {
       id: SETTINGS_ID,
-      premiumDefaultAmountMinor: getDefaultPremiumAmountMinor(),
+      premiumDefaultAmountMinor: getDefaultPremiumAmountMinor('monthly'),
       premiumCurrency: getDefaultPremiumCurrency(),
       agentAvailabilityMode: 'all',
     },
@@ -275,6 +403,7 @@ export async function cancelPremiumSubscription(
       amount: null,
       currency: getDefaultPremiumCurrency(),
       billingCycle: getPremiumBillingCycle(),
+      provider: 'manual',
       currentPeriodStart: now,
       currentPeriodEnd: now,
       cancelledAt: now,
@@ -282,11 +411,116 @@ export async function cancelPremiumSubscription(
       razorpaySubscriptionId: null,
       razorpayCustomerId: null,
       razorpayPlanId: null,
+      googlePlayPurchaseToken: null,
+      googlePlayOrderId: null,
+      googlePlayProductId: null,
+      googlePlayBasePlanId: null,
+      googlePlaySubscriptionState: null,
+      googlePlayAcknowledgementState: null,
+      lastProviderSyncAt: now,
     },
     update: {
       status: reason === 'admin' ? 'revoked' : 'cancelled',
       currentPeriodEnd: now,
       cancelledAt: now,
+      lastProviderSyncAt: now,
+    },
+  });
+}
+
+export async function setDeveloperPremiumOverride(
+  userId: string,
+  enabled: boolean
+): Promise<SubscriptionRecord | null> {
+  const now = new Date();
+  const existing = await prisma.subscriptions.findUnique({ where: { userId } });
+
+  if (enabled) {
+    if (
+      existing &&
+      !isDeveloperPremiumOverrideSubscription(existing) &&
+      isPremiumSubscriptionActive(existing, now)
+    ) {
+      return existing;
+    }
+
+    const currentPeriodEnd = getPremiumPeriodEnd(
+      now,
+      getPremiumDurationDaysForBillingCycle('yearly')
+    );
+
+    const subscription = await prisma.subscriptions.upsert({
+      where: { userId },
+      create: {
+        id: randomUUID(),
+        userId,
+        plan: getPremiumPlan(),
+        status: 'active',
+        amount: 0,
+        currency: getDefaultPremiumCurrency(),
+        billingCycle: 'yearly',
+        provider: DEVELOPER_PREMIUM_PROVIDER,
+        currentPeriodStart: now,
+        currentPeriodEnd,
+        cancelledAt: null,
+        trialEndsAt: null,
+        razorpaySubscriptionId: null,
+        razorpayCustomerId: null,
+        razorpayPlanId: null,
+        googlePlayPurchaseToken: null,
+        googlePlayOrderId: null,
+        googlePlayProductId: null,
+        googlePlayBasePlanId: null,
+        googlePlaySubscriptionState: null,
+        googlePlayAcknowledgementState: null,
+        lastProviderSyncAt: now,
+      },
+      update: {
+        plan: getPremiumPlan(),
+        status: 'active',
+        amount: 0,
+        currency: getDefaultPremiumCurrency(),
+        billingCycle: 'yearly',
+        provider: DEVELOPER_PREMIUM_PROVIDER,
+        currentPeriodStart: now,
+        currentPeriodEnd,
+        cancelledAt: null,
+        trialEndsAt: null,
+        razorpaySubscriptionId: null,
+        razorpayCustomerId: null,
+        razorpayPlanId: null,
+        googlePlayPurchaseToken: null,
+        googlePlayOrderId: null,
+        googlePlayProductId: null,
+        googlePlayBasePlanId: null,
+        googlePlaySubscriptionState: null,
+        googlePlayAcknowledgementState: null,
+        lastProviderSyncAt: now,
+      },
+    });
+
+    await prisma.user_feature_access_overrides.updateMany({
+      where: { userId },
+      data: {
+        agentBlocked: false,
+        profileCustomizationBlocked: false,
+      },
+    });
+
+    return subscription;
+  }
+
+  if (!existing || !isDeveloperPremiumOverrideSubscription(existing)) {
+    return existing;
+  }
+
+  return prisma.subscriptions.update({
+    where: { userId },
+    data: {
+      status: 'cancelled',
+      currentPeriodEnd: now,
+      cancelledAt: now,
+      lastProviderSyncAt: now,
     },
   });
 }
@@ -301,6 +535,7 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
       select: {
         id: true,
         isAdmin: true,
+        email: true,
       },
     }),
   ]);
@@ -309,24 +544,38 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     throw new Error('User not found');
   }
 
-  const premiumAmountMinor =
+  const configuredPremiumAmountMinor =
     typeof override?.premiumPriceOverrideMinor === 'number' && override.premiumPriceOverrideMinor > 0
       ? override.premiumPriceOverrideMinor
-      : settings.premiumDefaultAmountMinor;
-  const premiumCurrency = settings.premiumCurrency || getDefaultPremiumCurrency();
+    : settings.premiumDefaultAmountMinor || getDefaultPremiumAmountMinor('monthly');
   const now = new Date();
-  const premiumDurationDays = getPremiumDurationDays();
   const isPremium = isPremiumSubscriptionActive(subscription, now);
+  const activeBillingCycle = normalizePremiumBillingCycle(
+    subscription?.billingCycle || getPremiumBillingCycle()
+  );
+  const premiumDurationDays = getPremiumDurationDaysForBillingCycle(activeBillingCycle);
+  const premiumAmountMinor =
+    isPremium && typeof subscription?.amount === 'number' && subscription.amount > 0
+      ? subscription.amount
+      : configuredPremiumAmountMinor;
+  const premiumCurrency = (isPremium && subscription?.currency) || settings.premiumCurrency || getDefaultPremiumCurrency();
   const agentMode = normalizeAgentAvailabilityMode(settings.agentAvailabilityMode);
   const premiumStartedAt = subscription?.currentPeriodStart || null;
   const premiumEndsAt =
     subscription?.currentPeriodEnd ||
     (subscription?.currentPeriodStart ? getPremiumPeriodEnd(subscription.currentPeriodStart) : null);
   const premiumDaysRemaining = isPremium ? getPremiumDaysRemaining(premiumEndsAt, now) : 0;
+  const provider =
+    subscription?.provider ||
+    (subscription?.razorpaySubscriptionId ? 'razorpay' : 'manual');
   const autoPayEnabled = Boolean(subscription?.razorpaySubscriptionId);
-  const canCancelPremium = isPremium || Boolean(subscription?.razorpaySubscriptionId);
-  const creditsWindowStart =
-    premiumStartedAt || new Date(now.getTime() - premiumDurationDays * 24 * 60 * 60 * 1000);
+  const canCancelPremium =
+    provider !== 'google_play' && (isPremium || Boolean(subscription?.razorpaySubscriptionId));
+  const canManageInGooglePlay =
+    provider === 'google_play' && Boolean(subscription?.googlePlayProductId);
+  const creditsWindowStart = isPremium
+    ? (premiumStartedAt || new Date(now.getTime() - premiumDurationDays * 24 * 60 * 60 * 1000))
+    : new Date(0);
   const creditsUsed = await prisma.agent_messages.count({
     where: {
       userId,
@@ -372,17 +621,24 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     agentPromptLimit: agentAccess.agentPromptLimit,
     agentLimitReached: agentAccess.agentLimitReached,
     canCancelPremium,
+    canManageInGooglePlay,
+    provider,
   };
 }
 
 export function buildPremiumPlanConfig(
-  snapshot: Pick<PremiumAccessSnapshot, 'premiumAmountMinor' | 'premiumCurrency'>
+  snapshot: Pick<PremiumAccessSnapshot, 'premiumAmountMinor' | 'premiumCurrency'>,
+  billingCycle = getPremiumBillingCycle()
 ): PremiumPlanConfig & { title: string; description: string; features: string[] } {
+  const normalizedBillingCycle = normalizePremiumBillingCycle(billingCycle);
+  const planOption = getPremiumPlanOptions(snapshot.premiumCurrency)
+    .find((option) => option.billingCycle === normalizedBillingCycle);
+
   return {
-    amountMinor: snapshot.premiumAmountMinor,
+    amountMinor: planOption?.amountMinor || snapshot.premiumAmountMinor,
     currency: snapshot.premiumCurrency,
     plan: getPremiumPlan(),
-    billingCycle: getPremiumBillingCycle(),
+    billingCycle: normalizedBillingCycle,
     title: getPremiumTitle(),
     description: getPremiumDescription(),
     features: getPremiumFeatureLabels(),
@@ -396,13 +652,14 @@ export function serializePremiumSubscription(
   return {
     plan: snapshot.subscription?.plan || 'free',
     status: snapshot.subscription?.status || 'inactive',
+    provider: snapshot.provider,
     isPremium: snapshot.isPremium,
     title: getPremiumTitle(),
     description: getPremiumDescription(),
     amountMinor: snapshot.premiumAmountMinor,
     currency: snapshot.premiumCurrency,
     displayAmount: snapshot.premiumDisplayAmount,
-    billingCycle: getPremiumBillingCycle(),
+    billingCycle: normalizePremiumBillingCycle(snapshot.subscription?.billingCycle || getPremiumBillingCycle()),
     checkoutEnabled,
     ctaLabel: snapshot.isPremium ? 'Premium active' : 'Go Premium',
     features: getPremiumFeatureLabels(),
@@ -420,6 +677,14 @@ export function serializePremiumSubscription(
     agentPromptLimit: snapshot.agentPromptLimit,
     agentLimitReached: snapshot.agentLimitReached,
     canCancel: snapshot.canCancelPremium,
+    canManageInGooglePlay: snapshot.canManageInGooglePlay,
+    googlePlayProductId: snapshot.subscription?.googlePlayProductId || null,
+    googlePlayBasePlanId: snapshot.subscription?.googlePlayBasePlanId || null,
+    googlePlaySubscriptionState: snapshot.subscription?.googlePlaySubscriptionState || null,
+    developerPremiumOverrideAvailable: isDeveloperPremiumOverrideAvailableForUser(snapshot.user),
+    developerPremiumOverrideActive:
+      snapshot.isPremium && isDeveloperPremiumOverrideSubscription(snapshot.subscription),
+    planOptions: getPremiumPlanOptions(snapshot.premiumCurrency),
   };
 }
 

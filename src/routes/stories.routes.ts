@@ -2,6 +2,8 @@ import { Router } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import { validateUploadedFiles } from '../middleware/upload-security.middleware';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -26,6 +28,16 @@ const mediaWriteLimit = createRateLimitMiddleware((req) => [
       }]
     : []),
 ]);
+const validateStoryUpload = validateUploadedFiles({
+  fields: {
+    media: {
+      allowedMimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'],
+      maxBytes: 50 * 1024 * 1024,
+    },
+  },
+  maxFiles: 1,
+  requireKnownField: true,
+});
 import {
   getStoriesFeed,
   createStory,
@@ -79,7 +91,7 @@ router.delete('/highlights/:highlightId/stories/:storyId', removeStoryFromHighli
 router.get('/user/:userId', getUserStories);
 
 // Story CRUD (supports both JSON and multipart/form-data for media)
-router.post('/', mediaWriteLimit, upload.single('media'), createStory);
+router.post('/', mediaWriteLimit, upload.single('media'), validateStoryUpload, validateMultipartFields, createStory);
 router.get('/:storyId', getStory);
 router.delete('/:storyId', deleteStory);
 
