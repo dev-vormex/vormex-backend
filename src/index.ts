@@ -9,6 +9,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { prisma, disconnectPrisma } from './config/prisma';
+import { validateAuthRuntimeConfig } from './config/auth-security.config';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { httpLogger } from './lib/logger';
 import { metricsMiddleware } from './middleware/metrics.middleware';
@@ -36,6 +37,9 @@ import accountabilityRoutes from './routes/accountability.routes';
 import skillsRoutes from './routes/skills.routes';
 import skillSwapRoutes from './routes/skill-swap.routes';
 import groupsRoutes from './routes/groups.routes';
+import hackathonsRoutes from './routes/hackathons.routes';
+import eventsRoutes from './routes/events.routes';
+import collegeCommunitiesRoutes from './routes/college-communities.routes';
 import circlesRoutes from './routes/circles.routes';
 import onboardingRoutes from './routes/onboarding.routes';
 import gamesRoutes from './routes/games.routes';
@@ -52,6 +56,7 @@ import interviewsRoutes from './routes/interviews.routes';
 import challengesRoutes from './routes/challenges.routes';
 import aiChatRoutes from './routes/ai-chat.routes';
 import agentRoutes from './routes/agent.routes';
+import talkRoutes from './routes/talk.routes';
 import devicesRoutes from './routes/devices.routes';
 import reelsRoutes from './routes/reels.routes';
 import audioRoutes from './routes/audio.routes';
@@ -65,22 +70,38 @@ import { getAllQueues } from './infrastructure/queue/queues';
 import {
   connectRedisClients,
   disconnectRedisClients,
+  getRedisHealth,
   isRedisEnabled,
+  isRedisRequired,
   redisPub,
   redisSub,
 } from './infrastructure/redis/client';
 import { initializeRealtimeSubscriptions } from './infrastructure/realtime/subscriber';
 import { requestSizeGuard } from './infrastructure/security/request-size.middleware';
+import {
+  validateAIRequestInput,
+  validateRequestInput,
+} from './middleware/input-validation.middleware';
+import {
+  containsPromptInjection,
+  sanitizeInputTree,
+} from './utils/input-security.util';
 import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
-import { createRateLimitMiddleware } from './middleware/rate-limit.middleware';
-import { optionalAuth, verifyAccessToken } from './middleware/auth.middleware';
+import { botGuard, generalApiRateLimit } from './middleware/abuse-protection.middleware';
+import { optionalAppCheck } from './middleware/app-check.middleware';
+import { optionalAuth } from './middleware/auth.middleware';
+import { ACCESS_TOKEN_COOKIE, parseCookieHeader } from './utils/auth-cookie.util';
+import { verifyToken, type JWTPayload } from './utils/jwt.util';
+import { getAuthSession } from './services/auth-session.service';
 import { getPostMetadata, mapPollOptionsForResponse } from './utils/post.util';
+import { canViewPost, canViewReel, canViewStory } from './utils/access-control.util';
 import { pushNotificationService } from './services/push-notification.service';
 import {
   getAgentAccessDeniedMessage,
   getPremiumAccessSnapshot,
 } from './services/premium-access.service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from './outbox/helpers';
+import { registerArcadeSocketHandlers } from './sockets/arcade.socket';
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -91,27 +112,83 @@ const requiredEnvVars = [
   'ENCRYPTION_KEY',
 ];
 
+if (process.env.NODE_ENV === 'production') {
+  requiredEnvVars.push('DATABASE_URL', 'JWT_SECRET', 'AUTH_CSRF_SECRET');
+}
+
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     throw new Error(`Missing required environment variable: ${envVar}`);
   }
 }
 
-// Validate ENCRYPTION_KEY format (must be 64 hex characters)
-if (process.env.ENCRYPTION_KEY && process.env.ENCRYPTION_KEY.length !== 64) {
-  throw new Error('ENCRYPTION_KEY must be exactly 64 characters (32 bytes in hex)');
-}
+validateAuthRuntimeConfig();
 
 const app: Express = express();
 const httpServer = createServer(app);
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-app.set('trust proxy', true);
+function parseTrustProxy(value: string | undefined): boolean | number | string {
+  if (!value) {
+    return process.env.NODE_ENV === 'production' ? 1 : true;
+  }
+  if (value === 'true') return true;
+  if (value === 'false') return false;
 
-// Socket.IO Setup - allow all origins so mobile (Android/iOS) can connect (they may not send standard Origin)
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : value;
+}
+
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
+
+// Middleware — add comma-separated origins via CORS_EXTRA_ORIGINS (e.g. admin on Vercel)
+const defaultAllowedOrigins = [
+  'http://localhost:3001',
+  'http://localhost:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:3000',
+  'https://vormex.in',
+  'https://www.vormex.in',
+];
+const extraOrigins = (process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+const allowedOrigins = new Set([...defaultAllowedOrigins, ...extraOrigins]);
+
+function isAllowedLocalNetworkOrigin(origin: string): boolean {
+  if (process.env.NODE_ENV === 'production') {
+    return false;
+  }
+
+  return /^https?:\/\/(172\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}):(3000|3001)$/.test(origin);
+}
+
+function normalizeOrigin(origin: string): string {
+  try {
+    return new URL(origin).origin;
+  } catch {
+    return origin.replace(/\/$/, '');
+  }
+}
+
+function isAllowedRequestOrigin(origin: string | undefined): boolean {
+  if (!origin) {
+    // Native/mobile clients and same-origin non-browser tools may omit Origin.
+    return true;
+  }
+
+  const normalizedOrigin = normalizeOrigin(origin);
+  return allowedOrigins.has(normalizedOrigin) || isAllowedLocalNetworkOrigin(normalizedOrigin);
+}
+
+// Socket.IO Setup - browsers are origin-restricted; native/mobile clients may omit Origin.
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: true, // Allow any origin - required for Android/iOS real-time chat
+    origin: (origin, callback) => {
+      callback(null, isAllowedRequestOrigin(origin));
+    },
     credentials: true,
     methods: ['GET', 'POST'],
   },
@@ -121,16 +198,12 @@ const io = new SocketIOServer(httpServer, {
 // Share Socket.IO instance with controllers via the sockets module
 setIO(io);
 
-if (isRedisEnabled() && redisPub && redisSub) {
-  void connectRedisClients()
-    .then(async () => {
-      io.adapter(createAdapter(redisPub, redisSub));
-      await initializeRealtimeSubscriptions(io);
-    })
-    .catch((error) => {
-      console.error('Failed to initialize Redis realtime infrastructure:', error);
-    });
-}
+const redisStartupPromise = connectRedisClients().then(async () => {
+  if (isRedisEnabled() && redisPub && redisSub) {
+    io.adapter(createAdapter(redisPub, redisSub));
+    await initializeRealtimeSubscriptions(io);
+  }
+});
 
 // Import activity service for engagement tracking
 import { recordActivity } from './services/activity.service';
@@ -142,8 +215,28 @@ const socketUsers = new Map<string, string>(); // socketId -> userId
 
 // Helper to get userId from socket
 const getSocketUserId = (socket: any): string | null => {
-  return socketUsers.get(socket.id) || null;
+  return socket.data?.userId || socketUsers.get(socket.id) || null;
 };
+
+async function verifySocketAccessToken(token: string): Promise<JWTPayload> {
+  const decoded = verifyToken(token);
+  if (!decoded.sessionId) {
+    throw new Error('Session is no longer active');
+  }
+
+  const session = await getAuthSession(decoded.sessionId);
+  if (!session || session.userId !== String(decoded.userId)) {
+    throw new Error('Session is no longer active');
+  }
+
+  return decoded;
+}
+
+function getSocketHandshakeToken(socket: any): string | null {
+  const cookies = parseCookieHeader(socket.handshake.headers.cookie);
+  const token = socket.handshake.auth?.token || cookies[ACCESS_TOKEN_COOKIE];
+  return typeof token === 'string' && token.trim() ? token.trim() : null;
+}
 
 // Helper to emit to user by userId (all their connected sockets)
 const emitToUser = (userId: string, event: string, data: any) => {
@@ -159,6 +252,57 @@ const chatUserSelect = {
   isOnline: true,
   lastActiveAt: true,
 };
+
+const normalizeClientMessageId = (clientMessageId: unknown): string | null => {
+  if (typeof clientMessageId !== 'string') {
+    return null;
+  }
+
+  const normalized = clientMessageId.trim();
+  return normalized ? normalized.slice(0, 128) : null;
+};
+
+const buildFallbackChatUser = (userId: string) => ({
+  id: userId,
+  username: '',
+  name: '',
+  profileImage: null,
+  isOnline: false,
+  lastActiveAt: null,
+});
+
+const mapSocketChatMessagePayload = (
+  message: any,
+  sender: any,
+  clientMessageIdOverride?: string | null
+) => ({
+  id: message.id,
+  clientMessageId: message.clientMessageId || clientMessageIdOverride || undefined,
+  conversationId: message.conversationId,
+  senderId: message.senderId,
+  receiverId: message.receiverId,
+  content: message.content,
+  contentType: message.contentType,
+  mediaUrl: message.mediaUrl,
+  mediaType: message.mediaType,
+  fileName: message.fileName,
+  fileSize: message.fileSize,
+  status: message.status,
+  deliveredAt: message.deliveredAt?.toISOString(),
+  readAt: message.readAt?.toISOString(),
+  isDeleted: message.isDeleted,
+  replyToId: message.replyToId,
+  replyTo: message.messages || null,
+  sender: sender || buildFallbackChatUser(message.senderId),
+  reactions: (message.message_reactions || []).map((reaction: any) => ({
+    id: reaction.id,
+    userId: reaction.userId,
+    emoji: reaction.emoji,
+    user: { id: reaction.userId, username: '', name: '' },
+  })),
+  createdAt: message.createdAt.toISOString(),
+  updatedAt: message.updatedAt.toISOString(),
+});
 
 const buildGroupMessagePreview = (content: string, contentType: string): string => {
   if (content && content.trim()) {
@@ -222,10 +366,10 @@ async function togglePostReactionWithFanout(
   return prisma.$transaction(async (tx) => {
     const post = await tx.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
 
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId, tx as any))) {
       return null;
     }
 
@@ -250,6 +394,9 @@ async function togglePostReactionWithFanout(
       where: { id: postId },
       data: { likesCount },
     });
+    const postRooms = String(post.visibility || '').toLowerCase() === 'public'
+      ? [feedRealtimeRoom, `post:${postId}`]
+      : [`post:${postId}`];
 
     await enqueueRealtimeFanout(tx as any, {
       aggregateType: 'post',
@@ -258,7 +405,7 @@ async function togglePostReactionWithFanout(
       envelopes: [
         {
           event: eventName,
-          rooms: [feedRealtimeRoom, `post:${postId}`],
+          rooms: postRooms,
           payload: {
             postId,
             userId,
@@ -275,7 +422,7 @@ async function togglePostReactionWithFanout(
       aggregateType: 'post',
       aggregateId: postId,
       eventType: 'post.engagement.cache.invalidate',
-      tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+      tags: ['feed:global', `feed:${post.authorId}`, `user:${post.authorId}`],
     });
 
     return {
@@ -304,11 +451,20 @@ async function createPostCommentWithFanout(
   return prisma.$transaction(async (tx) => {
     const post = await tx.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
 
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId, tx as any))) {
       return null;
+    }
+    if (parentId) {
+      const parentComment = await tx.post_comments.findFirst({
+        where: { id: parentId, postId },
+        select: { id: true },
+      });
+      if (!parentComment) {
+        throw new Error('POST_COMMENT_PARENT_NOT_FOUND');
+      }
     }
 
     const comment = await tx.post_comments.create({
@@ -350,11 +506,14 @@ async function createPostCommentWithFanout(
       createdAt: comment.createdAt,
       updatedAt: comment.updatedAt,
     };
+    const postRooms = String(post.visibility || '').toLowerCase() === 'public'
+      ? [feedRealtimeRoom, `post:${postId}`]
+      : [`post:${postId}`];
 
     const envelopes: Array<Record<string, unknown>> = [
       {
         event: 'comment:created',
-        rooms: [feedRealtimeRoom, `post:${postId}`],
+        rooms: postRooms,
         payload: {
           postId,
           comment: mappedComment,
@@ -386,7 +545,7 @@ async function createPostCommentWithFanout(
       aggregateType: 'post',
       aggregateId: postId,
       eventType: 'post.comment.cache.invalidate',
-      tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+      tags: ['feed:global', `feed:${post.authorId}`, `user:${post.authorId}`],
     });
 
     return { mappedComment, commentsCount };
@@ -404,10 +563,14 @@ async function toggleCommentLikeWithFanout(
   return prisma.$transaction(async (tx) => {
     const comment = await tx.post_comments.findUnique({
       where: { id: commentId },
-      select: { id: true, postId: true },
+      select: {
+        id: true,
+        postId: true,
+        posts: { select: { authorId: true, visibility: true, isActive: true } },
+      },
     });
 
-    if (!comment || comment.postId !== postId) {
+    if (!comment || comment.postId !== postId || !(await canViewPost(comment.posts, userId, tx as any))) {
       return null;
     }
 
@@ -467,10 +630,10 @@ async function votePollWithFanout(
   return prisma.$transaction(async (tx) => {
     const post = await tx.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true, metadata: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true, metadata: true },
     });
 
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId, tx as any))) {
       return null;
     }
 
@@ -514,6 +677,9 @@ async function votePollWithFanout(
     });
 
     const responseOptions = mapPollOptionsForResponse(updatedOptions, optionId);
+    const postRooms = String(post.visibility || '').toLowerCase() === 'public'
+      ? [feedRealtimeRoom, `post:${postId}`]
+      : [`post:${postId}`];
 
     await enqueueRealtimeFanout(tx as any, {
       aggregateType: 'post',
@@ -522,7 +688,7 @@ async function votePollWithFanout(
       envelopes: [
         {
           event: 'poll:updated',
-          rooms: [feedRealtimeRoom, `post:${postId}`],
+          rooms: postRooms,
           payload: {
             postId,
             voterId: userId,
@@ -537,7 +703,7 @@ async function votePollWithFanout(
       aggregateType: 'post',
       aggregateId: postId,
       eventType: 'post.poll.cache.invalidate',
-      tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+      tags: ['feed:global', `feed:${post.authorId}`, `user:${post.authorId}`],
     });
 
     return responseOptions as any;
@@ -554,10 +720,10 @@ async function toggleReelLikeWithFanout(
   return prisma.$transaction(async (tx) => {
     const reel = await tx.reels.findUnique({
       where: { id: reelId },
-      select: { id: true, authorId: true },
+      select: { id: true, authorId: true, visibility: true, status: true, publishedAt: true },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId, {}, tx as any))) {
       return null;
     }
 
@@ -630,14 +796,23 @@ async function createReelCommentWithFanout(
   return prisma.$transaction(async (tx) => {
     const reel = await tx.reels.findUnique({
       where: { id: reelId },
-      select: { id: true, authorId: true, allowComments: true },
+      select: { id: true, authorId: true, visibility: true, status: true, publishedAt: true, allowComments: true },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId, {}, tx as any))) {
       return null;
     }
     if (!reel.allowComments) {
       throw new Error('REEL_COMMENTS_DISABLED');
+    }
+    if (parentId) {
+      const parentComment = await tx.reel_comments.findFirst({
+        where: { id: parentId, reelId },
+        select: { id: true },
+      });
+      if (!parentComment) {
+        throw new Error('REEL_COMMENT_PARENT_NOT_FOUND');
+      }
     }
 
     const comment = await tx.reel_comments.create({
@@ -704,45 +879,105 @@ async function createReelCommentWithFanout(
   });
 }
 
+io.use(async (socket, next) => {
+  const token = getSocketHandshakeToken(socket);
+  if (!token) {
+    next();
+    return;
+  }
+
+  try {
+    const decoded = await verifySocketAccessToken(token);
+    socket.data.userId = String(decoded.userId);
+    socket.data.sessionId = decoded.sessionId;
+    next();
+  } catch (error) {
+    const authError = error instanceof Error ? error.message : 'Socket authentication failed';
+    const socketError = new Error(authError);
+    (socketError as any).data = {
+      code: authError === 'Session is no longer active' ? 'session_inactive' : 'unauthorized',
+    };
+    next(socketError);
+  }
+});
+
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
   console.log(`🔌 Socket connected: ${socket.id}`);
 
-  // Handle authentication
-  const token = socket.handshake.auth?.token;
-  let userId: string | null = null;
+  socket.use((packet, next) => {
+    const [eventName, payload] = packet;
+    const event = String(eventName || '');
 
-  if (token) {
-    try {
-      const decoded = await verifyAccessToken(token);
-      userId = String(decoded.userId);
-      
-      // Track socket-user mapping
-      socketUsers.set(socket.id, userId);
-      const wasOffline = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
-      if (!userSockets.has(userId)) {
-        userSockets.set(userId, new Set());
+    if (event === 'agent:voice_audio_chunk') {
+      const audioBase64 = typeof payload?.audioBase64 === 'string' ? payload.audioBase64 : '';
+      if (!audioBase64 || audioBase64.length > 256 * 1024 || !/^[a-zA-Z0-9+/=]+$/.test(audioBase64)) {
+        socket.emit('error', { message: 'Invalid voice audio chunk' });
+        next(new Error('Invalid voice audio chunk'));
+        return;
       }
-      userSockets.get(userId)!.add(socket.id);
-      
-      // Join user's personal room for notifications
-      socket.join(`user:${userId}`);
-
-      if (wasOffline) {
-        prisma.user.update({
-          where: { id: userId },
-          data: { isOnline: true, lastActiveAt: new Date() },
-        }).catch((error) => {
-          console.error('Failed to mark socket user online:', error);
-        });
-        socket.broadcast.emit('user:online', { userId });
-      }
-      
-      console.log(`✅ Socket ${socket.id} authenticated as user ${userId}`);
-    } catch (error) {
-      console.error('Socket auth failed:', error);
+      next();
+      return;
     }
+
+    if (payload !== undefined) {
+      const result = sanitizeInputTree(payload, {
+        location: 'body',
+        maxDepth: 6,
+        maxStringLength: 4_000,
+      });
+      if (!result.ok) {
+        socket.emit('error', { message: result.error || 'Invalid socket payload' });
+        next(new Error(result.error || 'Invalid socket payload'));
+        return;
+      }
+
+      if (
+        (event.startsWith('agent:') || event.includes('message') || event.includes('comment'))
+        && typeof result.value === 'object'
+        && result.value !== null
+        && JSON.stringify(result.value).length <= 10_000
+        && containsPromptInjection(JSON.stringify(result.value))
+      ) {
+        socket.emit('error', { message: 'Unsafe prompt-injection instructions are not allowed' });
+        next(new Error('Unsafe prompt-injection instructions are not allowed'));
+        return;
+      }
+
+      packet[1] = result.value;
+    }
+
+    next();
+  });
+
+  // Handle authenticated sockets. Invalid tokens are rejected in io.use above.
+  const userId = socket.data?.userId ? String(socket.data.userId) : null;
+  if (userId) {
+    socketUsers.set(socket.id, userId);
+    const wasOffline = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
+    if (!userSockets.has(userId)) {
+      userSockets.set(userId, new Set());
+    }
+    userSockets.get(userId)!.add(socket.id);
+
+    // Join user's personal room for notifications
+    socket.join(`user:${userId}`);
+    socket.emit('socket:authenticated', { userId });
+
+    if (wasOffline) {
+      prisma.user.update({
+        where: { id: userId },
+        data: { isOnline: true, lastActiveAt: new Date() },
+      }).catch((error) => {
+        console.error('Failed to mark socket user online:', error);
+      });
+      socket.broadcast.emit('user:online', { userId });
+    }
+
+    console.log(`✅ Socket ${socket.id} authenticated as user ${userId}`);
   }
+
+  registerArcadeSocketHandlers({ io, socket, getSocketUserId });
 
   socket.on('agent:join_session', ({ sessionId }) => {
     const authenticatedUserId = getSocketUserId(socket);
@@ -799,6 +1034,7 @@ io.on('connection', async (socket) => {
           typeof payload?.allowAutonomousActions === 'boolean'
             ? payload.allowAutonomousActions
             : undefined,
+        autonomyMode: typeof payload?.autonomyMode === 'string' ? payload.autonomyMode : undefined,
       });
     } catch (error) {
       socket.emit('agent:voice_error', {
@@ -834,6 +1070,7 @@ io.on('connection', async (socket) => {
           typeof payload?.allowAutonomousActions === 'boolean'
             ? payload.allowAutonomousActions
             : undefined,
+        autonomyMode: typeof payload?.autonomyMode === 'string' ? payload.autonomyMode : undefined,
       });
     } catch (error) {
       socket.emit('agent:voice_error', {
@@ -865,8 +1102,24 @@ io.on('connection', async (socket) => {
   });
 
   // Post room events
-  socket.on('post:join', ({ postId }) => {
-    socket.join(`post:${postId}`);
+  socket.on('post:join', async ({ postId }) => {
+    const viewerId = getSocketUserId(socket);
+    if (!postId) return;
+
+    try {
+      const post = await prisma.post.findFirst({
+        where: { id: postId, isActive: true },
+        select: { authorId: true, visibility: true, isActive: true },
+      });
+      if (!post || !(await canViewPost(post, viewerId))) {
+        socket.emit('error', { message: 'Post not found' });
+        return;
+      }
+      socket.join(`post:${postId}`);
+    } catch (error) {
+      console.error('post:join error:', error);
+      socket.emit('error', { message: 'Failed to join post' });
+    }
   });
 
   socket.on('post:leave', ({ postId }) => {
@@ -945,6 +1198,10 @@ io.on('connection', async (socket) => {
       console.log(`Comment created on post ${postId} by user ${userId}`);
     } catch (error) {
       console.error('post:comment error:', error);
+      if (error instanceof Error && error.message === 'POST_COMMENT_PARENT_NOT_FOUND') {
+        socket.emit('error', { message: 'Parent comment not found' });
+        return;
+      }
       socket.emit('error', { message: 'Failed to create comment' });
     }
   });
@@ -1064,7 +1321,17 @@ io.on('connection', async (socket) => {
     }
 
     try {
-      const { conversationId, content, contentType, mediaUrl, mediaType, fileName, fileSize, replyToId } = data;
+      const {
+        conversationId,
+        content,
+        contentType,
+        mediaUrl,
+        mediaType,
+        fileName,
+        fileSize,
+        replyToId,
+      } = data;
+      const clientMessageId = normalizeClientMessageId(data?.clientMessageId);
       if (!conversationId || (!content && !mediaUrl)) {
         failSend('Content or media is required');
         return;
@@ -1089,11 +1356,63 @@ io.on('connection', async (socket) => {
       const receiverId = conversation.participant1Id === senderId
         ? conversation.participant2Id
         : conversation.participant1Id;
+      const sender = await prisma.user.findUnique({
+        where: { id: senderId },
+        select: chatUserSelect,
+      });
+
+      if (clientMessageId) {
+        const existingMessage = await prisma.messages.findFirst({
+          where: {
+            conversationId,
+            senderId,
+            clientMessageId,
+          },
+          include: {
+            message_reactions: true,
+            messages: {
+              select: {
+                id: true,
+                content: true,
+                contentType: true,
+                senderId: true,
+              },
+            },
+          },
+        });
+
+        if (existingMessage) {
+          const existingPayload = mapSocketChatMessagePayload(existingMessage, sender);
+          emitToUser(senderId, 'chat:new_message', {
+            conversationId,
+            message: existingPayload,
+          });
+          emitToUser(receiverId, 'chat:new_message', {
+            conversationId,
+            message: existingPayload,
+          });
+          acknowledge?.({ ok: true, message: existingPayload });
+          return;
+        }
+      }
+
+      const replyMessageId = replyToId ? String(replyToId).trim() : null;
+      const replyToMessage = replyMessageId
+        ? await prisma.messages.findFirst({
+            where: { id: replyMessageId, conversationId, isDeleted: false },
+            select: { id: true, content: true, contentType: true, senderId: true },
+          })
+        : null;
+      if (replyMessageId && !replyToMessage) {
+        failSend('Reply target is invalid for this conversation');
+        return;
+      }
 
       // Create message in database
       const message = await prisma.messages.create({
         data: {
           id: randomUUID(),
+          clientMessageId,
           conversationId,
           senderId,
           receiverId,
@@ -1103,7 +1422,7 @@ io.on('connection', async (socket) => {
           mediaType,
           fileName,
           fileSize,
-          replyToId,
+          replyToId: replyMessageId || undefined,
           status: 'SENT',
           updatedAt: new Date(),
         },
@@ -1125,53 +1444,29 @@ io.on('connection', async (socket) => {
         data: { lastMessageAt: new Date(), updatedAt: new Date() },
       });
 
-      // Get sender info
-      const sender = await prisma.user.findUnique({
-        where: { id: senderId },
-        select: chatUserSelect,
-      });
-
-      const messagePayload = {
-        id: message.id,
-        conversationId: message.conversationId,
-        senderId: message.senderId,
-        receiverId: message.receiverId,
-        content: message.content,
-        contentType: message.contentType,
-        mediaUrl: message.mediaUrl,
-        mediaType: message.mediaType,
-        fileName: message.fileName,
-        fileSize: message.fileSize,
-        status: message.status,
-        deliveredAt: message.deliveredAt?.toISOString(),
-        readAt: message.readAt?.toISOString(),
-        isDeleted: message.isDeleted,
-        replyToId: message.replyToId,
-        replyTo: (message as typeof message & { messages: unknown }).messages,
-        sender,
-        reactions: [],
-        createdAt: message.createdAt.toISOString(),
-        updatedAt: message.updatedAt.toISOString(),
-      };
-
-      // Broadcast to conversation room
-      io.to(`chat:${conversationId}`).emit('chat:new_message', {
-        conversationId,
-        message: messagePayload,
-      });
+      const messagePayload = mapSocketChatMessagePayload(message, sender, clientMessageId);
 
       emitToUser(senderId, 'chat:new_message', {
         conversationId,
         message: messagePayload,
       });
 
-      // Also emit to receiver's personal room (for notifications when not in chat)
+      // Also emit the canonical message event to the receiver's personal room.
+      // This keeps mobile clients live even if they have not joined the chat room yet.
+      emitToUser(receiverId, 'chat:new_message', {
+        conversationId,
+        message: messagePayload,
+      });
+
+      // Emit a notification event too, so clients can show out-of-thread alerts.
       emitToUser(receiverId, 'chat:notification', {
         type: 'new_message',
         conversationId,
         message: messagePayload,
         sender,
       });
+
+      acknowledge?.({ ok: true, message: messagePayload });
 
       if (sender) {
         const preview = content ? (content.length > 100 ? content.substring(0, 97) + '...' : content) : 'Sent you a message';
@@ -1181,7 +1476,19 @@ io.on('connection', async (socket) => {
           preview,
           conversationId,
           senderId,
-          sender.profileImage || undefined
+          sender.profileImage || undefined,
+          {
+            id: messagePayload.id,
+            clientMessageId: messagePayload.clientMessageId,
+            content: messagePayload.content,
+            contentType: messagePayload.contentType,
+            mediaUrl: messagePayload.mediaUrl,
+            mediaType: messagePayload.mediaType,
+            fileName: messagePayload.fileName,
+            fileSize: messagePayload.fileSize,
+            createdAt: messagePayload.createdAt,
+            updatedAt: messagePayload.updatedAt,
+          }
         ).catch(console.error);
       }
 
@@ -1190,7 +1497,6 @@ io.on('connection', async (socket) => {
       updateEngagementStreak(senderId, 'messaging').catch(console.error);
 
       console.log(`Message sent in conversation ${conversationId} by user ${senderId}`);
-      acknowledge?.({ ok: true, message: messagePayload });
     } catch (error) {
       console.error('chat:send_message error:', error);
       failSend('Failed to send message');
@@ -1268,7 +1574,7 @@ io.on('connection', async (socket) => {
   });
 
   // Delete message
-  socket.on('chat:delete_message', async ({ messageId, conversationId, forEveryone }) => {
+  socket.on('chat:delete_message', async ({ messageId, forEveryone }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
 
@@ -1282,6 +1588,7 @@ io.on('connection', async (socket) => {
         return;
       }
 
+      const actualConversationId = message.conversationId;
       if (forEveryone) {
         await prisma.messages.update({
           where: { id: messageId },
@@ -1294,9 +1601,9 @@ io.on('connection', async (socket) => {
       }
 
       // Broadcast deletion
-      io.to(`chat:${conversationId}`).emit('chat:message_deleted', {
+      io.to(`chat:${actualConversationId}`).emit('chat:message_deleted', {
         messageId,
-        conversationId,
+        conversationId: actualConversationId,
         deletedBy: userId,
         forEveryone,
       });
@@ -1306,7 +1613,7 @@ io.on('connection', async (socket) => {
   });
 
   // Edit message
-  socket.on('chat:edit_message', async ({ messageId, conversationId, content }) => {
+  socket.on('chat:edit_message', async ({ messageId, content }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
 
@@ -1319,6 +1626,10 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Cannot edit this message' });
         return;
       }
+      if (message.isDeleted) {
+        socket.emit('error', { message: 'Cannot edit this message' });
+        return;
+      }
 
       const updated = await prisma.messages.update({
         where: { id: messageId },
@@ -1326,9 +1637,9 @@ io.on('connection', async (socket) => {
       });
 
       // Broadcast edit
-      io.to(`chat:${conversationId}`).emit('chat:message_edited', {
+      io.to(`chat:${message.conversationId}`).emit('chat:message_edited', {
         messageId,
-        conversationId,
+        conversationId: message.conversationId,
         content,
         editedAt: updated.updatedAt,
       });
@@ -1338,11 +1649,25 @@ io.on('connection', async (socket) => {
   });
 
   // React to message
-  socket.on('chat:react', async ({ messageId, conversationId, emoji }) => {
+  socket.on('chat:react', async ({ messageId, emoji }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
+    if (!emoji) {
+      socket.emit('error', { message: 'Emoji is required' });
+      return;
+    }
 
     try {
+      const message = await prisma.messages.findUnique({
+        where: { id: messageId },
+        select: { id: true, conversationId: true, senderId: true, receiverId: true, isDeleted: true },
+      });
+      if (!message || message.isDeleted || (message.senderId !== userId && message.receiverId !== userId)) {
+        socket.emit('error', { message: 'Message not found' });
+        return;
+      }
+      const conversationId = message.conversationId;
+
       const existingReaction = await prisma.message_reactions.findUnique({
         where: {
           messageId_userId: { messageId, userId },
@@ -1452,6 +1777,9 @@ io.on('connection', async (socket) => {
   socket.on('group:typing', async ({ groupId, isTyping }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
+    if (!groupId || !socket.rooms.has(`group:${groupId}`)) {
+      return;
+    }
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -1506,6 +1834,17 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Group not found' });
         return;
       }
+      const replyMessageId = replyToId ? String(replyToId).trim() : null;
+      const replyMessage = replyMessageId
+        ? await prisma.group_messages.findFirst({
+            where: { id: replyMessageId, groupId, isDeleted: false },
+            select: { id: true, content: true, senderId: true },
+          })
+        : null;
+      if (replyMessageId && !replyMessage) {
+        socket.emit('error', { message: 'Reply target is not in this group' });
+        return;
+      }
 
       // Create message in database
       const message = await prisma.group_messages.create({
@@ -1519,7 +1858,7 @@ io.on('connection', async (socket) => {
           mediaType,
           fileName,
           fileSize,
-          replyToId,
+          replyToId: replyMessageId || undefined,
           updatedAt: new Date(),
         },
         include: {
@@ -1548,7 +1887,7 @@ io.on('connection', async (socket) => {
         fileName: message.fileName,
         fileSize: message.fileSize,
         replyToId: message.replyToId,
-        replyTo: (message as typeof message & { group_messages: unknown }).group_messages,
+        replyTo: (message as typeof message & { group_messages: unknown }).group_messages || replyMessage,
         reactions: [],
         createdAt: message.createdAt.toISOString(),
         updatedAt: message.updatedAt.toISOString(),
@@ -1590,12 +1929,55 @@ io.on('connection', async (socket) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
 
-    // Broadcast deletion
-    io.to(`group:${groupId}`).emit('group:message_deleted', {
-      groupId,
-      messageId,
-      deletedBy: userId,
-    });
+    try {
+      const message = await prisma.group_messages.findUnique({
+        where: { id: messageId },
+        select: {
+          id: true,
+          groupId: true,
+          senderId: true,
+          isDeleted: true,
+          groups: { select: { creatorId: true } },
+        },
+      });
+
+      if (!message || (groupId && message.groupId !== groupId)) {
+        socket.emit('error', { message: 'Message not found' });
+        return;
+      }
+
+      const membership = await prisma.group_members.findUnique({
+        where: { groupId_userId: { groupId: message.groupId, userId } },
+        select: { role: true },
+      });
+      if (!membership) {
+        socket.emit('error', { message: 'Not a member of this group' });
+        return;
+      }
+
+      const role = message.groups.creatorId === userId ? 'owner' : String(membership.role || '').toLowerCase();
+      const canModerate = ['owner', 'admin', 'moderator'].includes(role);
+      if (message.senderId !== userId && !canModerate) {
+        socket.emit('error', { message: 'Cannot delete this message' });
+        return;
+      }
+
+      if (!message.isDeleted) {
+        await prisma.group_messages.update({
+          where: { id: messageId },
+          data: { isDeleted: true, content: '', updatedAt: new Date() },
+        });
+      }
+
+      io.to(`group:${message.groupId}`).emit('group:message_deleted', {
+        groupId: message.groupId,
+        messageId,
+        deletedBy: userId,
+      });
+    } catch (error) {
+      console.error('group:delete_message error:', error);
+      socket.emit('error', { message: 'Failed to delete group message' });
+    }
   });
 
   // ============================================
@@ -1603,8 +1985,24 @@ io.on('connection', async (socket) => {
   // ============================================
 
   // Join reel room (for live engagement updates)
-  socket.on('reel:join', ({ reelId }) => {
-    socket.join(`reel:${reelId}`);
+  socket.on('reel:join', async ({ reelId }) => {
+    const viewerId = getSocketUserId(socket);
+    if (!reelId) return;
+
+    try {
+      const reel = await prisma.reels.findUnique({
+        where: { id: reelId },
+        select: { authorId: true, visibility: true, status: true, publishedAt: true },
+      });
+      if (!reel || !(await canViewReel(reel, viewerId))) {
+        socket.emit('error', { message: 'Reel not found' });
+        return;
+      }
+      socket.join(`reel:${reelId}`);
+    } catch (error) {
+      console.error('reel:join error:', error);
+      socket.emit('error', { message: 'Failed to join reel' });
+    }
   });
 
   // Leave reel room
@@ -1660,6 +2058,10 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Comments are disabled' });
         return;
       }
+      if (message === 'REEL_COMMENT_PARENT_NOT_FOUND') {
+        socket.emit('error', { message: 'Parent comment not found' });
+        return;
+      }
       socket.emit('error', { message: 'Failed to comment on reel' });
     }
   });
@@ -1676,9 +2078,9 @@ io.on('connection', async (socket) => {
     try {
       const story = await prisma.stories.findFirst({
         where: { id: storyId, expiresAt: { gt: new Date() } },
-        select: { id: true, authorId: true, viewsCount: true },
+        select: { id: true, authorId: true, visibility: true, expiresAt: true, viewsCount: true },
       });
-      if (!story) return;
+      if (!story || !(await canViewStory(story, viewerUserId))) return;
 
       // Don't count own views
       if (story.authorId === viewerUserId) return;
@@ -1767,36 +2169,6 @@ io.on('connection', async (socket) => {
   });
 });
 
-// Middleware — add comma-separated origins via CORS_EXTRA_ORIGINS (e.g. admin on Vercel)
-const defaultAllowedOrigins = [
-  'http://localhost:3001',
-  'http://localhost:3000',
-  'http://127.0.0.1:3001',
-  'http://127.0.0.1:3000',
-  'https://vormex.in',
-  'https://www.vormex.in',
-];
-const extraOrigins = (process.env.CORS_EXTRA_ORIGINS || '')
-  .split(',')
-  .map((s) => s.trim().replace(/\/$/, ''))
-  .filter(Boolean);
-const allowedOrigins = [...defaultAllowedOrigins, ...extraOrigins];
-const generalApiRateLimit = createRateLimitMiddleware((req) => [
-  {
-    keyPrefix: 'rate:ip:api',
-    limit: 120,
-    windowSeconds: 60,
-  },
-  ...(req.user?.userId
-    ? [
-        {
-          keyPrefix: 'rate:user:api',
-          limit: 600,
-          windowSeconds: 60,
-        },
-      ]
-    : []),
-]);
 const DEFAULT_REQUEST_MAX_BYTES = 5 * 1024 * 1024;
 const IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 const STORY_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
@@ -1845,20 +2217,20 @@ app.use(requestSizeGuard(getRequestMaxBytes));
 app.use(compression());
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
-    // Allow local network IPs (e.g. 172.20.10.3:3000, 192.168.x.x:3000)
-    if (/^https?:\/\/(172\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}):(3000|3001)$/.test(origin)) {
-      callback(null, true);
-      return;
-    }
-    callback(null, false);
+    callback(null, isAllowedRequestOrigin(origin));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-CSRF-Token',
+    'X-Auth-Token-Transport',
+    'X-Firebase-AppCheck',
+    'X-Vormex-Client',
+    'X-Vormex-App-Version',
+    'X-Vormex-App-Build',
+  ],
 }));
 
 app.use(express.json({
@@ -1868,6 +2240,7 @@ app.use(express.json({
   },
 }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use('/api', validateRequestInput);
 
 /**
  * Health check endpoint
@@ -1883,12 +2256,14 @@ app.get('/api/health/live', async (_req: Request, res: Response): Promise<void> 
 app.get('/api/health/ready', async (_req: Request, res: Response): Promise<void> => {
   try {
     await prisma.$queryRaw`SELECT 1`;
+    const redisHealth = await getRedisHealth();
+    const redisReady = redisHealth.status === 'connected' || redisHealth.status === 'disabled';
 
-    res.status(200).json({
-      status: 'ok',
+    res.status(redisReady ? 200 : 503).json({
+      status: redisReady ? 'ok' : 'error',
       timestamp: Date.now(),
       database: 'connected',
-      redis: isRedisEnabled() ? 'configured' : 'disabled',
+      redis: redisHealth,
     });
   } catch (error) {
     console.error('Readiness check failed:', error);
@@ -1896,6 +2271,11 @@ app.get('/api/health/ready', async (_req: Request, res: Response): Promise<void>
       status: 'error',
       timestamp: Date.now(),
       database: 'disconnected',
+      redis: await getRedisHealth().catch(() => ({
+        required: process.env.NODE_ENV === 'production',
+        enabled: isRedisEnabled(),
+        status: 'error',
+      })),
     });
   }
 });
@@ -1928,7 +2308,10 @@ app.get('/metrics', async (_req: Request, res: Response): Promise<void> => {
 
 // API Documentation (Swagger UI)
 setupSwagger(app, PORT);
-app.use('/api', optionalAuth, generalApiRateLimit);
+app.use('/api', optionalAppCheck, botGuard, optionalAuth, generalApiRateLimit);
+app.use('/api/ai/chat', validateAIRequestInput);
+app.use('/api/agent', validateAIRequestInput);
+app.use('/api/talk', validateAIRequestInput);
 
 // API Routes
 app.use('/api/auth', authRoutes);
@@ -1955,6 +2338,9 @@ app.use('/api/accountability', accountabilityRoutes);
 app.use('/api/skills', skillsRoutes);
 app.use('/api/skill-swap', skillSwapRoutes);
 app.use('/api/groups', groupsRoutes);
+app.use('/api/hackathons', hackathonsRoutes);
+app.use('/api/events', eventsRoutes);
+app.use('/api/college-communities', collegeCommunitiesRoutes);
 app.use('/api/circles', circlesRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/games', gamesRoutes);
@@ -1972,6 +2358,7 @@ app.use('/api/interviews', interviewsRoutes);
 app.use('/api/challenges', challengesRoutes);
 app.use('/api/ai/chat', aiChatRoutes);
 app.use('/api/agent', agentRoutes);
+app.use('/api/talk', talkRoutes);
 app.use('/api/devices', devicesRoutes);
 app.use('/api/reels', reelsRoutes);
 app.use('/api/audio', audioRoutes);
@@ -1988,7 +2375,7 @@ const server = httpServer;
 const handleStartupError = async (error: NodeJS.ErrnoException): Promise<void> => {
   if (error.code === 'EADDRINUSE') {
     console.error(`Port ${PORT} is already in use.`);
-    console.error(`Another process is already listening on http://localhost:${PORT}.`);
+    console.error(`Another process is already listening on http://${HOST}:${PORT}.`);
     console.error('Stop that process or run the backend on a different port, for example:');
     console.error('  PORT=5001 npm run dev');
   } else {
@@ -2011,19 +2398,33 @@ const onStartupError = (error: NodeJS.ErrnoException): void => {
 
 server.once('error', onStartupError);
 
-// Start server
-server.listen(PORT, (): void => {
-  server.removeListener('error', onStartupError);
+async function startServer(): Promise<void> {
+  try {
+    await redisStartupPromise;
+  } catch (error) {
+    console.error('Failed to initialize Redis realtime infrastructure:', error);
+    if (isRedisRequired()) {
+      await disconnectPrisma();
+      process.exit(1);
+    }
+  }
 
-  console.log(`
+  server.listen(Number(PORT), HOST, (): void => {
+    server.removeListener('error', onStartupError);
+
+    console.log(`
 🚀 Server is running!
 📍 Environment: ${process.env.NODE_ENV || 'development'}
-🌐 Server URL: http://localhost:${PORT}
-📊 Health Check: http://localhost:${PORT}/api/health
-📚 API Docs: http://localhost:${PORT}/api-docs
-🔌 WebSocket: ws://localhost:${PORT}
+🌐 Server URL: http://${HOST}:${PORT}
+📊 Health Check: http://${HOST}:${PORT}/api/health
+📚 API Docs: http://${HOST}:${PORT}/api-docs
+🔌 WebSocket: ws://${HOST}:${PORT}
   `);
-});
+  });
+}
+
+// Start server
+void startServer();
 
 // Graceful shutdown
 const gracefulShutdown = async (signal: string): Promise<void> => {

@@ -18,6 +18,7 @@ import {
   mapPostTypeToFrontend,
   normalizeUrl,
 } from '../utils/post.util';
+import { buildPostVisibilityWhere } from '../utils/access-control.util';
 
 const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -25,6 +26,30 @@ function isProfileUserOnline(user: { isOnline?: boolean | null; lastActiveAt?: D
   if (user.isOnline) return true;
   if (!user.lastActiveAt) return false;
   return Date.now() - user.lastActiveAt.getTime() < PROFILE_ONLINE_WINDOW_MS;
+}
+
+async function backfillGitHubContributionCalendar(
+  user: {
+    githubConnected?: boolean | null;
+    githubAccessToken?: string | null;
+    githubUsername?: string | null;
+  },
+  targetUserId: string
+): Promise<void> {
+  if (!user.githubConnected || !user.githubAccessToken || !user.githubUsername) {
+    return;
+  }
+
+  const accessToken = decryptToken(user.githubAccessToken);
+  const contributionCalendar = await getGitHubContributionCalendar(
+    user.githubUsername,
+    accessToken
+  );
+  await prisma.gitHubStats.update({
+    where: { userId: targetUserId },
+    data: { contributionData: contributionCalendar as any },
+  });
+  await cacheService.invalidateTags(`user:${targetUserId}`);
 }
 
 /**
@@ -181,10 +206,11 @@ export async function getUnifiedContentFeed(
   userId: string,
   page: number = 1,
   limit: number = 20,
-  filter?: 'all' | 'posts' | 'articles' | 'forum' | 'videos'
+  filter?: 'all' | 'posts' | 'articles' | 'forum' | 'videos',
+  requestingUserId?: string | null
 ): Promise<UnifiedFeedResponse> {
   try {
-    const cacheKey = `profile:feed:${userId}:${filter || 'all'}:${page}:${limit}`;
+    const cacheKey = `profile:feed:${requestingUserId || 'anon'}:${userId}:${filter || 'all'}:${page}:${limit}`;
     if (page === 1) {
       const cached = await cacheService.get<UnifiedFeedResponse>(cacheKey);
       if (cached) {
@@ -241,6 +267,7 @@ export async function getUnifiedContentFeed(
       try {
         const postModel = (prisma as any).post;
         if (postModel) {
+          const accessWhere = await buildPostVisibilityWhere(requestingUserId);
           const postTypeFilter =
             filter === 'posts'
               ? { in: ['text', 'image', 'link', 'poll', 'celebration', 'document', 'mixed'] }
@@ -248,9 +275,26 @@ export async function getUnifiedContentFeed(
 
           const posts = await postModel.findMany({
             where: {
-              authorId: userId,
-              isActive: true,
-              type: postTypeFilter,
+              AND: [
+                {
+                  OR: [
+                    { authorId: userId },
+                    {
+                      collaborators: {
+                        some: {
+                          userId,
+                          status: 'accepted',
+                        },
+                      },
+                    },
+                  ],
+                },
+                {
+                  isActive: true,
+                  type: postTypeFilter,
+                },
+                accessWhere,
+              ],
             },
             orderBy: { createdAt: 'desc' },
             take: 100,
@@ -271,11 +315,29 @@ export async function getUnifiedContentFeed(
       try {
         const postModel = (prisma as any).post;
         if (postModel) {
+          const accessWhere = await buildPostVisibilityWhere(requestingUserId);
           const articles = await postModel.findMany({
             where: {
-              authorId: userId,
-              isActive: true,
-              type: 'article',
+              AND: [
+                {
+                  OR: [
+                    { authorId: userId },
+                    {
+                      collaborators: {
+                        some: {
+                          userId,
+                          status: 'accepted',
+                        },
+                      },
+                    },
+                  ],
+                },
+                {
+                  isActive: true,
+                  type: 'article',
+                },
+                accessWhere,
+              ],
             },
             orderBy: { createdAt: 'desc' },
             take: 100,
@@ -455,7 +517,7 @@ export async function getFullProfile(
       })),
 
       // Recent activity feed (first 20 items)
-      getUnifiedContentFeed(targetUserId, 1, 20, 'all').catch(() => ({
+      getUnifiedContentFeed(targetUserId, 1, 20, 'all', requestingUserId).catch(() => ({
         items: [],
         totalCount: 0,
         hasMore: false,
@@ -594,22 +656,12 @@ export async function getFullProfile(
       user.githubUsername &&
       githubStats
     ) {
-      try {
-        const accessToken = decryptToken(user.githubAccessToken);
-        contributionCalendar = await getGitHubContributionCalendar(
-          user.githubUsername,
-          accessToken
-        );
-        await prisma.gitHubStats.update({
-          where: { userId: targetUserId },
-          data: { contributionData: contributionCalendar as any },
-        });
-      } catch (error) {
+      void backfillGitHubContributionCalendar(user, targetUserId).catch((error) => {
         console.warn(
           `Failed to backfill GitHub contribution calendar for ${targetUserId}:`,
           error instanceof Error ? error.message : 'Unknown error'
         );
-      }
+      });
     }
 
     // Build GitHub object

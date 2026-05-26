@@ -22,7 +22,7 @@ The API uses **JSON Web Tokens (JWT)** for authentication. After successful logi
    ```
    Authorization: Bearer <your-jwt-token>
    ```
-3. **Token Expiration:** Tokens expire after **7 days**. Users need to login again after expiration.
+3. **Token Expiration:** Tokens expire after **365 days**. Users need to login again after expiration.
 
 ### Example Request with Authentication
 
@@ -744,9 +744,11 @@ NODE_ENV=development
 DATABASE_URL=postgresql://...
 
 # JWT
-JWT_SECRET=your-secret-key
-JWT_EXPIRES_IN=365d
-AUTH_SESSION_TTL_SECONDS=31536000
+JWT_SECRET=replace-with-at-least-32-random-bytes
+AUTH_CSRF_SECRET=replace-with-a-different-32-byte-random-secret
+AUTH_ACCESS_TOKEN_TTL=365d
+AUTH_REFRESH_TOKEN_TTL_SECONDS=31536000
+AUTH_PASSWORD_MIN_LENGTH=12
 
 # Google OAuth
 GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
@@ -818,7 +820,7 @@ For API support or questions:
 
 1. **Always use HTTPS in production** - Never send tokens over unencrypted connections
 2. **Store tokens securely** - Use secure storage (not localStorage for sensitive apps)
-3. **Token expiration** - Tokens expire after 7 days; implement token refresh logic
+3. **Token expiration** - Tokens expire after 365 days; implement token refresh logic
 4. **Password requirements** - Minimum 8 characters (enforced by backend)
 5. **Email verification** - **Required** for email/password users before login. Google OAuth users are auto-verified.
 6. **OAuth tokens** - Google ID tokens are verified server-side; never trust client-side tokens

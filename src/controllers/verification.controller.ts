@@ -1,16 +1,18 @@
 import { Request, Response } from 'express';
-import crypto from 'node:crypto';
-import bcrypt from 'bcryptjs';
 import { prisma } from '../config/prisma';
+import { sendVerificationEmail } from '../utils/email.util';
 import {
-  isEmailServiceUnavailableError,
-  sendVerificationEmail,
-} from '../utils/email.util';
+  generateOpaqueToken,
+  hashOpaqueToken,
+  isLikelyOpaqueToken,
+  verifyLegacyBcryptToken,
+} from '../utils/auth-security.util';
 import {
   ResendVerificationRequestBody,
   ErrorResponse,
   SuccessMessageResponse,
 } from '../types/auth.types';
+import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.service';
 
 /**
  * Email validation regex
@@ -18,14 +20,40 @@ import {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * Hash token rounds (same as password reset)
- */
-const SALT_ROUNDS = 10;
-
-/**
  * Verification token expiry time (24 hours in milliseconds)
  */
 const VERIFICATION_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
+
+async function findUserByVerificationToken(token: string) {
+  const now = new Date();
+  const tokenHash = hashOpaqueToken(token);
+  const user = await prisma.user.findFirst({
+    where: {
+      verificationToken: tokenHash,
+      verificationTokenExpiry: { gt: now },
+    },
+  });
+
+  if (user) {
+    return user;
+  }
+
+  const usersWithLegacyVerificationTokens = await prisma.user.findMany({
+    where: {
+      verificationToken: { startsWith: '$2' },
+      verificationTokenExpiry: { gt: now },
+    },
+    take: 100,
+  });
+
+  for (const legacyUser of usersWithLegacyVerificationTokens) {
+    if (await verifyLegacyBcryptToken(token, legacyUser.verificationToken)) {
+      return legacyUser;
+    }
+  }
+
+  return null;
+}
 
 /**
  * Verify Email - Verify user's email address with token
@@ -60,27 +88,14 @@ export const verifyEmail = async (
       return;
     }
 
-    // Hash the received token to compare with stored hash
-    // Find all users with verification tokens that haven't expired
-    const usersWithVerificationTokens = await prisma.user.findMany({
-      where: {
-        verificationToken: { not: null },
-        verificationTokenExpiry: { gt: new Date() }, // Not expired
-      },
-    });
-
-    // Find user with matching token
-    let userWithValidToken = null;
-
-    for (const user of usersWithVerificationTokens) {
-      if (user.verificationToken) {
-        const isTokenValid = await bcrypt.compare(trimmedToken, user.verificationToken);
-        if (isTokenValid) {
-          userWithValidToken = user;
-          break;
-        }
-      }
+    if (!isLikelyOpaqueToken(trimmedToken)) {
+      res.status(400).json({
+        error: 'Invalid or expired verification token',
+      });
+      return;
     }
+
+    const userWithValidToken = await findUserByVerificationToken(trimmedToken);
 
     // Check if valid token found
     if (!userWithValidToken) {
@@ -107,6 +122,7 @@ export const verifyEmail = async (
         verificationTokenExpiry: null,
       },
     });
+    await invalidateAuthUserStatus(userWithValidToken.id);
 
     console.log('Email verified successfully for user:', userWithValidToken.email);
 
@@ -163,26 +179,26 @@ export const resendVerification = async (
     // Always return success message (security: don't reveal if email exists)
     // Only proceed if user exists
     if (user) {
-      // Check if already verified
+      // Do not reveal account state for resend requests.
       if (user.isVerified) {
-        res.status(400).json({
-          error: 'Email is already verified',
+        res.status(200).json({
+          message: 'Verification email sent. Please check your inbox.',
         });
         return;
       }
 
       // Skip OAuth users (they're already verified)
       if (user.authProvider !== 'email') {
-        res.status(400).json({
-          error: 'OAuth users do not need email verification',
+        res.status(200).json({
+          message: 'Verification email sent. Please check your inbox.',
         });
         return;
       }
 
       try {
         // Generate new verification token
-        const plainVerificationToken = crypto.randomBytes(32).toString('hex');
-        const hashedVerificationToken = await bcrypt.hash(plainVerificationToken, SALT_ROUNDS);
+        const plainVerificationToken = generateOpaqueToken();
+        const hashedVerificationToken = hashOpaqueToken(plainVerificationToken);
         const verificationTokenExpiry = new Date(Date.now() + VERIFICATION_TOKEN_EXPIRY);
 
         // Update user with new verification token and expiry
@@ -202,16 +218,6 @@ export const resendVerification = async (
         // Log error but still return success message (security)
         console.error('Error processing resend verification request:', error);
 
-        if (isEmailServiceUnavailableError(error)) {
-          res.status(error.statusCode).json({
-            error: error.message,
-            code: error.code,
-            ...(error.retryAfterSeconds
-              ? { retryAfterSeconds: error.retryAfterSeconds }
-              : {}),
-          });
-          return;
-        }
       }
     }
 

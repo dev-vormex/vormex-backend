@@ -231,6 +231,7 @@ export const getFollowers = async (req: AuthRequest, res: Response): Promise<voi
               headline: true,
               college: true,
               isOnline: true,
+              isVerified: true,
             },
           },
         },
@@ -286,6 +287,7 @@ export const getFollowing = async (req: AuthRequest, res: Response): Promise<voi
               headline: true,
               college: true,
               isOnline: true,
+              isVerified: true,
             },
           },
         },
@@ -389,6 +391,7 @@ export const getMutualInfo = async (req: AuthRequest, res: Response): Promise<vo
               headline: true,
               college: true,
               isOnline: true,
+              isVerified: true,
             },
           })
         : [],
@@ -403,6 +406,7 @@ export const getMutualInfo = async (req: AuthRequest, res: Response): Promise<vo
               headline: true,
               college: true,
               isOnline: true,
+              isVerified: true,
             },
           })
         : [],

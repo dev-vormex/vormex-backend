@@ -32,6 +32,12 @@ export type NotificationType =
   | 'post_share'
   | 'recommended_match'
   | 'people_you_know_joined'
+  | 'hackathon_team_match'
+  | 'hackathon_team_application'
+  | 'hackathon_team_application_accepted'
+  | 'hackathon_weekly_digest'
+  | 'skill_endorsement'
+  | 'college_community_joined'
   | 'admin_announcement';
 
 interface CreateNotificationParams {
@@ -54,6 +60,7 @@ const notificationInclude = {
       username: true,
       name: true,
       profileImage: true,
+      isVerified: true,
     },
   },
   posts: {
@@ -622,6 +629,239 @@ class NotificationService {
     });
   }
 
+  async notifyHackathonTeamMatch(
+    userId: string,
+    actorId: string,
+    params: {
+      ownerName: string;
+      hackathonTitle: string;
+      teamId: string;
+      hackathonId: string;
+      skills?: string[];
+    }
+  ): Promise<void> {
+    const skillText = params.skills?.length
+      ? ` for ${params.skills.slice(0, 2).join(', ')}`
+      : '';
+
+    const title = 'Team looking for your skills';
+    const body = `${params.ownerName} is forming a ${params.hackathonTitle} team${skillText}`;
+
+    await this.createNotification({
+      userId,
+      type: 'hackathon_team_match',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        skills: params.skills || [],
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'hackathon_team_match',
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyHackathonTeamApplication(
+    userId: string,
+    actorId: string,
+    params: {
+      applicantName: string;
+      hackathonTitle: string;
+      teamId: string;
+      hackathonId: string;
+      applicationId: string;
+    }
+  ): Promise<void> {
+    const title = 'New teammate application';
+    const body = `${params.applicantName} applied to join your ${params.hackathonTitle} team`;
+
+    await this.createNotification({
+      userId,
+      type: 'hackathon_team_application',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        applicationId: params.applicationId,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'hackathon_team_application',
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        applicationId: params.applicationId,
+        actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyHackathonTeamApplicationAccepted(
+    userId: string,
+    actorId: string,
+    params: {
+      hackathonTitle: string;
+      teamId: string;
+      hackathonId: string;
+      groupId?: string | null;
+    }
+  ): Promise<void> {
+    const title = 'You are on the team';
+    const body = `Your ${params.hackathonTitle} team application was accepted`;
+
+    await this.createNotification({
+      userId,
+      type: 'hackathon_team_application_accepted',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        groupId: params.groupId || null,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'hackathon_team_application_accepted',
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        teamId: params.teamId,
+        groupId: params.groupId || '',
+        actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyHackathonWeeklyDigest(
+    userId: string,
+    count: number,
+    sampleTitles: string[] = []
+  ): Promise<void> {
+    const body = count === 1
+      ? `${sampleTitles[0] || 'A new hackathon'} was posted this week`
+      : `${count} new hackathons were posted this week`;
+
+    const title = 'New hackathons this week';
+
+    await this.createNotification({
+      userId,
+      type: 'hackathon_weekly_digest',
+      title,
+      body,
+      data: {
+        screen: 'hackathons',
+        count,
+        sampleTitles,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'hackathon_weekly_digest',
+        screen: 'hackathons',
+        count: String(count),
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifySkillEndorsement(
+    userId: string,
+    actorId: string,
+    params: {
+      endorserName: string;
+      skillName: string;
+      endorsementId: string;
+    }
+  ): Promise<void> {
+    const title = 'New skill endorsement';
+    const body = `${params.endorserName} endorsed you for ${params.skillName}`;
+
+    await this.createNotification({
+      userId,
+      type: 'skill_endorsement',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'skill_passport',
+        skillName: params.skillName,
+        endorsementId: params.endorsementId,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'skill_endorsement',
+        screen: 'skill_passport',
+        skillName: params.skillName,
+        endorsementId: params.endorsementId,
+        actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyCollegeCommunityJoined(
+    userId: string,
+    actorId: string,
+    params: {
+      memberName: string;
+      college: string;
+      communityId: string;
+      groupId: string;
+    }
+  ): Promise<void> {
+    const title = 'College community grew';
+    const body = `${params.memberName} joined ${params.college}`;
+
+    await this.createNotification({
+      userId,
+      type: 'college_community_joined',
+      title,
+      body,
+      actorId,
+      data: {
+        screen: 'college_communities',
+        communityId: params.communityId,
+        groupId: params.groupId,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'college_community_joined',
+        screen: 'college_communities',
+        communityId: params.communityId,
+        groupId: params.groupId,
+        actorId,
+      },
+    }).catch(() => undefined);
+  }
+
   /**
    * Send notification when someone comments on a post
    */
@@ -715,7 +955,11 @@ class NotificationService {
     mentionerName: string,
     context: 'post' | 'comment' | 'reel' | 'reel_comment',
     referenceId: string,
-    preview: string
+    preview: string,
+    metadata: {
+      commentId?: string;
+      parentCommentId?: string;
+    } = {}
   ): Promise<void> {
     const typeMap = {
       post: 'mention' as NotificationType,
@@ -723,17 +967,82 @@ class NotificationService {
       reel: 'reel_mention' as NotificationType,
       reel_comment: 'reel_mention' as NotificationType,
     };
+    const type = typeMap[context];
+    const isReelContext = context === 'reel' || context === 'reel_comment';
+    const title = '📢 You were mentioned';
+    const body = `${mentionerName} mentioned you: "${preview.slice(0, 50)}${preview.length > 50 ? '...' : ''}"`;
+    const data = {
+      type,
+      screen: isReelContext ? 'reel' : 'post',
+      context,
+      preview,
+      actorId: mentionerId,
+      ...(isReelContext ? { reelId: referenceId } : { postId: referenceId }),
+      ...(metadata.commentId ? { commentId: metadata.commentId } : {}),
+      ...(metadata.parentCommentId ? { parentCommentId: metadata.parentCommentId } : {}),
+    };
 
     await this.createNotification({
       userId: mentionedUserId,
-      type: typeMap[context],
-      title: '📢 You were mentioned',
-      body: `${mentionerName} mentioned you: "${preview.slice(0, 50)}${preview.length > 50 ? '...' : ''}"`,
+      type,
+      title,
+      body,
       actorId: mentionerId,
       postId: context === 'post' || context === 'comment' ? referenceId : undefined,
       reelId: context === 'reel' || context === 'reel_comment' ? referenceId : undefined,
-      data: { context, preview },
+      commentId: metadata.commentId,
+      data,
     });
+
+    pushNotificationService.sendToUser(mentionedUserId, {
+      title,
+      body,
+      data: Object.fromEntries(
+        Object.entries(data)
+          .filter(([, value]) => value !== undefined && value !== null)
+          .map(([key, value]) => [key, String(value)])
+      ),
+    }).catch(() => undefined);
+  }
+
+  async notifyPostCollabInvite(
+    collaboratorUserId: string,
+    inviterId: string,
+    inviterName: string,
+    postId: string,
+    preview: string
+  ): Promise<void> {
+    const title = '🤝 Collab invite';
+    const body = `${inviterName} invited you to collaborate on a post`;
+    const data = {
+      type: 'mention',
+      screen: 'post',
+      context: 'post_collab_invite',
+      collabStatus: 'pending',
+      preview,
+      actorId: inviterId,
+      postId,
+    };
+
+    await this.createNotification({
+      userId: collaboratorUserId,
+      type: 'mention',
+      title,
+      body,
+      actorId: inviterId,
+      postId,
+      data,
+    });
+
+    pushNotificationService.sendToUser(collaboratorUserId, {
+      title,
+      body,
+      data: Object.fromEntries(
+        Object.entries(data)
+          .filter(([, value]) => value !== undefined && value !== null)
+          .map(([key, value]) => [key, String(value)])
+      ),
+    }).catch(() => undefined);
   }
 
   /**
@@ -787,16 +1096,34 @@ class NotificationService {
     commentId: string,
     commentPreview: string
   ): Promise<void> {
+    const preview = String(commentPreview || '').trim() || 'your reel';
+    const title = '💬 New Comment on Reel';
+    const body = `${commenterName} commented: "${preview.slice(0, 50)}${preview.length > 50 ? '...' : ''}"`;
+    const data = {
+      type: 'reel_comment',
+      screen: 'reel',
+      reelId,
+      commentId,
+      actorId: commenterId,
+      commentPreview: preview,
+    };
+
     await this.createNotification({
       userId: reelAuthorId,
       type: 'reel_comment',
-      title: '💬 New Comment on Reel',
-      body: `${commenterName} commented: "${commentPreview.slice(0, 50)}${commentPreview.length > 50 ? '...' : ''}"`,
+      title,
+      body,
       actorId: commenterId,
       reelId,
       commentId,
-      data: { commentPreview },
+      data,
     });
+
+    pushNotificationService.sendToUser(reelAuthorId, {
+      title,
+      body,
+      data,
+    }).catch(() => undefined);
   }
 
   /**
@@ -808,18 +1135,38 @@ class NotificationService {
     replierName: string,
     reelId: string,
     commentId: string,
+    parentCommentId: string,
     replyPreview: string
   ): Promise<void> {
+    const preview = String(replyPreview || '').trim() || 'your comment';
+    const title = '↩️ New Reply on Reel';
+    const body = `${replierName} replied: "${preview.slice(0, 50)}${preview.length > 50 ? '...' : ''}"`;
+    const data = {
+      type: 'reel_comment_reply',
+      screen: 'reel',
+      reelId,
+      commentId,
+      parentCommentId,
+      actorId: replierId,
+      replyPreview: preview,
+    };
+
     await this.createNotification({
       userId: originalCommenterId,
       type: 'reel_comment_reply',
-      title: '↩️ New Reply on Reel',
-      body: `${replierName} replied: "${replyPreview.slice(0, 50)}${replyPreview.length > 50 ? '...' : ''}"`,
+      title,
+      body,
       actorId: replierId,
       reelId,
       commentId,
-      data: { replyPreview },
+      data,
     });
+
+    pushNotificationService.sendToUser(originalCommenterId, {
+      title,
+      body,
+      data,
+    }).catch(() => undefined);
   }
 
   /**

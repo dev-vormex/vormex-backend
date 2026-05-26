@@ -11,6 +11,12 @@ import {
   getLifetimeXp,
   isMeaningfulActivity,
 } from './progress.service';
+import { cacheService } from './cache.service';
+
+const ACTIVITY_HEATMAP_CACHE_TTL_SECONDS = 120;
+const ACTIVITY_YEARS_CACHE_TTL_SECONDS = 24 * 60 * 60;
+
+const activityCacheTags = (userId: string) => [`user:${userId}`, `activity:${userId}`];
 
 /**
  * Get today's date in UTC as YYYY-MM-DD string
@@ -116,6 +122,10 @@ export async function recordActivity(
       update: Object.keys(updateData).length > 0
         ? updateData
         : { isActive: existingActivity?.isActive ?? false },
+    });
+
+    cacheService.invalidateTags(...activityCacheTags(userId)).catch((error: unknown) => {
+      console.error(`Failed to invalidate activity cache for user ${userId}:`, error);
     });
 
     if (countsForDailyStreak) {
@@ -438,6 +448,12 @@ export async function getContributionYears(userId: string): Promise<{
   joinedYear: number;
 }> {
   try {
+    const cacheKey = `activity:years:${userId}`;
+    const cached = await cacheService.get<{ years: number[]; joinedYear: number }>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { createdAt: true },
@@ -456,10 +472,17 @@ export async function getContributionYears(userId: string): Promise<{
       years.push(year);
     }
 
-    return {
+    const response = {
       years,
       joinedYear,
     };
+    await cacheService.set(
+      cacheKey,
+      response,
+      ACTIVITY_YEARS_CACHE_TTL_SECONDS,
+      activityCacheTags(userId)
+    );
+    return response;
   } catch (error) {
     console.error(`Failed to get contribution years for user ${userId}:`, error);
     throw error;
@@ -492,6 +515,25 @@ export async function getActivityHeatmap(
   };
 }> {
   try {
+    const cacheKey = `activity:heatmap:${userId}:${year ?? 'rolling'}`;
+    const cached = await cacheService.get<{
+      days: ActivityHeatmapDay[];
+      stats: {
+        totalContributions: number;
+        currentStreak: number;
+        longestStreak: number;
+        contributionLevels: {
+          level0: number;
+          level1: number;
+          level2: number;
+          level3: number;
+        };
+      };
+    }>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     // Fetch user to get joined date (createdAt)
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -533,7 +575,7 @@ export async function getActivityHeatmap(
 
     // If requested year is before user joined, return empty
     if (year !== undefined && year !== null && year < joinedDate.getUTCFullYear()) {
-      return {
+      const emptyResponse = {
         days: [],
         stats: {
           totalContributions: 0,
@@ -547,6 +589,13 @@ export async function getActivityHeatmap(
           },
         },
       };
+      await cacheService.set(
+        cacheKey,
+        emptyResponse,
+        ACTIVITY_HEATMAP_CACHE_TTL_SECONDS,
+        activityCacheTags(userId)
+      );
+      return emptyResponse;
     }
 
     // Fetch activity records in date range
@@ -631,7 +680,7 @@ export async function getActivityHeatmap(
     // Calculate streaks
     const streakInfo = await calculateStreak(userId);
 
-    return {
+    const response = {
       days,
       stats: {
         totalContributions,
@@ -640,6 +689,13 @@ export async function getActivityHeatmap(
         contributionLevels,
       },
     };
+    await cacheService.set(
+      cacheKey,
+      response,
+      ACTIVITY_HEATMAP_CACHE_TTL_SECONDS,
+      activityCacheTags(userId)
+    );
+    return response;
   } catch (error) {
     console.error(`Failed to get activity heatmap for user ${userId}:`, error);
     throw error;

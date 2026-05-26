@@ -20,9 +20,16 @@ export const errorHandler = (
   res: Response,
   _next: NextFunction
 ): void => {
-  const statusCode = err.statusCode || 500;
-  const status = err.status || 'error';
-  const message = err.message || 'Internal Server Error';
+  const isMulterError = err.name === 'MulterError';
+  const isUploadValidationError =
+    isMulterError
+    || err.message === 'Only image files are allowed'
+    || err.message?.includes('Unexpected field');
+  const statusCode = err.statusCode || (isUploadValidationError ? ((err as any).code === 'LIMIT_FILE_SIZE' ? 413 : 400) : 500);
+  const status = err.status || (isUploadValidationError ? 'bad_request' : 'error');
+  const message = isUploadValidationError
+    ? err.message || 'Invalid file upload'
+    : err.message || 'Internal Server Error';
   const requestId = getRequestId(req);
   const log = getRequestLogger(req);
 

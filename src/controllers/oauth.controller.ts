@@ -1,17 +1,25 @@
 // @ts-nocheck
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { generateToken } from '../utils/jwt.util';
-import { verifyGoogleToken, GoogleTokenPayload } from '../utils/google.util';
+import {
+  exchangeGoogleAuthorizationCodeForIdToken,
+  verifyGoogleToken,
+  GoogleTokenPayload,
+} from '../utils/google.util';
 import { generateUsernameFromName, normalizeUsername } from '../utils/username.util';
 import { hashEmail } from '../utils/email-hash.util';
+import {
+  authTokensForResponse,
+  issueAuthTransport,
+} from '../services/auth-transport.service';
+import { buildUserResponse, safeUserResponseSelect } from '../services/user-response.service';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { processPeopleYouKnowJoinForUser } from '../services/people-you-know-join.service';
+import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.service';
 import {
   GoogleSignInRequestBody,
   AuthSuccessResponse,
   ErrorResponse,
-  UserResponse,
 } from '../types/auth.types';
 
 /**
@@ -55,6 +63,10 @@ async function generateUniqueUsername(baseUsername: string): Promise<string> {
   // Fallback: use timestamp
   const timestamp = Date.now().toString().slice(-6);
   return `${baseUsername}_${timestamp}`;
+}
+
+async function createOAuthSession(req: Request, res: Response, userId: string | number) {
+  return issueAuthTransport(req, res, userId);
 }
 
 /**
@@ -110,45 +122,22 @@ export const googleSignIn = async (
     let user = await prisma.user.findUnique({
       where: { googleId },
       select: {
-        id: true,
-        email: true,
+        ...safeUserResponseSelect,
         emailHash: true,
-        username: true,
-        name: true,
-        college: true,
-        branch: true,
-        profileImage: true,
-        bio: true,
-        graduationYear: true,
-        isVerified: true,
-        authProvider: true,
-        googleId: true,
-        appleId: true,
-        githubConnected: true,
-        githubUsername: true,
-        githubId: true,
-        githubAvatarUrl: true,
-        githubProfileUrl: true,
-        githubLastSyncedAt: true,
-        headline: true,
-        bannerImageUrl: true,
-        location: true,
-        currentYear: true,
-        degree: true,
-        portfolioUrl: true,
-        linkedinUrl: true,
-        otherSocialUrls: true,
-        isOpenToOpportunities: true,
-        interests: true,
-        onboardingCompleted: true,
-        createdAt: true,
-        updatedAt: true,
-        // Explicitly exclude password
+        isBanned: true,
       },
     });
 
     // Case A: User found by googleId (existing Google user)
     if (user) {
+      if (user.isBanned) {
+        res.status(403).json({
+          error: 'User account is disabled',
+          code: 'account_disabled',
+        });
+        return;
+      }
+
       // Update user if name or profileImage changed
       const needsUpdate =
         user.name !== name || user.profileImage !== picture || !user.emailHash;
@@ -162,84 +151,19 @@ export const googleSignIn = async (
             emailHash: hashEmail(email),
           },
           select: {
-            id: true,
-            email: true,
-            username: true,
-            name: true,
-            college: true,
-            branch: true,
-            profileImage: true,
-            bio: true,
-            graduationYear: true,
-            isVerified: true,
-            authProvider: true,
-            googleId: true,
-            appleId: true,
-            githubConnected: true,
-            githubUsername: true,
-            githubId: true,
-            githubAvatarUrl: true,
-            githubProfileUrl: true,
-            githubLastSyncedAt: true,
-            headline: true,
-            bannerImageUrl: true,
-            location: true,
-            currentYear: true,
-            degree: true,
-            portfolioUrl: true,
-            linkedinUrl: true,
-            otherSocialUrls: true,
-            isOpenToOpportunities: true,
-            interests: true,
-            onboardingCompleted: true,
-            createdAt: true,
-            updatedAt: true,
+            ...safeUserResponseSelect,
+            isBanned: true,
           },
         });
       }
 
-      // Generate JWT token
-      const token = generateToken(user.id);
+      const authSession = await createOAuthSession(req, res, user.id);
 
-      // Return user and token (user already has username from select)
-      const userResponse: UserResponse = {
-        id: user.id,
-        email: user.email,
-        username: user.username, // Username is required
-        name: user.name,
-        college: user.college,
-        branch: user.branch,
-        profileImage: user.profileImage,
-        bio: user.bio,
-        graduationYear: user.graduationYear,
-        isVerified: user.isVerified,
-        authProvider: user.authProvider,
-        googleId: user.googleId || null,
-        appleId: user.appleId || null,
-        githubConnected: user.githubConnected || false,
-        githubUsername: user.githubUsername || null,
-        githubId: user.githubId || null,
-        githubAvatarUrl: user.githubAvatarUrl || null,
-        githubProfileUrl: user.githubProfileUrl || null,
-        githubLastSyncedAt: user.githubLastSyncedAt || null,
-        headline: user.headline || null,
-        bannerImageUrl: user.bannerImageUrl || null,
-        location: user.location || null,
-        currentYear: user.currentYear || null,
-        degree: user.degree || null,
-        portfolioUrl: user.portfolioUrl || null,
-        linkedinUrl: user.linkedinUrl || null,
-        otherSocialUrls: user.otherSocialUrls || null,
-        isOpenToOpportunities: user.isOpenToOpportunities || false,
-        onboardingCompleted: user.onboardingCompleted ?? false,
-        interests: user.interests || [],
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      };
+      const userResponse = await buildUserResponse(user);
 
       res.status(200).json({
         user: userResponse,
-        token,
+        ...authTokensForResponse(req, authSession),
       });
       return;
     }
@@ -250,10 +174,19 @@ export const googleSignIn = async (
       select: {
         id: true,
         authProvider: true,
+        isBanned: true,
       },
     });
 
     if (existingUserByEmail) {
+      if (existingUserByEmail.isBanned) {
+        res.status(403).json({
+          error: 'User account is disabled',
+          code: 'account_disabled',
+        });
+        return;
+      }
+
       // If email exists with different auth provider (email/password)
       if (existingUserByEmail.authProvider !== 'google') {
         res.status(409).json({
@@ -274,83 +207,19 @@ export const googleSignIn = async (
           emailHash: hashEmail(email),
         },
         select: {
-          id: true,
-          email: true,
-          username: true,
-          name: true,
-          college: true,
-          branch: true,
-          profileImage: true,
-          bio: true,
-          graduationYear: true,
-          isVerified: true,
-          authProvider: true,
-          googleId: true,
-          appleId: true,
-          githubConnected: true,
-          githubUsername: true,
-          githubId: true,
-          githubAvatarUrl: true,
-          githubProfileUrl: true,
-          githubLastSyncedAt: true,
-          headline: true,
-          bannerImageUrl: true,
-          location: true,
-          currentYear: true,
-          degree: true,
-          portfolioUrl: true,
-          linkedinUrl: true,
-          otherSocialUrls: true,
-          isOpenToOpportunities: true,
-          interests: true,
-          onboardingCompleted: true,
-          createdAt: true,
-          updatedAt: true,
+          ...safeUserResponseSelect,
+          isBanned: true,
         },
       });
+      await invalidateAuthUserStatus(updatedUser.id);
 
-      // Generate JWT token
-      const token = generateToken(updatedUser.id);
+      const authSession = await createOAuthSession(req, res, updatedUser.id);
 
-      // Return user and token
-      const userResponse: UserResponse = {
-        id: updatedUser.id,
-        email: updatedUser.email,
-        username: updatedUser.username, // Username is required
-        name: updatedUser.name,
-        college: updatedUser.college,
-        branch: updatedUser.branch,
-        profileImage: updatedUser.profileImage,
-        bio: updatedUser.bio,
-        graduationYear: updatedUser.graduationYear,
-        isVerified: updatedUser.isVerified,
-        authProvider: updatedUser.authProvider,
-        googleId: updatedUser.googleId || null,
-        appleId: updatedUser.appleId || null,
-        githubConnected: updatedUser.githubConnected || false,
-        githubUsername: updatedUser.githubUsername || null,
-        githubId: updatedUser.githubId || null,
-        githubAvatarUrl: updatedUser.githubAvatarUrl || null,
-        githubProfileUrl: updatedUser.githubProfileUrl || null,
-        githubLastSyncedAt: updatedUser.githubLastSyncedAt || null,
-        headline: updatedUser.headline || null,
-        bannerImageUrl: updatedUser.bannerImageUrl || null,
-        location: updatedUser.location || null,
-        currentYear: updatedUser.currentYear || null,
-        degree: updatedUser.degree || null,
-        portfolioUrl: updatedUser.portfolioUrl || null,
-        linkedinUrl: updatedUser.linkedinUrl || null,
-        otherSocialUrls: updatedUser.otherSocialUrls || null,
-        isOpenToOpportunities: updatedUser.isOpenToOpportunities || false,
-        interests: updatedUser.interests || [],
-        onboardingCompleted: updatedUser.onboardingCompleted ?? false,
-        createdAt: updatedUser.createdAt,
-        updatedAt: updatedUser.updatedAt,
-      };
+      const userResponse = await buildUserResponse(updatedUser);
 
       res.status(200).json({
         user: userResponse,
-        token,
+        ...authTokensForResponse(req, authSession),
       });
       return;
     }
@@ -377,39 +246,7 @@ export const googleSignIn = async (
         bio: null,
         graduationYear: null,
       },
-      select: {
-        id: true,
-        email: true,
-        username: true,
-        name: true,
-        college: true,
-        branch: true,
-        profileImage: true,
-        bio: true,
-        graduationYear: true,
-        isVerified: true,
-        authProvider: true,
-        googleId: true,
-        appleId: true,
-        githubConnected: true,
-        githubUsername: true,
-        githubId: true,
-        githubAvatarUrl: true,
-        githubProfileUrl: true,
-        githubLastSyncedAt: true,
-        headline: true,
-        bannerImageUrl: true,
-        location: true,
-        currentYear: true,
-        degree: true,
-        portfolioUrl: true,
-        linkedinUrl: true,
-        otherSocialUrls: true,
-        isOpenToOpportunities: true,
-        interests: true,
-        createdAt: true,
-        updatedAt: true,
-      },
+      select: safeUserResponseSelect,
     });
 
     try {
@@ -420,53 +257,52 @@ export const googleSignIn = async (
 
     queueMatchAvailabilityNotifications(newUser.id, 'google_signup');
 
-    // Generate JWT token
-    const token = generateToken(newUser.id);
+    const authSession = await createOAuthSession(req, res, newUser.id);
 
-    // Return user and token
-    const userResponse: UserResponse = {
-      id: newUser.id,
-      email: newUser.email,
-      username: newUser.username, // Username is required
-      name: newUser.name,
-      college: newUser.college,
-      branch: newUser.branch,
-      profileImage: newUser.profileImage,
-      bio: newUser.bio,
-      graduationYear: newUser.graduationYear,
-      isVerified: newUser.isVerified,
-      authProvider: newUser.authProvider,
-      googleId: newUser.googleId || null,
-      appleId: newUser.appleId || null,
-      githubConnected: newUser.githubConnected || false,
-      githubUsername: newUser.githubUsername || null,
-      githubId: newUser.githubId || null,
-      githubAvatarUrl: newUser.githubAvatarUrl || null,
-      githubProfileUrl: newUser.githubProfileUrl || null,
-      githubLastSyncedAt: newUser.githubLastSyncedAt || null,
-      headline: newUser.headline || null,
-      bannerImageUrl: newUser.bannerImageUrl || null,
-      location: newUser.location || null,
-      currentYear: newUser.currentYear || null,
-      degree: newUser.degree || null,
-      portfolioUrl: newUser.portfolioUrl || null,
-      linkedinUrl: newUser.linkedinUrl || null,
-      otherSocialUrls: newUser.otherSocialUrls || null,
-      isOpenToOpportunities: newUser.isOpenToOpportunities || false,
-      interests: newUser.interests || [],
-      onboardingCompleted: newUser.onboardingCompleted ?? false,
-      createdAt: newUser.createdAt,
-      updatedAt: newUser.updatedAt,
-    };
+    const userResponse = await buildUserResponse(newUser);
 
     res.status(201).json({
       user: userResponse,
-      token,
+      ...authTokensForResponse(req, authSession),
     });
   } catch (error) {
     console.error('Google sign-in error:', error);
     res.status(500).json({
       error: 'Internal server error during Google sign-in',
+    });
+  }
+};
+
+export const googleCodeSignIn = async (
+  req: Request,
+  res: Response<AuthSuccessResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    const { code, codeVerifier, redirectUri } = req.body || {};
+
+    if (
+      typeof code !== 'string' ||
+      typeof codeVerifier !== 'string' ||
+      typeof redirectUri !== 'string'
+    ) {
+      res.status(400).json({
+        error: 'Code, code verifier, and redirect URI are required',
+      });
+      return;
+    }
+
+    const idToken = await exchangeGoogleAuthorizationCodeForIdToken({
+      code,
+      codeVerifier,
+      redirectUri,
+    });
+
+    req.body = { idToken };
+    await googleSignIn(req as any, res);
+  } catch (error) {
+    console.error('Google authorization code sign-in error:', error);
+    res.status(401).json({
+      error: error instanceof Error ? error.message : 'Google sign-in failed',
     });
   }
 };

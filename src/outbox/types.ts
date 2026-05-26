@@ -10,9 +10,15 @@ export interface OutboxEventInput {
   availableAt?: Date;
 }
 
-export interface CacheInvalidationPayload {
-  tags: string[];
-}
+export type CacheInvalidationPayload =
+  | {
+      tags: string[];
+    }
+  | {
+      type: 'post_created';
+      postId: string;
+      authorId: string;
+    };
 
 export interface NotificationDeliveryPayload {
   kind: 'generic' | 'new_message' | 'group_message';
@@ -24,6 +30,16 @@ export interface NotificationDeliveryPayload {
   senderId?: string;
   senderName?: string;
   senderImage?: string;
+  messageId?: string;
+  clientMessageId?: string;
+  messageContent?: string;
+  contentType?: string;
+  mediaUrl?: string;
+  mediaType?: string;
+  fileName?: string;
+  fileSize?: number;
+  messageCreatedAt?: string;
+  messageUpdatedAt?: string;
   conversationId?: string;
   groupId?: string;
   groupName?: string;

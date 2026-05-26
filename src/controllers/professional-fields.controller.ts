@@ -1,7 +1,10 @@
+import { createHash } from 'crypto';
 import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
-import { prisma } from '../config/prisma';
+import { prisma, prismaRead } from '../config/prisma';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
+import { getProfileProjectLimitState } from '../services/tier-limits.service';
+import { cacheService } from '../services/cache.service';
 import { ensureString } from '../utils/request.util';
 
 /**
@@ -10,6 +13,11 @@ import { ensureString } from '../utils/request.util';
 const PROFICIENCY_LEVELS = ['Beginner', 'Intermediate', 'Advanced', 'Expert'];
 const EXPERIENCE_TYPES = ['Internship', 'Part-time', 'Full-time', 'Freelance', 'Contract'];
 const ACHIEVEMENT_TYPES = ['Hackathon', 'Competition', 'Award', 'Scholarship', 'Recognition'];
+const SKILL_SEARCH_CACHE_TTL_SECONDS = 5 * 60;
+const SKILL_SEARCH_MAX_LIMIT = 20;
+
+const skillSearchCacheKey = (query: string, limit: number): string =>
+  `skills:search:v1:${createHash('sha256').update(query.toLowerCase()).digest('hex').slice(0, 24)}:${limit}`;
 
 function validateUrl(url: string | null | undefined): boolean {
   if (!url) return true; // Optional field
@@ -226,24 +234,39 @@ export const searchSkills = async (
   res: Response<any[] | ErrorResponse>,
 ): Promise<void> => {
   try {
-    const query = ensureString(req.query.q) || '';
+    const query = (ensureString(req.query.q) || '').trim().replace(/\s+/g, ' ').slice(0, 50);
+    const limit = Math.min(
+      SKILL_SEARCH_MAX_LIMIT,
+      Math.max(1, parseInt(ensureString(req.query.limit) || String(SKILL_SEARCH_MAX_LIMIT), 10) || SKILL_SEARCH_MAX_LIMIT)
+    );
 
     if (query.length < 2) {
       res.status(200).json([]);
       return;
     }
 
-    const skills = await prisma.skill.findMany({
+    const cacheKey = skillSearchCacheKey(query, limit);
+    const cached = await cacheService.get<any[]>(cacheKey);
+    if (cached) {
+      res.setHeader('X-Vormex-Cache', 'HIT');
+      res.status(200).json(cached);
+      return;
+    }
+
+    const skills = await prismaRead.skill.findMany({
       where: {
         name: {
           contains: query,
           mode: 'insensitive',
         },
       },
-      take: 20,
+      take: limit,
       orderBy: { name: 'asc' },
     });
 
+    await cacheService.set(cacheKey, skills, SKILL_SEARCH_CACHE_TTL_SECONDS, ['people:filters']);
+
+    res.setHeader('X-Vormex-Cache', 'MISS');
     res.status(200).json(skills);
   } catch (error) {
     console.error('Error searching skills:', error);
@@ -844,6 +867,20 @@ export const createProject = async (
 
     if (githubUrl && !validateUrl(githubUrl)) {
       res.status(400).json({ error: 'githubUrl must be a valid URL' });
+      return;
+    }
+
+    const limitState = await getProfileProjectLimitState(userId);
+    if (!limitState.allowed) {
+      res.status(403).json({
+        error: limitState.isPremium
+          ? 'Premium profiles can showcase up to 10 projects.'
+          : 'Free profiles can showcase up to 3 projects. Upgrade to Premium to add up to 10 projects.',
+        code: 'profile_project_limit_reached',
+        limit: limitState.limit,
+        used: limitState.used,
+        remaining: limitState.remaining,
+      });
       return;
     }
 

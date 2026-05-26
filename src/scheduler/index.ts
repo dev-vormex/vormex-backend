@@ -1,8 +1,22 @@
-import { getQueue } from '../infrastructure/queue/queues';
+import { getQueue, isQueueingEnabled } from '../infrastructure/queue/queues';
 import { queueNames } from '../infrastructure/queue/queue-names';
+import { isRedisRequired } from '../infrastructure/redis/client';
+import { logger } from '../lib/logger';
 import { maintenanceSchedules } from '../services/cron.service';
 
-export async function registerSchedulerJobs(): Promise<void> {
+export async function registerSchedulerJobs(): Promise<boolean> {
+  if (!isQueueingEnabled()) {
+    if (isRedisRequired()) {
+      throw new Error('Scheduler requires Redis, but Redis is not connected');
+    }
+
+    logger.warn({
+      event: 'scheduler.skipped',
+      reason: 'redis_unavailable',
+    });
+    return false;
+  }
+
   await getQueue(queueNames.scheduledPublish).upsertJobScheduler(
     'scheduled_publish_tick',
     {
@@ -48,4 +62,6 @@ export async function registerSchedulerJobs(): Promise<void> {
       }
     );
   }
+
+  return true;
 }

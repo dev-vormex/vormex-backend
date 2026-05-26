@@ -18,45 +18,50 @@ function setRateLimitHeaders(
 
 export function createAIRateLimitMiddleware(scope: AIRateLimitScope) {
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
-    const requestId = getRequestId(req);
-    const log = getRequestLogger(req);
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    const userId = req.user?.userId ? String(req.user.userId) : undefined;
+    try {
+      const requestId = getRequestId(req);
+      const log = getRequestLogger(req);
+      const ip = req.ip || req.socket.remoteAddress || 'unknown';
+      const userId = req.user?.userId ? String(req.user.userId) : undefined;
 
-    const result = await aiRateLimitService.checkLimit({
-      ip,
-      requestId,
-      scope,
-      userId,
-    });
-
-    setRateLimitHeaders(res, {
-      limit: result.effective.limit,
-      remaining: result.effective.remaining,
-      resetAt: result.effective.resetAt,
-      retryAfterSeconds: result.allowed ? undefined : result.effective.retryAfterSeconds,
-    });
-
-    if (!result.allowed) {
-      log.warn({
-        event: 'ai.rate_limit.hit',
+      const result = await aiRateLimitService.checkLimit({
+        ip,
         requestId,
         scope,
-        blockedBy: result.blockedBy,
         userId,
-        ip,
-        retryAfterSeconds: result.effective.retryAfterSeconds,
       });
 
-      res.status(429).json({
-        error: 'AI requests are cooling down. Please wait a bit before trying again.',
-        code: 'ai_rate_limited',
-        requestId,
-        retryAfterSeconds: result.effective.retryAfterSeconds,
+      setRateLimitHeaders(res, {
+        limit: result.effective.limit,
+        remaining: result.effective.remaining,
+        resetAt: result.effective.resetAt,
+        retryAfterSeconds: result.allowed ? undefined : result.effective.retryAfterSeconds,
       });
-      return;
+
+      if (!result.allowed) {
+        log.warn({
+          event: 'ai.rate_limit.hit',
+          requestId,
+          scope,
+          blockedBy: result.blockedBy,
+          window: result.effective.window,
+          userId,
+          ip,
+          retryAfterSeconds: result.effective.retryAfterSeconds,
+        });
+
+        res.status(429).json({
+          error: 'AI requests are cooling down. Please wait a bit before trying again.',
+          code: 'ai_rate_limited',
+          requestId,
+          retryAfterSeconds: result.effective.retryAfterSeconds,
+        });
+        return;
+      }
+
+      next();
+    } catch (error) {
+      next(error);
     }
-
-    next();
   };
 }

@@ -988,6 +988,10 @@ export const getQuizBattle = async (
       res.status(404).json({ error: 'Battle not found' });
       return;
     }
+    if (battle.player1Id !== userId && battle.player2Id !== userId) {
+      res.status(404).json({ error: 'Battle not found' });
+      return;
+    }
 
     const questionIds = battle.questionIds as string[];
     const questions = await prisma.trivia_questions.findMany({
@@ -1045,12 +1049,22 @@ export const answerBattleQuestion = async (
       res.status(404).json({ error: 'Battle not found' });
       return;
     }
+    if (battle.player1Id !== userId && battle.player2Id !== userId) {
+      res.status(404).json({ error: 'Battle not found' });
+      return;
+    }
 
     const qId = ensureString(questionId);
     if (!qId) {
       res.status(400).json({ error: 'Question ID is required' });
       return;
     }
+    const battleQuestionIds = Array.isArray(battle.questionIds) ? battle.questionIds.map(String) : [];
+    if (!battleQuestionIds.includes(qId)) {
+      res.status(400).json({ error: 'Question does not belong to this battle' });
+      return;
+    }
+
     const question = await prisma.trivia_questions.findUnique({
       where: { id: qId },
     });

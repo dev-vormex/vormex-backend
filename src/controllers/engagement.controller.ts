@@ -17,6 +17,7 @@ import {
   type RewardCardAction,
   type RewardCardType,
 } from '../services/reward-cards.service';
+import { getConnectionRequestLimitState } from '../services/tier-limits.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -743,45 +744,69 @@ export const getTrendingStatus = async (req: AuthRequest, res: Response): Promis
 // LIVE ACTIVITY (Social Proof)
 // ======================
 export const getLiveActivity = async (req: AuthRequest, res: Response): Promise<void> => {
+  const countOrZero = async (label: string, count: () => Promise<number>): Promise<number> => {
+    try {
+      return await count();
+    } catch (error) {
+      console.warn(`getLiveActivity ${label} count failed:`, error);
+      return 0;
+    }
+  };
+
   try {
     const { location } = req.query;
     const fifteenMinsAgo = new Date(Date.now() - 15 * 60 * 1000);
     const todayStart = getTodayStart();
+    const locationLabel = Array.isArray(location)
+      ? location[0]
+      : typeof location === 'string' && location.trim()
+        ? location.trim()
+        : 'Worldwide';
 
-    // Count active users in last 15 minutes
-    const activeUsersNow = await prisma.user.count({
-      where: {
-        lastActiveAt: { gte: fifteenMinsAgo },
-        isBanned: false,
-      },
-    });
-
-    // Count connections made today
-    const connectionsToday = await prisma.connections.count({
-      where: {
-        status: 'accepted',
-        updatedAt: { gte: todayStart },
-      },
-    });
-
-    // Count new users today
-    const newUsersToday = await prisma.user.count({
-      where: {
-        createdAt: { gte: todayStart },
-      },
-    });
+    const [activeUsersNow, connectionsToday, newUsersToday] = await Promise.all([
+      countOrZero('active users', () =>
+        prisma.user.count({
+          where: {
+            lastActiveAt: { gte: fifteenMinsAgo },
+            isBanned: false,
+          },
+        })
+      ),
+      countOrZero('connections today', () =>
+        prisma.connections.count({
+          where: {
+            status: 'accepted',
+            updatedAt: { gte: todayStart },
+          },
+        })
+      ),
+      countOrZero('new users today', () =>
+        prisma.user.count({
+          where: {
+            createdAt: { gte: todayStart },
+          },
+        })
+      ),
+    ]);
 
     res.json({
       data: {
         activeUsersNow,
         connectionsToday,
         newUsersToday,
-        locationLabel: location as string || 'Worldwide',
+        locationLabel,
       },
     });
   } catch (error) {
     console.error('getLiveActivity error:', error);
-    res.status(500).json({ error: 'Failed to fetch live activity' });
+    res.json({
+      data: {
+        activeUsersNow: 0,
+        connectionsToday: 0,
+        newUsersToday: 0,
+        locationLabel: 'Worldwide',
+      },
+    });
   }
 };
 
@@ -1138,30 +1163,24 @@ export const getConnectionLimit = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const todayStart = getTodayStart();
-    const DAILY_LIMIT = 50;
-
-    // Count connection requests sent today
-    const sentToday = await prisma.connections.count({
-      where: {
-        requesterId: userId,
-        createdAt: { gte: todayStart },
-      },
-    });
-
-    const remaining = Math.max(0, DAILY_LIMIT - sentToday);
-    const canSend = remaining > 0;
-
-    // Reset time is tomorrow midnight
-    const tomorrow = new Date(todayStart);
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const limitState = await getConnectionRequestLimitState(userId);
+    const resetsAt = limitState.windowStart
+      ? new Date(Date.UTC(
+          limitState.windowStart.getUTCFullYear(),
+          limitState.windowStart.getUTCMonth() + 1,
+          1
+        ))
+      : null;
 
     res.json({
       data: {
-        canSend,
-        remaining,
-        limit: DAILY_LIMIT,
-        resetsAt: tomorrow.toISOString(),
+        canSend: limitState.allowed,
+        remaining: limitState.remaining ?? 0,
+        limit: limitState.limit ?? 0,
+        used: limitState.used,
+        isPremium: limitState.isPremium,
+        unlimitedRequests: limitState.limit === null,
+        resetsAt: resetsAt?.toISOString() || null,
       },
     });
   } catch (error) {

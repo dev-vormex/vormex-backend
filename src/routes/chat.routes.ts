@@ -2,9 +2,12 @@ import { NextFunction, Request, Response, Router } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import { chatUploadRule, validateUploadedFiles } from '../middleware/upload-security.middleware';
 import {
   getConversations,
   getOrCreateConversation,
+  getConversationStatusWithUser,
   getConversation,
   getMessages,
   sendMessage,
@@ -39,6 +42,13 @@ const mediaWriteLimit = createRateLimitMiddleware((req) => [
       }]
     : []),
 ]);
+const validateChatUpload = validateUploadedFiles({
+  fields: {
+    file: chatUploadRule(CHAT_VIDEO_MAX_BYTES),
+  },
+  maxFiles: 1,
+  requireKnownField: true,
+});
 
 // Chat media upload middleware
 const chatUpload = multer({
@@ -73,6 +83,7 @@ router.use(authenticate);
 
 router.get('/conversations', getConversations);
 router.post('/conversations', getOrCreateConversation);
+router.get('/users/:userId/status', getConversationStatusWithUser);
 router.get('/conversations/:conversationId', getConversation);
 router.get('/conversations/:conversationId/messages', getMessages);
 router.post('/conversations/:conversationId/messages', sendMessage);
@@ -88,6 +99,6 @@ router.get('/requests', getMessageRequests);
 router.get('/requests/count', getMessageRequestsCount);
 router.post('/requests/:conversationId/accept', acceptMessageRequest);
 router.delete('/requests/:conversationId', declineMessageRequest);
-router.post('/upload', mediaWriteLimit, handleChatUpload, uploadChatMedia);
+router.post('/upload', mediaWriteLimit, handleChatUpload, validateChatUpload, validateMultipartFields, uploadChatMedia);
 
 export default router;

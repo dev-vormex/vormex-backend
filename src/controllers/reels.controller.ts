@@ -8,6 +8,8 @@ import { bunnyStorageService } from '../services/bunny-storage.service';
 import { getIO } from '../sockets';
 import { notificationService } from '../services/notification.service';
 import { recordActivity } from '../services/activity.service';
+import { cacheService } from '../services/cache.service';
+import { buildReelVisibilityWhere, canViewReel } from '../utils/access-control.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -19,6 +21,7 @@ const reelCommentAuthorSelect = {
   name: true,
   profileImage: true,
   headline: true,
+  isVerified: true,
 };
 
 function verifyBunnyStreamSignature(req: Request): boolean {
@@ -57,6 +60,8 @@ function mapReelCommentAuthor(author: any) {
       name: 'Unknown user',
       profileImage: null,
       headline: null,
+      verified: false,
+      isVerified: false,
     };
   }
 
@@ -66,6 +71,8 @@ function mapReelCommentAuthor(author: any) {
     name: author.name,
     profileImage: author.profileImage,
     headline: author.headline,
+    verified: Boolean(author.isVerified),
+    isVerified: Boolean(author.isVerified),
   };
 }
 
@@ -89,15 +96,32 @@ function mapReelComment(comment: any, currentUserId?: string) {
   };
 }
 
+function normalizeMentionUsernames(content: string, mentions?: unknown): string[] {
+  const fromBody = Array.isArray(mentions)
+    ? mentions
+    : typeof mentions === 'string'
+      ? safeJsonParse<string[]>(mentions, [])
+      : [];
+  const fromContent = [...content.matchAll(/(^|[^A-Za-z0-9_.])@([A-Za-z0-9_][A-Za-z0-9_.-]{1,29})/g)]
+    .map((match) => match[2]);
+
+  const normalized = [...fromBody, ...fromContent]
+    .map((mention) => String(mention || '').trim().replace(/^@+/, '').toLowerCase())
+    .map((mention) => mention.replace(/^[^a-z0-9_]+|[^a-z0-9_.-]+$/gi, ''))
+    .filter((mention) => mention.length >= 2 && mention.length <= 30);
+
+  return Array.from(new Set(normalized)).slice(0, 30);
+}
+
 function mapReelResponse(reel: any, currentUserId?: string) {
   const author = reel.users;
   const isLiked = currentUserId
-    ? Boolean(reel.reels_likes?.some((like: any) => like.userId === currentUserId))
+    ? Boolean((reel.reel_likes || reel.reels_likes)?.some((like: any) => like.userId === currentUserId))
     : false;
   const isSaved = currentUserId
-    ? Boolean(reel.reels_saves?.some((save: any) => save.userId === currentUserId))
+    ? Boolean((reel.reel_saves || reel.reels_saves)?.some((save: any) => save.userId === currentUserId))
     : false;
-  const userVotedOption = reel.reels_poll_votes?.find((v: any) => v.userId === currentUserId)?.optionId ?? null;
+  const userVotedOption = (reel.reel_poll_votes || reel.reels_poll_votes)?.find((v: any) => v.userId === currentUserId)?.optionId ?? null;
 
   return {
     id: reel.id,
@@ -108,6 +132,8 @@ function mapReelResponse(reel: any, currentUserId?: string) {
           name: author.name,
           profileImage: author.profileImage,
           headline: author.headline,
+          verified: Boolean(author.isVerified),
+          isVerified: Boolean(author.isVerified),
           isFollowing: Boolean(author.follows_follows_followingIdTousers?.length),
         }
       : null,
@@ -158,6 +184,7 @@ function mapReelResponse(reel: any, currentUserId?: string) {
     allowStitch: reel.allowStitch,
     allowDownload: reel.allowDownload,
     allowSharing: reel.allowSharing,
+    muteOriginalAudio: reel.muteOriginalAudio,
     status: reel.status,
     viewsCount: reel.viewsCount || 0,
     likesCount: reel.likesCount || 0,
@@ -180,6 +207,7 @@ const reelInclude = (currentUserId?: string) => ({
       name: true,
       profileImage: true,
       headline: true,
+      isVerified: true,
       ...(currentUserId
         ? {
             follows_follows_followingIdTousers: {
@@ -208,6 +236,25 @@ const reelInclude = (currentUserId?: string) => ({
     : {}),
 });
 
+function normalizeCacheQuery(query: Record<string, unknown>): string {
+  return Object.entries(query)
+    .map(([key, value]) => [
+      key,
+      Array.isArray(value) ? value.map(String).sort().join(',') : String(value ?? ''),
+    ])
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join('&');
+}
+
+function anonymousReelsFeedCacheKey(query: Record<string, unknown>): string {
+  return `reels:feed:public:${normalizeCacheQuery(query) || 'default'}`;
+}
+
+function invalidateReelsFeedCache(): void {
+  cacheService.invalidateTags('reels:feed').catch(() => undefined);
+}
+
 export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const currentUserId = req.user?.userId;
@@ -220,6 +267,17 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
       visibility: 'public',
       publishedAt: { not: null },
     };
+
+    const cacheKey = !currentUserId && mode !== 'following'
+      ? anonymousReelsFeedCacheKey(req.query as Record<string, unknown>)
+      : null;
+    if (cacheKey) {
+      const cached = await cacheService.get(cacheKey);
+      if (cached) {
+        res.json(cached);
+        return;
+      }
+    }
 
     if (mode === 'following' && currentUserId) {
       const following = await prisma.follows.findMany({
@@ -239,7 +297,7 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
     const reels = await prisma.reels.findMany({
       where: whereClause,
       include: reelInclude(currentUserId),
-      orderBy: [{ publishedAt: 'desc' }, { viewsCount: 'desc' }],
+      orderBy: [{ publishedAt: 'desc' }, { viewsCount: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
@@ -248,11 +306,17 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
     const pageItems = hasMore ? reels.slice(0, limit) : reels;
     const rankedItems = mode === 'following' ? pageItems : rankForYouReels(pageItems);
 
-    res.json({
+    const response = {
       reels: rankedItems.map((reel) => mapReelResponse(reel, currentUserId)),
       nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
       hasMore,
-    });
+    };
+
+    if (cacheKey) {
+      await cacheService.set(cacheKey, response, 10, ['reels:feed']);
+    }
+
+    res.json(response);
   } catch (error) {
     console.error('getReelsFeed error:', error);
     res.status(500).json({ error: 'Failed to fetch reels feed' });
@@ -282,16 +346,37 @@ export const getTrendingReels = async (req: AuthRequest, res: Response): Promise
 
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
 
-    const reels = await prisma.reels.findMany({
+    const trendingOrderBy = [
+      { viewsCount: 'desc' },
+      { likesCount: 'desc' },
+      { commentsCount: 'desc' },
+      { sharesCount: 'desc' },
+      { publishedAt: 'desc' },
+    ];
+    const publicReadyWhere = {
+      status: 'ready',
+      visibility: 'public',
+      publishedAt: { not: null },
+    };
+
+    let reels = await prisma.reels.findMany({
       where: {
-        status: 'ready',
-        visibility: 'public',
+        ...publicReadyWhere,
         publishedAt: { gte: since },
       },
       include: reelInclude(currentUserId),
-      orderBy: [{ viewsCount: 'desc' }, { likesCount: 'desc' }],
+      orderBy: trendingOrderBy,
       take: limit,
     });
+
+    if (reels.length === 0) {
+      reels = await prisma.reels.findMany({
+        where: publicReadyWhere,
+        include: reelInclude(currentUserId),
+        orderBy: trendingOrderBy,
+        take: limit,
+      });
+    }
 
     res.json({
       reels: reels.map((reel) => mapReelResponse(reel, currentUserId)),
@@ -314,18 +399,16 @@ export const getReel = async (req: AuthRequest, res: Response): Promise<void> =>
       return;
     }
 
-    const reel = await prisma.reels.findUnique({
-      where: { id: reelId },
+    const reel = await prisma.reels.findFirst({
+      where: {
+        id: reelId,
+        ...(await buildReelVisibilityWhere(currentUserId, { allowOwnerDraft: true })),
+      },
       include: reelInclude(currentUserId),
     });
 
     if (!reel) {
       res.status(404).json({ error: 'Reel not found' });
-      return;
-    }
-
-    if (reel.visibility === 'private' && reel.authorId !== currentUserId) {
-      res.status(403).json({ error: 'This reel is private' });
       return;
     }
 
@@ -348,15 +431,18 @@ export const getReelPreloadData = async (req: AuthRequest, res: Response): Promi
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
       select: {
+        authorId: true,
+        visibility: true,
         hlsUrl: true,
         videoUrl: true,
         thumbnailUrl: true,
         durationSeconds: true,
         status: true,
+        publishedAt: true,
       },
     });
 
-    if (!reel || reel.status !== 'ready') {
+    if (!reel || !(await canViewReel(reel, req.user?.userId))) {
       res.status(404).json({ error: 'Reel not found or not ready' });
       return;
     }
@@ -386,7 +472,10 @@ export const getReelAudio = async (req: AuthRequest, res: Response): Promise<voi
       where: { id: reelId },
       select: {
         id: true,
+        authorId: true,
+        visibility: true,
         status: true,
+        publishedAt: true,
         audioId: true,
         reel_audio: {
           select: {
@@ -405,7 +494,7 @@ export const getReelAudio = async (req: AuthRequest, res: Response): Promise<voi
       },
     });
 
-    if (!reel || reel.status !== 'ready') {
+    if (!reel || !(await canViewReel(reel, req.user?.userId))) {
       res.status(404).json({ error: 'Reel not found or not ready' });
       return;
     }
@@ -623,6 +712,9 @@ export const createReel = async (req: AuthRequest, res: Response): Promise<void>
     });
 
     recordActivity(userId, 'short_video', 1, { sourceId: reel.id }).catch(console.error);
+    if (reel.status === 'ready' && reel.visibility === 'public') {
+      invalidateReelsFeedCache();
+    }
 
     res.status(201).json(mapReelResponse(reel, userId));
   } catch (error: any) {
@@ -690,6 +782,9 @@ export const onUploadComplete = async (req: AuthRequest, res: Response): Promise
     });
 
     recordActivity(userId, 'short_video', 1, { sourceId: reel.id }).catch(console.error);
+    if (reel.status === 'ready' && reel.visibility === 'public') {
+      invalidateReelsFeedCache();
+    }
 
     res.status(201).json(mapReelResponse(reel, userId));
   } catch (error) {
@@ -760,6 +855,7 @@ export const updateReel = async (req: AuthRequest, res: Response): Promise<void>
       include: reelInclude(userId),
     });
 
+    invalidateReelsFeedCache();
     res.json(mapReelResponse(reel, userId));
   } catch (error) {
     console.error('updateReel error:', error);
@@ -815,6 +911,7 @@ export const publishDraft = async (req: AuthRequest, res: Response): Promise<voi
       },
     });
 
+    invalidateReelsFeedCache();
     const updated = await prisma.reels.findUnique({
       where: { id: reelId },
       include: reelInclude(userId),
@@ -857,6 +954,7 @@ export const deleteReel = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     await prisma.reels.delete({ where: { id: reelId } });
+    invalidateReelsFeedCache();
     bunnyStreamService.deleteVideo(existing.videoId).catch(console.error);
 
     res.json({ success: true });
@@ -883,7 +981,7 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
     const [reel, user] = await Promise.all([
       prisma.reels.findUnique({
         where: { id: reelId },
-        select: { id: true, authorId: true },
+        select: { id: true, authorId: true, visibility: true, status: true, publishedAt: true },
       }),
       prisma.user.findUnique({
         where: { id: userId },
@@ -891,7 +989,7 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
       }),
     ]);
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
@@ -963,10 +1061,10 @@ export const toggleSave = async (req: AuthRequest, res: Response): Promise<void>
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { id: true },
+      select: { id: true, authorId: true, visibility: true, status: true, publishedAt: true },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
@@ -1021,6 +1119,9 @@ export const shareReel = async (req: AuthRequest, res: Response): Promise<void> 
         select: { 
           id: true, 
           authorId: true,
+          visibility: true,
+          status: true,
+          publishedAt: true,
           allowSharing: true, 
           sharesCount: true,
           title: true,
@@ -1034,7 +1135,7 @@ export const shareReel = async (req: AuthRequest, res: Response): Promise<void> 
       }),
     ]);
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
@@ -1113,6 +1214,9 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
         select: {
           id: true,
           authorId: true,
+          visibility: true,
+          status: true,
+          publishedAt: true,
           title: true,
           caption: true,
           thumbnailUrl: true,
@@ -1126,13 +1230,14 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
               username: true,
               name: true,
               profileImage: true,
+              isVerified: true,
             },
           },
         },
       }),
       prisma.user.findUnique({
         where: { id: userId },
-        select: { id: true, name: true, username: true, profileImage: true },
+        select: { id: true, name: true, username: true, profileImage: true, isVerified: true },
       }),
       prisma.user.findUnique({
         where: { id: recipientId },
@@ -1140,7 +1245,7 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
       }),
     ]);
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
@@ -1152,6 +1257,11 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
 
     if (!recipient) {
       res.status(404).json({ error: 'Recipient not found' });
+      return;
+    }
+
+    if (!(await canViewReel(reel, recipientId))) {
+      res.status(403).json({ error: 'Recipient cannot access this reel' });
       return;
     }
 
@@ -1389,6 +1499,16 @@ export const trackView = async (req: AuthRequest, res: Response): Promise<void> 
       return;
     }
 
+    const reel = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true, visibility: true, status: true, publishedAt: true },
+    });
+
+    if (!reel || !(await canViewReel(reel, userId))) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
+
     const reelViews = viewBatch.get(reelId) || [];
     reelViews.push({
       reelId,
@@ -1430,41 +1550,79 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
     }
     const parentId = ensureString(req.query.parentId) || undefined;
     const cursor = ensureString(req.query.cursor);
+    const highlightCommentId = ensureString(req.query.highlightCommentId) || ensureString(req.query.commentId);
     const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { id: true, allowComments: true },
+      select: {
+        id: true,
+        authorId: true,
+        visibility: true,
+        status: true,
+        publishedAt: true,
+        allowComments: true,
+      },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, currentUserId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
 
     const where: any = { reelId, parentId: parentId || null };
+    const commentInclude = {
+      users: { select: reelCommentAuthorSelect },
+      ...(currentUserId
+        ? {
+            reel_comment_likes: {
+              where: { userId: currentUserId },
+              select: { userId: true },
+            },
+          }
+        : {}),
+      _count: { select: { other_reel_comments: true } },
+    };
 
     const comments = await prisma.reel_comments.findMany({
       where,
-      include: {
-        users: { select: reelCommentAuthorSelect },
-        ...(currentUserId
-          ? {
-              reel_comment_likes: {
-                where: { userId: currentUserId },
-                select: { userId: true },
-              },
-            }
-          : {}),
-        _count: { select: { other_reel_comments: true } },
-      },
-      orderBy: [{ isPinned: 'desc' }, { likesCount: 'desc' }, { createdAt: 'desc' }],
+      include: commentInclude,
+      orderBy: [{ isPinned: 'desc' }, { likesCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = comments.length > limit;
-    const items = hasMore ? comments.slice(0, limit) : comments;
+    let items = hasMore ? comments.slice(0, limit) : comments;
+
+    if (highlightCommentId) {
+      const focus = await prisma.reel_comments.findFirst({
+        where: { id: highlightCommentId, reelId },
+        select: { id: true, parentId: true },
+      });
+      const focusListId = parentId ? focus?.id : (focus?.parentId || focus?.id);
+      const belongsInList = parentId
+        ? focus?.parentId === parentId
+        : focus && !parentId;
+
+      if (focusListId && belongsInList) {
+        const focusedComment = await prisma.reel_comments.findFirst({
+          where: {
+            id: focusListId,
+            reelId,
+            parentId: parentId || null,
+          },
+          include: commentInclude,
+        });
+
+        if (focusedComment) {
+          items = [
+            focusedComment,
+            ...items.filter((comment) => comment.id !== focusedComment.id),
+          ].slice(0, limit);
+        }
+      }
+    }
 
     res.json({
       comments: items.map((comment) => mapReelComment(comment, currentUserId)),
@@ -1499,10 +1657,17 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { id: true, authorId: true, allowComments: true },
+      select: {
+        id: true,
+        authorId: true,
+        visibility: true,
+        status: true,
+        publishedAt: true,
+        allowComments: true,
+      },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }
@@ -1512,13 +1677,26 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    if (parentId) {
+      const parentComment = await prisma.reel_comments.findFirst({
+        where: { id: String(parentId), reelId },
+        select: { id: true },
+      });
+      if (!parentComment) {
+        res.status(400).json({ error: 'Parent comment is invalid for this reel' });
+        return;
+      }
+    }
+
+    const normalizedMentions = normalizeMentionUsernames(content, mentions);
+
     const comment = await prisma.reel_comments.create({
       data: {
         reelId,
         authorId: userId,
         content: content.trim(),
         parentId: parentId || null,
-        mentions: mentions || [],
+        mentions: normalizedMentions,
       },
       include: {
         users: { select: reelCommentAuthorSelect },
@@ -1589,14 +1767,20 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
         commentAuthor.name || commentAuthor.username,
         reelId,
         comment.id,
+        parentId,
         comment.content
       );
     }
 
     // Send notifications for @mentions
-    if (mentions && Array.isArray(mentions) && mentions.length > 0) {
+    if (normalizedMentions.length > 0) {
       const mentionedUsers = await prisma.user.findMany({
-        where: { username: { in: mentions } },
+        where: {
+          isBanned: false,
+          OR: normalizedMentions.map((username) => ({
+            username: { equals: username, mode: 'insensitive' },
+          })),
+        },
         select: { id: true, username: true },
       });
 
@@ -1608,7 +1792,11 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
             commentAuthor.name || commentAuthor.username,
             'reel_comment',
             reelId,
-            comment.content
+            comment.content,
+            {
+              commentId: comment.id,
+              parentCommentId: comment.parentId || undefined,
+            }
           );
         }
       }
@@ -1652,6 +1840,22 @@ export const toggleCommentLike = async (req: AuthRequest, res: Response): Promis
     const existing = await prisma.reel_comment_likes.findUnique({
       where: { commentId_userId: { commentId, userId } },
     });
+
+    const comment = await prisma.reel_comments.findUnique({
+      where: { id: commentId },
+      select: {
+        id: true,
+        reelId: true,
+        reels: {
+          select: { authorId: true, visibility: true, status: true, publishedAt: true },
+        },
+      },
+    });
+
+    if (!comment || comment.reelId !== ensureString(req.params.reelId) || !(await canViewReel(comment.reels, userId))) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
 
     let liked = false;
     if (existing) {
@@ -1705,10 +1909,15 @@ export const deleteComment = async (req: AuthRequest, res: Response): Promise<vo
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { authorId: true },
+      select: { id: true, authorId: true },
     });
 
-    if (comment.authorId !== userId && reel?.authorId !== userId) {
+    if (!reel || comment.reelId !== reelId) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
+
+    if (comment.authorId !== userId && reel.authorId !== userId) {
       res.status(403).json({ error: 'You can only delete your own comments' });
       return;
     }
@@ -1764,10 +1973,10 @@ export const heartComment = async (req: AuthRequest, res: Response): Promise<voi
 
     const comment = await prisma.reel_comments.findUnique({
       where: { id: commentId },
-      select: { isAuthorHeart: true },
+      select: { isAuthorHeart: true, reelId: true },
     });
 
-    if (!comment) {
+    if (!comment || comment.reelId !== reelId) {
       res.status(404).json({ error: 'Comment not found' });
       return;
     }
@@ -1806,10 +2015,18 @@ export const votePoll = async (req: AuthRequest, res: Response): Promise<void> =
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { pollQuestion: true, pollOptions: true, pollEndsAt: true },
+      select: {
+        authorId: true,
+        visibility: true,
+        status: true,
+        publishedAt: true,
+        pollQuestion: true,
+        pollOptions: true,
+        pollEndsAt: true,
+      },
     });
 
-    if (!reel || !reel.pollQuestion) {
+    if (!reel || !(await canViewReel(reel, userId)) || !reel.pollQuestion) {
       res.status(404).json({ error: 'Poll not found' });
       return;
     }
@@ -1872,10 +2089,17 @@ export const answerQuiz = async (req: AuthRequest, res: Response): Promise<void>
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { quizQuestion: true, quizCorrectIndex: true },
+      select: {
+        authorId: true,
+        visibility: true,
+        status: true,
+        publishedAt: true,
+        quizQuestion: true,
+        quizCorrectIndex: true,
+      },
     });
 
-    if (!reel || !reel.quizQuestion) {
+    if (!reel || !(await canViewReel(reel, userId)) || !reel.quizQuestion) {
       res.status(404).json({ error: 'Quiz not found' });
       return;
     }
@@ -1989,7 +2213,7 @@ export const getUserReels = async (req: AuthRequest, res: Response): Promise<voi
     const reels = await prisma.reels.findMany({
       where: whereClause,
       include: reelInclude(currentUserId),
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
@@ -2040,10 +2264,15 @@ export const getUserLikedReels = async (req: AuthRequest, res: Response): Promis
 
     const hasMore = likes.length > limit;
     const pageItems = hasMore ? likes.slice(0, limit) : likes;
+    const visibleItems = [];
+    for (const like of pageItems) {
+      if (like.reels.status === 'ready' && await canViewReel(like.reels, currentUserId)) {
+        visibleItems.push(like);
+      }
+    }
 
     res.json({
-      reels: pageItems
-        .filter((l) => l.reels.status === 'ready')
+      reels: visibleItems
         .map((l) => mapReelResponse(l.reels, currentUserId)),
       nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
       hasMore,
@@ -2086,10 +2315,15 @@ export const getUserSavedReels = async (req: AuthRequest, res: Response): Promis
 
     const hasMore = saves.length > limit;
     const pageItems = hasMore ? saves.slice(0, limit) : saves;
+    const visibleItems = [];
+    for (const save of pageItems) {
+      if (save.reels.status === 'ready' && await canViewReel(save.reels, currentUserId)) {
+        visibleItems.push(save);
+      }
+    }
 
     res.json({
-      reels: pageItems
-        .filter((s) => s.reels.status === 'ready')
+      reels: visibleItems
         .map((s) => mapReelResponse(s.reels, currentUserId)),
       nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
       hasMore,
@@ -2139,6 +2373,15 @@ export const getReelResponses = async (req: AuthRequest, res: Response): Promise
     const reelId = ensureString(req.params.reelId);
     const cursor = ensureString(req.query.cursor);
     const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+
+    const original = await prisma.reels.findUnique({
+      where: { id: reelId },
+      select: { authorId: true, visibility: true, status: true, publishedAt: true },
+    });
+    if (!original || !(await canViewReel(original, currentUserId))) {
+      res.status(404).json({ error: 'Reel not found' });
+      return;
+    }
 
     const reels = await prisma.reels.findMany({
       where: {
@@ -2363,10 +2606,10 @@ export const reportReel = async (req: AuthRequest, res: Response): Promise<void>
 
     const reel = await prisma.reels.findUnique({
       where: { id: reelId },
-      select: { id: true },
+      select: { id: true, authorId: true, visibility: true, status: true, publishedAt: true },
     });
 
-    if (!reel) {
+    if (!reel || !(await canViewReel(reel, userId))) {
       res.status(404).json({ error: 'Reel not found' });
       return;
     }

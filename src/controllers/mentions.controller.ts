@@ -1,9 +1,23 @@
+import { createHash } from 'crypto';
 import { Request, Response } from 'express';
-import { prisma } from '../config/prisma';
+import { prisma, prismaRead } from '../config/prisma';
+import { cacheService } from '../services/cache.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
+
+const MENTION_SEARCH_CACHE_TTL_SECONDS = 60;
+const MENTION_SEARCH_MAX_LIMIT = 15;
+const MENTION_SEARCH_MIN_LENGTH = 2;
+
+const normalizeMentionSearch = (value: unknown): string => {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/\s+/g, ' ').slice(0, 50);
+};
+
+const mentionSearchCacheKey = (query: string, limit: number): string =>
+  `mentions:search:v1:${createHash('sha256').update(query.toLowerCase()).digest('hex').slice(0, 24)}:${limit}`;
 
 /**
  * Search users for @mention autocomplete
@@ -16,21 +30,31 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const query = (req.query.q as string) || (req.query.query as string) || '';
-    const limit = Math.min(20, Math.max(1, parseInt((req.query.limit as string) || '10', 10)));
+    const query = normalizeMentionSearch((req.query.q as string) || (req.query.query as string) || '');
+    const parsedLimit = parseInt((req.query.limit as string) || '10', 10);
+    const limit = Math.min(MENTION_SEARCH_MAX_LIMIT, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 10));
 
-    if (!query || query.trim().length < 2) {
+    if (!query || query.length < MENTION_SEARCH_MIN_LENGTH) {
       res.json({ users: [] });
       return;
     }
 
-    const search = query.trim().toLowerCase();
-    const users = await prisma.user.findMany({
+    const cacheKey = mentionSearchCacheKey(query, limit);
+    const cached = await cacheService.get<{ users: any[] }>(cacheKey);
+    if (cached) {
+      res.setHeader('X-Vormex-Cache', 'HIT');
+      res.json(cached);
+      return;
+    }
+
+    const users = await prismaRead.user.findMany({
       where: {
         isBanned: false,
         OR: [
-          { username: { contains: search, mode: 'insensitive' } },
-          { name: { contains: search, mode: 'insensitive' } },
+          { username: { startsWith: query, mode: 'insensitive' } },
+          { name: { startsWith: query, mode: 'insensitive' } },
+          { username: { contains: query, mode: 'insensitive' } },
+          { name: { contains: query, mode: 'insensitive' } },
         ],
       },
       select: {
@@ -39,11 +63,13 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
         name: true,
         profileImage: true,
         headline: true,
+        isVerified: true,
       },
+      orderBy: [{ lastActiveAt: { sort: 'desc', nulls: 'last' } }, { id: 'asc' }],
       take: limit,
     });
 
-    res.json({
+    const response = {
       users: users.map((u) => ({
         id: u.id,
         username: u.username,
@@ -51,8 +77,15 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
         avatar: u.profileImage,
         profileImage: u.profileImage,
         headline: u.headline,
+        verified: Boolean(u.isVerified),
+        isVerified: Boolean(u.isVerified),
       })),
-    });
+    };
+
+    await cacheService.set(cacheKey, response, MENTION_SEARCH_CACHE_TTL_SECONDS, ['people:global']);
+
+    res.setHeader('X-Vormex-Cache', 'MISS');
+    res.json(response);
   } catch (error) {
     console.error('searchMentions error:', error);
     res.status(500).json({ error: 'Failed to search users' });

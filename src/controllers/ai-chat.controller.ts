@@ -7,9 +7,9 @@ import { AuthenticatedRequest } from '../types/auth.types';
 const AI_BUSY_MESSAGE = 'AI is temporarily busy. Please try again shortly.';
 
 const FALLBACK_STARTERS = [
-  "Hey! I noticed we're both interested in tech. What projects are you working on?",
-  "Hi there! I'd love to connect and learn more about your experience.",
-  'Hello! Your profile caught my attention. What got you interested in this field?',
+  "Hey, I saw the work you're doing and think there may be useful overlap with what I'm building. I'd love to trade ideas and see if we can help each other move faster.",
+  "Hey, your profile made me think we might have a strong collaboration angle. I'd love to understand what you're working on and share anything useful from my side.",
+  "Hey, I noticed a few things in your profile that connect with my interests. Would you be open to trading notes and exploring a small way to collaborate?",
 ];
 
 const FALLBACK_REVIVALS = [
@@ -498,12 +498,15 @@ export const getConversationStarters = async (
       limit: 3,
       route: 'conversation-starters',
       systemPrompt:
-        'You create warm, concise conversation openers for student/professional networking chats. Return ONLY a JSON array of strings.',
+        'You write thoughtful first messages for student/professional networking chats. The sender wants a real collaboration or helpful connection, not a generic greeting. Return ONLY a JSON array of strings.',
       userPrompt: [
         `User goal: ${normalizedGoal}`,
         `Context: ${promptContext || 'No extra context provided.'}`,
-        'Generate 3 options, each <= 22 words, natural, non-cringe, and not overly formal.',
+        'Generate 3 options, each 28-45 words.',
+        'Each message should be warm, specific to the two profiles when possible, and show a clear reason the recipient may benefit from replying.',
+        'Avoid empty greetings like "hi", flattery-only lines, sales language, and over-formal wording.',
       ].join('\n'),
+      temperature: 0.75,
     });
 
     res.json({ starters });

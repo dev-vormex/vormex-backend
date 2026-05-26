@@ -1,4 +1,6 @@
 import { prisma } from '../config/prisma';
+import type * as admin from 'firebase-admin';
+import { getFirebaseMessaging, initializeFirebaseAdmin } from './firebase-admin.service';
 
 /**
  * Push Notification Service
@@ -44,42 +46,16 @@ interface RecommendedMatchPushData {
   tab?: string;
 }
 
-// Firebase Admin SDK for push notifications
-import * as admin from 'firebase-admin';
-let firebaseInitialized = false;
-
 let fcmEnabled = false;
 
 function initializeFirebase(): boolean {
-  if (firebaseInitialized) return true;
-  
-  try {
-    const projectId = process.env.FIREBASE_PROJECT_ID;
-    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-
-    if (!projectId || !clientEmail || !privateKey) {
-      console.warn('Firebase credentials not configured. Push notifications disabled.');
-      console.log('Push notifications running in mock mode (FCM not configured)');
-      return false;
-    }
-
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId,
-        clientEmail,
-        privateKey,
-      }),
-    });
-
-    firebaseInitialized = true;
-    fcmEnabled = true;
-    console.log('Firebase Admin SDK initialized successfully');
-    return true;
-  } catch (error) {
-    console.error('Failed to initialize Firebase Admin SDK:', error);
-    return false;
+  const initialized = initializeFirebaseAdmin();
+  if (!initialized) {
+    console.warn('Firebase credentials not configured. Push notifications disabled.');
+    console.log('Push notifications running in mock mode (FCM not configured)');
   }
+  fcmEnabled = initialized;
+  return initialized;
 }
 
 class PushNotificationService {
@@ -111,7 +87,16 @@ class PushNotificationService {
       }
 
       // Send via Firebase Cloud Messaging
-      const messaging = admin.messaging();
+      const messaging = getFirebaseMessaging();
+      if (!messaging) {
+        console.log(`📱 [MOCK] Push notification to ${userId}:`);
+        console.log(`  Title: ${payload.title}`);
+        console.log(`  Body: ${payload.body}`);
+        if (payload.data) {
+          console.log(`  Data:`, payload.data);
+        }
+        return true;
+      }
       const tokenStrings = tokens.map(t => t.token);
       
       // IMPORTANT: Use DATA-ONLY messages (no 'notification' field)
@@ -359,8 +344,25 @@ class PushNotificationService {
     preview: string,
     conversationId: string,
     senderId?: string,
-    senderImage?: string
+    senderImage?: string,
+    message?: {
+      id?: string;
+      clientMessageId?: string;
+      content?: string;
+      contentType?: string;
+      mediaUrl?: string | null;
+      mediaType?: string | null;
+      fileName?: string | null;
+      fileSize?: number | null;
+      createdAt?: string | Date;
+      updatedAt?: string | Date;
+    }
   ): Promise<boolean> {
+    const messageCreatedAt =
+      message?.createdAt instanceof Date ? message.createdAt.toISOString() : message?.createdAt;
+    const messageUpdatedAt =
+      message?.updatedAt instanceof Date ? message.updatedAt.toISOString() : message?.updatedAt;
+
     return this.sendToUser(userId, {
       title: senderName,
       body: preview.length > 100 ? preview.substring(0, 97) + '...' : preview,
@@ -370,6 +372,16 @@ class PushNotificationService {
         user_id: senderId || '',
         senderName,
         senderImage: senderImage || '',
+        messageId: message?.id || '',
+        clientMessageId: message?.clientMessageId || '',
+        messageContent: message?.content || preview || '',
+        contentType: message?.contentType || 'text',
+        mediaUrl: message?.mediaUrl || '',
+        mediaType: message?.mediaType || '',
+        fileName: message?.fileName || '',
+        fileSize: message?.fileSize != null ? String(message.fileSize) : '',
+        messageCreatedAt: messageCreatedAt || '',
+        messageUpdatedAt: messageUpdatedAt || messageCreatedAt || '',
         screen: 'chat',
       },
     });

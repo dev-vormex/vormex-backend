@@ -1,5 +1,5 @@
 import type { Server } from 'socket.io';
-import { redisSub } from '../redis/client';
+import { isRedisEnabled, redisSub } from '../redis/client';
 import { REALTIME_CHANNEL, type RealtimeEnvelope } from './channels';
 import { emitRealtimeEnvelopeToServer } from './emitter';
 import { logger } from '../../lib/logger';
@@ -7,7 +7,7 @@ import { logger } from '../../lib/logger';
 let subscribed = false;
 
 export async function initializeRealtimeSubscriptions(io: Server): Promise<void> {
-  if (!redisSub || subscribed) {
+  if (!isRedisEnabled() || !redisSub || subscribed) {
     return;
   }
 

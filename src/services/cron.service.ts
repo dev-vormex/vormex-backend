@@ -1,6 +1,8 @@
 import { prisma } from '../config/prisma';
 import { engagementService } from './engagement.service';
 import { pushNotificationService } from './push-notification.service';
+import { importExternalHackathons } from './hackathon-import.service';
+import { runHackathonWeeklyDigest } from './hackathon-digest.service';
 import { runReengagementCampaign } from './reengagement-notification.service';
 import { socialProofService } from './social-proof.service';
 import { storyService } from './story.service';
@@ -20,6 +22,16 @@ export const maintenanceSchedules = [
     schedulerId: 'weekly_counter_reset',
     jobName: 'weekly_counter_reset',
     pattern: '30 18 * * 0',
+  },
+  {
+    schedulerId: 'hackathon_weekly_digest',
+    jobName: 'hackathon_weekly_digest',
+    pattern: '0 17 * * 5',
+  },
+  {
+    schedulerId: 'hackathon_external_import',
+    jobName: 'hackathon_external_import',
+    pattern: '15 */6 * * *',
   },
   {
     schedulerId: 'social_proof_leaderboard',
@@ -151,6 +163,10 @@ export async function runMaintenanceJob(jobName: MaintenanceJobName): Promise<un
       return engagementService.processStreakFreezes();
     case 'weekly_counter_reset':
       return engagementService.resetWeeklyCounters();
+    case 'hackathon_weekly_digest':
+      return runHackathonWeeklyDigest();
+    case 'hackathon_external_import':
+      return importExternalHackathons();
     case 'social_proof_leaderboard':
       return socialProofService.runLeaderboardCron();
     case 'social_proof_trending':

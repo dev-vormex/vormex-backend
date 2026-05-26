@@ -1,13 +1,24 @@
 // @ts-nocheck
 import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { Request, Response } from 'express';
 import { prisma, prismaRead } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { bunnyStorageService } from '../services/bunny-storage.service';
 import { notificationService } from '../services/notification.service';
 import { recordActivity } from '../services/activity.service';
+import { cacheService } from '../services/cache.service';
 import { updateEngagementStreak } from './engagement.controller';
-import { rankFeed } from '../services/feed-algorithm.service';
+import { queueNames } from '../infrastructure/queue/queue-names';
+import { getQueue } from '../infrastructure/queue/queues';
+import { logger } from '../lib/logger';
+import {
+  buildFeedRecommendationProfile,
+  decodeRecommendedFeedCursor,
+  rankFeedPage,
+  recommendedFeedCandidateLimit,
+  type FeedRecommendationProfileInput,
+} from '../services/feed-algorithm.service';
 import {
   enqueueCacheInvalidation,
   enqueueNotificationDelivery,
@@ -26,12 +37,171 @@ import {
   type StoredPostMetadata,
 } from '../utils/post.util';
 import { parseStoredMusicAttachment } from '../utils/music.util';
+import { buildPostVisibilityWhere, canViewPost } from '../utils/access-control.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
 
 const FEED_REALTIME_ROOM = 'feed:global';
+const FEED_IMPRESSION_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const FEED_IMPRESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const HOME_FEED_CACHE_TTL_SECONDS = 60;
+const HOME_FEED_CACHE_VERSION = 'v1';
+const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
+const HOME_FEED_DEFAULT_LIMIT = 40;
+const HOME_FEED_MAX_LIMIT = 50;
+const HOME_FEED_RECOMMENDATION_CONTEXT_CACHE_TTL_SECONDS = 2 * 60;
+const RECENT_PROFILE_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_RECENT_PROFILE_SIGNALS = 24;
+const MAX_FEED_CONTEXT_CONNECTIONS = 500;
+const MAX_FEED_CONTEXT_FOLLOWS = 500;
+const MAX_FEED_CONTEXT_EXPERIENCES = 12;
+const MAX_FEED_CONTEXT_PROJECTS = 12;
+const MAX_FEED_CONTEXT_EDUCATION = 12;
+let lastFeedImpressionCleanupAt = 0;
+const postAuthorSelect = {
+  id: true,
+  username: true,
+  name: true,
+  profileImage: true,
+  headline: true,
+  isVerified: true,
+};
+const postAuthorWithProfileSignalsSelect = {
+  ...postAuthorSelect,
+  college: true,
+  branch: true,
+  degree: true,
+};
+
+const postResponseInclude = (
+  currentUserId: string,
+  options: { authorProfileSignals?: boolean } = {}
+) => ({
+  author: {
+    select: options.authorProfileSignals
+      ? postAuthorWithProfileSignalsSelect
+      : postAuthorSelect,
+  },
+  collaborators: {
+    include: {
+      user: {
+        select: postAuthorSelect,
+      },
+    },
+  },
+  likes: {
+    where: { userId: currentUserId },
+    select: { userId: true },
+  },
+  saved_posts: {
+    where: { userId: currentUserId },
+    select: { userId: true },
+  },
+  pollVotes: {
+    where: { userId: currentUserId },
+    select: { optionId: true, userId: true },
+  },
+  _count: { select: { saved_posts: true } },
+});
+
+const feedCacheTags = (...tags: Array<string | null | undefined>): string[] => {
+  const dynamicTags = tags.filter((tag): tag is string => Boolean(tag));
+  return Array.from(new Set([HOME_FEED_CACHE_GLOBAL_TAG, ...dynamicTags]));
+};
+
+async function enqueuePostCreatedFollowerFeedInvalidation(postId: string, authorId: string): Promise<void> {
+  try {
+    await getQueue(queueNames.cacheInvalidation).add(
+      'post_created',
+      {
+        type: 'post_created',
+        postId,
+        authorId,
+      },
+      {
+        jobId: `post_created:${postId}:follower_feed_cache_invalidation`,
+      }
+    );
+  } catch (error) {
+    logger.error({
+      event: 'post.created.follower_feed_cache_invalidation.enqueue_failed',
+      postId,
+      authorId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function buildHomeFeedCacheKey(params: {
+  userId: string;
+  cursor: string;
+  limit: number;
+  mode: 'latest' | 'recommended';
+}): string {
+  return [
+    'posts:feed',
+    HOME_FEED_CACHE_VERSION,
+    `user:${params.userId}`,
+    `mode:${params.mode}`,
+    `limit:${params.limit}`,
+    `cursor:${params.cursor || 'first'}`,
+  ].join(':');
+}
+
+function buildFeedRecommendationContextCacheKey(userId: string): string {
+  return `posts:feed:recommendation-context:${HOME_FEED_CACHE_VERSION}:${userId}`;
+}
+
+function shouldBypassHomeFeedCache(req: Request): boolean {
+  const cacheControl = String(req.headers['cache-control'] || '').toLowerCase();
+  return (
+    cacheControl.includes('no-cache') ||
+    Boolean(ensureString(req.query.cacheBust)) ||
+    Boolean(ensureString(req.query._t))
+  );
+}
+
+function writeRecommendedFeedImpressions(currentUserId: string, postIds: string[]): void {
+  const feedImpressionsModel = (prisma as any).feed_impressions;
+  const uniquePostIds = Array.from(new Set(postIds.filter(Boolean)));
+  if (!feedImpressionsModel || uniquePostIds.length === 0) return;
+
+  const now = new Date();
+  const shouldRunCleanup = now.getTime() - lastFeedImpressionCleanupAt > FEED_IMPRESSION_CLEANUP_INTERVAL_MS;
+  if (shouldRunCleanup) {
+    lastFeedImpressionCleanupAt = now.getTime();
+  }
+
+  // Fire-and-forget: never block feed response on impression writes.
+  void (async () => {
+    await prisma.$executeRaw(
+      Prisma.sql`
+        INSERT INTO "feed_impressions" ("id", "userId", "postId", "seenAt")
+        VALUES ${Prisma.join(
+          uniquePostIds.map((postId) => Prisma.sql`(${randomUUID()}, ${currentUserId}, ${postId}, ${now})`)
+        )}
+        ON CONFLICT ("userId", "postId")
+        DO UPDATE SET "seenAt" = EXCLUDED."seenAt"
+      `
+    );
+
+    if (shouldRunCleanup) {
+      await feedImpressionsModel.deleteMany({
+        where: { seenAt: { lt: new Date(now.getTime() - FEED_IMPRESSION_LOOKBACK_MS) } },
+      });
+    }
+  })().catch((impressionError: unknown) => {
+    console.error('Failed to write feed impressions:', impressionError);
+  });
+}
+
+const getPostRealtimeRooms = (postId: string, visibility?: string | null): string[] => (
+  String(visibility || 'public').toLowerCase() === 'public'
+    ? [FEED_REALTIME_ROOM, `post:${postId}`]
+    : [`post:${postId}`]
+);
 
 function buildMetadataFromRequest(
   body: Record<string, unknown>,
@@ -40,10 +210,15 @@ function buildMetadataFromRequest(
 ): StoredPostMetadata | null {
   const metadata: StoredPostMetadata = {};
   const mentions = parseStringArrayField(body.mentions);
+  const collaboratorIds = parseStringArrayField(body.collaboratorIds);
   const music = parseStoredMusicAttachment(body.music);
 
   if (mentions.length > 0) {
     metadata.mentions = mentions;
+  }
+
+  if (collaboratorIds.length > 0) {
+    metadata.pendingCollaboratorIds = collaboratorIds;
   }
 
   if (music) {
@@ -123,6 +298,163 @@ function buildMetadataFromRequest(
   return Object.keys(metadata).length > 0 ? metadata : null;
 }
 
+function compactStringList(values: unknown[]): string[] {
+  return values
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean);
+}
+
+function connectionPeerIds(
+  rows: Array<{ requesterId?: string | null; addresseeId?: string | null }>,
+  currentUserId: string
+): string[] {
+  return Array.from(
+    new Set(
+      rows
+        .flatMap((connection) => [connection.requesterId, connection.addresseeId])
+        .filter((userId): userId is string => Boolean(userId && userId !== currentUserId))
+    )
+  );
+}
+
+function recentProfileWeights(
+  rows: Array<{ viewedId?: string | null }>,
+  currentUserId: string
+): Record<string, number> {
+  const uniqueViewedIds = rows
+    .map((row) => String(row.viewedId || '').trim())
+    .filter((viewedId) => viewedId && viewedId !== currentUserId)
+    .filter((viewedId, index, all) => all.indexOf(viewedId) === index)
+    .slice(0, MAX_RECENT_PROFILE_SIGNALS);
+
+  return Object.fromEntries(
+    uniqueViewedIds.map((viewedId, index) => [
+      viewedId,
+      Math.max(1, MAX_RECENT_PROFILE_SIGNALS - index),
+    ])
+  );
+}
+
+async function buildFeedRecommendationContextForUser(currentUserId: string) {
+  const cacheKey = buildFeedRecommendationContextCacheKey(currentUserId);
+  const cachedContextInput = await cacheService.get<FeedRecommendationProfileInput>(cacheKey);
+  if (cachedContextInput) {
+    return buildFeedRecommendationProfile(cachedContextInput);
+  }
+
+  const profileViewsModel = (prismaRead as any).profile_views;
+  const followsModel = (prismaRead as any).follows;
+
+  const [user, acceptedConnections, following, recentViews] = await Promise.all([
+    prismaRead.user.findUnique({
+      where: { id: currentUserId },
+      select: {
+        id: true,
+        college: true,
+        branch: true,
+        degree: true,
+        interests: true,
+        skills: {
+          select: {
+            skill: {
+              select: { name: true },
+            },
+          },
+        },
+        experiences: {
+          select: { skills: true },
+          orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }],
+          take: MAX_FEED_CONTEXT_EXPERIENCES,
+        },
+        projects: {
+          select: { techStack: true },
+          orderBy: [{ featured: 'desc' }, { startDate: 'desc' }],
+          take: MAX_FEED_CONTEXT_PROJECTS,
+        },
+        educationHistory: {
+          select: {
+            school: true,
+            degree: true,
+            fieldOfStudy: true,
+          },
+          orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }],
+          take: MAX_FEED_CONTEXT_EDUCATION,
+        },
+      },
+    }),
+    prismaRead.connections.findMany({
+      where: {
+        status: 'accepted',
+        OR: [{ requesterId: currentUserId }, { addresseeId: currentUserId }],
+      },
+      select: { requesterId: true, addresseeId: true },
+      orderBy: { updatedAt: 'desc' },
+      take: MAX_FEED_CONTEXT_CONNECTIONS,
+    }),
+    followsModel?.findMany
+      ? followsModel.findMany({
+          where: { followerId: currentUserId },
+          select: { followingId: true },
+          orderBy: { createdAt: 'desc' },
+          take: MAX_FEED_CONTEXT_FOLLOWS,
+        })
+      : Promise.resolve([]),
+    profileViewsModel?.findMany
+      ? profileViewsModel.findMany({
+          where: {
+            viewerId: currentUserId,
+            viewedId: { not: currentUserId },
+            viewedAt: { gte: new Date(Date.now() - RECENT_PROFILE_LOOKBACK_MS) },
+          },
+          select: { viewedId: true, viewedAt: true },
+          orderBy: { viewedAt: 'desc' },
+          take: MAX_RECENT_PROFILE_SIGNALS * 3,
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const skillHints = compactStringList([
+    ...(user?.skills || []).map((item: any) => item?.skill?.name),
+    ...(user?.experiences || []).flatMap((experience: any) => experience?.skills || []),
+    ...(user?.projects || []).flatMap((project: any) => project?.techStack || []),
+  ]);
+
+  const educationHints = compactStringList([
+    user?.college,
+    user?.branch,
+    user?.degree,
+    ...(user?.educationHistory || []).flatMap((education: any) => [
+      education?.school,
+      education?.degree,
+      education?.fieldOfStudy,
+    ]),
+  ]);
+
+  const contextInput: FeedRecommendationProfileInput = {
+    currentUserId,
+    skills: skillHints,
+    interests: compactStringList(user?.interests || []),
+    educationHints,
+    connectionAuthorIds: connectionPeerIds(acceptedConnections || [], currentUserId),
+    followingAuthorIds: (following || []).map((item: any) => item.followingId),
+    recentProfileWeights: recentProfileWeights(recentViews || [], currentUserId),
+  };
+
+  void cacheService
+    .set(
+      cacheKey,
+      contextInput,
+      HOME_FEED_RECOMMENDATION_CONTEXT_CACHE_TTL_SECONDS,
+      [`feed:${currentUserId}`, `user:${currentUserId}`]
+    )
+    .catch((cacheError: unknown) => {
+      console.error('Failed to cache feed recommendation context:', cacheError);
+    });
+
+  return buildFeedRecommendationProfile(contextInput);
+}
+
 function collectOwnedPostMediaUrls(post: { mediaUrls?: string[] | null; metadata?: unknown }, userId: string): string[] {
   const metadata = getPostMetadata(post.metadata);
   const candidates = [
@@ -172,129 +504,166 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     }
 
     const currentUserId = String(req.user.userId);
+    const requestStartedAtMs = Date.now();
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const requestedLimit = parseInt(ensureString(req.query.limit) || String(HOME_FEED_DEFAULT_LIMIT), 10);
+    const limit = Math.min(
+      Math.max(Number.isFinite(requestedLimit) ? requestedLimit : HOME_FEED_DEFAULT_LIMIT, 1),
+      HOME_FEED_MAX_LIMIT
+    );
     const modeRaw = (ensureString(req.query.mode) || 'recommended').toLowerCase();
     const mode: 'latest' | 'recommended' = modeRaw === 'latest' ? 'latest' : 'recommended';
-
-    const acceptedConnections = await prismaRead.connections.findMany({
-      where: {
-        status: 'accepted',
-        OR: [{ requesterId: currentUserId }, { addresseeId: currentUserId }],
-      },
-      select: { requesterId: true, addresseeId: true },
+    const recommendedCursorState =
+      mode === 'recommended'
+        ? decodeRecommendedFeedCursor(cursor, requestStartedAtMs)
+        : null;
+    const recommendationSessionStartedAtMs =
+      recommendedCursorState?.sessionStartedAtMs ?? requestStartedAtMs;
+    const dbCursor =
+      mode === 'recommended'
+        ? recommendedCursorState?.baseCursor
+        : cursor;
+    const candidateLimit =
+      mode === 'recommended'
+        ? recommendedFeedCandidateLimit(limit)
+        : limit;
+    const bypassFeedCache = shouldBypassHomeFeedCache(req);
+    const cacheCursor =
+      mode === 'recommended'
+        ? cursor
+        : dbCursor;
+    const feedCacheKey = buildHomeFeedCacheKey({
+      userId: currentUserId,
+      cursor: cacheCursor || '',
+      limit,
+      mode,
     });
-    const connectedUserIds = new Set(
-      acceptedConnections.flatMap((c) => [c.requesterId, c.addresseeId]),
-    );
-    connectedUserIds.delete(currentUserId);
-    const connectionAuthorIds = Array.from(connectedUserIds);
 
-    const feedVisibilityOr: Array<Record<string, unknown>> = [
-      { visibility: 'public' },
-      { authorId: currentUserId },
-    ];
-    if (connectionAuthorIds.length > 0) {
-      feedVisibilityOr.push({
-        AND: [{ visibility: 'connections' }, { authorId: { in: connectionAuthorIds } }],
-      });
+    if (!bypassFeedCache) {
+      const cachedFeed = await cacheService.get<{
+        posts: any[];
+        nextCursor: string | null;
+        hasMore: boolean;
+      }>(feedCacheKey);
+      if (cachedFeed) {
+        res.setHeader('X-Vormex-Cache', 'HIT');
+        res.json(cachedFeed);
+        if (mode === 'recommended') {
+          writeRecommendedFeedImpressions(currentUserId, cachedFeed.posts.map((post) => post.id));
+        }
+        return;
+      }
     }
+
+    const accessWhere = await buildPostVisibilityWhere(currentUserId);
 
     const postsPromise = prismaRead.post.findMany({
       where: {
         isActive: true,
-        OR: feedVisibilityOr,
+        ...accessWhere,
+        ...(mode === 'recommended'
+          ? { createdAt: { lte: new Date(recommendationSessionStartedAtMs + 5_000) } }
+          : {}),
       },
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
-          },
-        },
-        likes: {
-          where: { userId: currentUserId },
-          select: { userId: true },
-        },
-        saved_posts: {
-          where: { userId: currentUserId },
-          select: { userId: true },
-        },
-        pollVotes: {
-          where: { userId: currentUserId },
-          select: { optionId: true, userId: true },
-        },
-        _count: { select: { saved_posts: true } },
-      },
+      include: postResponseInclude(currentUserId, { authorProfileSignals: mode === 'recommended' }),
       orderBy: { createdAt: 'desc' },
-      take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      take: candidateLimit + 1,
+      ...(dbCursor ? { cursor: { id: dbCursor }, skip: 1 } : {}),
     });
 
     const feedImpressionsModel = (prismaRead as any).feed_impressions;
-    const impressionsPromise =
-      mode === 'recommended' && feedImpressionsModel
-        ? feedImpressionsModel.findMany({
+    const recommendationContextPromise =
+      mode === 'recommended'
+        ? buildFeedRecommendationContextForUser(currentUserId)
+        : Promise.resolve(null);
+
+    const [posts, recommendationContext] = await Promise.all([
+      postsPromise,
+      recommendationContextPromise,
+    ]);
+
+    const hasMoreChronological = posts.length > candidateLimit;
+    const chronologicalItems = hasMoreChronological ? posts.slice(0, candidateLimit) : posts;
+
+    const impressions =
+      mode === 'recommended' && feedImpressionsModel && chronologicalItems.length > 0
+        ? await feedImpressionsModel.findMany({
             where: {
               userId: currentUserId,
-              seenAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+              postId: { in: chronologicalItems.map((post) => post.id) },
+              seenAt: { gte: new Date(Date.now() - FEED_IMPRESSION_LOOKBACK_MS) },
             },
-            select: { postId: true },
+            select: { postId: true, seenAt: true },
           })
-        : Promise.resolve([]);
-
-    const [posts, impressions] = await Promise.all([postsPromise, impressionsPromise]);
-
-    const hasMore = posts.length > limit;
-    const chronologicalItems = hasMore ? posts.slice(0, limit) : posts;
-
-    const seenPostIds = Array.isArray(impressions)
-      ? impressions.map((item: { postId: string }) => item.postId)
+        : [];
+    const rankingImpressions = Array.isArray(impressions)
+      ? impressions.filter((item: { seenAt: Date }) => {
+          const seenAtMs = new Date(item.seenAt).getTime();
+          return !Number.isFinite(seenAtMs) || seenAtMs < recommendationSessionStartedAtMs;
+        })
       : [];
 
+    const seenPostIds = Array.isArray(rankingImpressions)
+      ? rankingImpressions.map((item: { postId: string }) => item.postId)
+      : [];
+    const seenAtByPostId = Array.isArray(rankingImpressions)
+      ? Object.fromEntries(
+          rankingImpressions.map((item: { postId: string; seenAt: Date }) => [item.postId, item.seenAt])
+        )
+      : {};
+
     let pageItems = chronologicalItems;
+    let nextCursor: string | null = null;
+    let hasMore = hasMoreChronological;
     if (mode === 'recommended') {
       try {
-        pageItems = rankFeed(chronologicalItems, seenPostIds);
+        const rankedPage = rankFeedPage(chronologicalItems, {
+          ...(recommendationContext || {}),
+          seenPostIds,
+          seenAtByPostId,
+          nowMs: recommendationSessionStartedAtMs,
+        }, {
+          limit,
+          cursorState: recommendedCursorState || undefined,
+          hasMoreChronological,
+          chronologicalBoundaryCursor: chronologicalItems[chronologicalItems.length - 1]?.id || null,
+        });
+        pageItems = rankedPage.items;
+        nextCursor = rankedPage.nextCursor;
+        hasMore = rankedPage.hasMore;
       } catch (rankingError) {
         console.error('Feed ranking failed, falling back to latest ordering:', rankingError);
-        pageItems = chronologicalItems;
+        pageItems = chronologicalItems.slice(0, limit);
+        nextCursor =
+          hasMoreChronological || chronologicalItems.length > pageItems.length
+            ? pageItems[pageItems.length - 1]?.id || null
+            : null;
+        hasMore = Boolean(nextCursor);
       }
+    } else {
+      pageItems = chronologicalItems.slice(0, limit);
+      nextCursor = hasMoreChronological ? pageItems[pageItems.length - 1]?.id || null : null;
     }
 
-    res.json({
+    const responsePayload = {
       posts: pageItems.map((post) => mapPostResponse(post, currentUserId)),
-      // Keep cursor progression tied to chronological batch for backward-compatible pagination.
-      nextCursor: hasMore ? chronologicalItems[chronologicalItems.length - 1].id : null,
+      nextCursor,
       hasMore,
-    });
+    };
+
+    res.setHeader('X-Vormex-Cache', bypassFeedCache ? 'BYPASS' : 'MISS');
+    res.json(responsePayload);
+
+    if (!bypassFeedCache) {
+      void cacheService
+        .set(feedCacheKey, responsePayload, HOME_FEED_CACHE_TTL_SECONDS, feedCacheTags(`feed:${currentUserId}`))
+        .catch((cacheError: unknown) => {
+          console.error('Failed to cache home feed:', cacheError);
+        });
+    }
 
     if (mode === 'recommended' && feedImpressionsModel && pageItems.length > 0) {
-      const uniquePostIds = Array.from(new Set(pageItems.map((post) => post.id)));
-      const now = new Date();
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-      // Fire-and-forget: never block feed response on impression writes.
-      void Promise.all(
-        uniquePostIds.map((postId) =>
-          feedImpressionsModel.upsert({
-            where: { userId_postId: { userId: currentUserId, postId } },
-            create: { userId: currentUserId, postId, seenAt: now },
-            update: { seenAt: now },
-          })
-        )
-      )
-        .then(() =>
-          feedImpressionsModel.deleteMany({
-            where: { seenAt: { lt: sevenDaysAgo } },
-          })
-        )
-        .catch((impressionError: unknown) => {
-          console.error('Failed to write feed impressions:', impressionError);
-        });
+      writeRecommendedFeedImpressions(currentUserId, pageItems.map((post) => post.id));
     }
   } catch (error) {
     console.error('getFeed error:', error);
@@ -321,40 +690,13 @@ export const getPost = async (req: AuthRequest, res: Response): Promise<void> =>
       where: {
         id: postId,
         isActive: true,
+        ...(await buildPostVisibilityWhere(currentUserId)),
       },
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
-          },
-        },
-        likes: {
-          where: { userId: currentUserId },
-          select: { userId: true },
-        },
-        saved_posts: {
-          where: { userId: currentUserId },
-          select: { userId: true },
-        },
-        pollVotes: {
-          where: { userId: currentUserId },
-          select: { optionId: true, userId: true },
-        },
-        _count: { select: { saved_posts: true } },
-      },
+      include: postResponseInclude(currentUserId),
     });
 
     if (!post) {
       res.status(404).json({ error: 'Post not found' });
-      return;
-    }
-
-    if (post.visibility === 'private' && post.authorId !== currentUserId) {
-      res.status(403).json({ error: 'Post is private' });
       return;
     }
 
@@ -469,6 +811,26 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
       await enrichLinkMetadataFromUrl(metadata);
     }
 
+    const requestedCollaboratorIds = Array.from(new Set(parseStringArrayField(metadata?.pendingCollaboratorIds)))
+      .filter((collaboratorId) => collaboratorId && collaboratorId !== userId)
+      .slice(0, 30);
+    const validCollaboratorIds =
+      requestedCollaboratorIds.length > 0
+        ? (
+            await prismaRead.user.findMany({
+              where: {
+                id: { in: requestedCollaboratorIds },
+                isBanned: false,
+              },
+              select: { id: true },
+            })
+          ).map((user) => user.id)
+        : [];
+
+    if (metadata?.pendingCollaboratorIds) {
+      metadata.pendingCollaboratorIds = validCollaboratorIds;
+    }
+
     const peerIds =
       visibility === 'connections'
         ? Array.from(
@@ -486,7 +848,7 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
           ).filter((peerId) => peerId !== userId)
         : [];
 
-    const created = await prisma.$transaction(async (tx) => {
+	    const created = await prisma.$transaction(async (tx) => {
       const nextPost = await tx.post.create({
         data: {
           authorId: userId,
@@ -496,31 +858,21 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
           mediaUrls,
           metadata,
         },
-        include: {
-          author: {
-            select: {
-              id: true,
-              username: true,
-              name: true,
-              profileImage: true,
-              headline: true,
-            },
-          },
-          likes: {
-            where: { userId },
-            select: { userId: true },
-          },
-          saved_posts: {
-            where: { userId },
-            select: { userId: true },
-          },
-          pollVotes: {
-            where: { userId },
-            select: { optionId: true, userId: true },
-          },
-          _count: { select: { saved_posts: true } },
-        },
+        include: postResponseInclude(userId),
       });
+
+      if (validCollaboratorIds.length > 0) {
+        await (tx as any).postCollaborator.createMany({
+          data: validCollaboratorIds.map((collaboratorId) => ({
+            id: randomUUID(),
+            postId: nextPost.id,
+            userId: collaboratorId,
+            invitedById: userId,
+            status: 'pending',
+          })),
+          skipDuplicates: true,
+        });
+      }
 
       const mappedPost = mapPostResponse(nextPost, userId);
       const envelopes: Array<Record<string, unknown>> = [
@@ -562,16 +914,71 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
         aggregateType: 'post',
         aggregateId: nextPost.id,
         eventType: 'post.created.cache.invalidate',
-        tags: [`feed:${userId}`, `user:${userId}`],
+        tags: feedCacheTags(`feed:${userId}`, `user:${userId}`),
       });
 
       return nextPost;
     });
 
+    await enqueuePostCreatedFollowerFeedInvalidation(created.id, userId);
+
     // Record activity and update posting streak (non-blocking)
     const activityType = mappedType === 'article' ? 'article' : 'post';
     recordActivity(userId, activityType, 1, { sourceId: created.id }).catch(console.error);
     updateEngagementStreak(userId, 'posting').catch(console.error);
+
+    const collaboratorIds = validCollaboratorIds;
+    const collaboratorIdSet = new Set(collaboratorIds);
+    const mentionedUserIds = Array.from(new Set(parseStringArrayField(metadata?.mentions)))
+      .filter((mentionedUserId) => mentionedUserId && mentionedUserId !== userId)
+      .filter((mentionedUserId) => !collaboratorIdSet.has(mentionedUserId))
+      .slice(0, 30);
+    if (mentionedUserIds.length > 0 || collaboratorIds.length > 0) {
+      Promise.resolve()
+        .then(async () => {
+          const [mentionableUsers, collaboratorUsers] = await Promise.all([
+            mentionedUserIds.length > 0 ? prisma.user.findMany({
+              where: {
+                id: { in: mentionedUserIds },
+                isBanned: false,
+              },
+              select: { id: true },
+            }) : [],
+            collaboratorIds.length > 0 ? prisma.user.findMany({
+              where: {
+                id: { in: collaboratorIds },
+                isBanned: false,
+              },
+              select: { id: true },
+            }) : [],
+          ]);
+          const mentionerName = created.author?.name || created.author?.username || 'Someone';
+          const preview = content || `${mentionerName} tagged you in a ${mappedType} post`;
+
+          await Promise.all([
+            ...mentionableUsers.map((mentionedUser) =>
+              notificationService.notifyMention(
+                mentionedUser.id,
+                userId,
+                mentionerName,
+                'post',
+                created.id,
+                preview
+              )
+            ),
+            ...collaboratorUsers.map((collaboratorUser) =>
+              notificationService.notifyPostCollabInvite(
+                collaboratorUser.id,
+                userId,
+                mentionerName,
+                created.id,
+                preview
+              )
+            ),
+          ]);
+        })
+        .catch(console.error);
+    }
 
     res.status(201).json(mapPostResponse(created, userId));
   } catch (error) {
@@ -621,36 +1028,187 @@ export const updatePost = async (req: AuthRequest, res: Response): Promise<void>
     const updated = await prisma.post.update({
       where: { id: postId },
       data,
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
-          },
-        },
-        likes: {
-          where: { userId },
-          select: { userId: true },
-        },
-        saved_posts: {
-          where: { userId },
-          select: { userId: true },
-        },
-        pollVotes: {
-          where: { userId },
-          select: { optionId: true, userId: true },
-        },
-        _count: { select: { saved_posts: true } },
-      },
+      include: postResponseInclude(userId),
     });
 
     res.status(200).json(mapPostResponse(updated, userId));
   } catch (error) {
     console.error('updatePost error:', error);
     res.status(500).json({ error: 'Failed to update post' });
+  }
+};
+
+// Accept or reject a post collaboration invite
+export const respondToPostCollabInvite = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const postId = ensureString(req.params.postId);
+    const action = ensureString(req.body?.action).toLowerCase();
+    if (!postId) {
+      res.status(400).json({ error: 'Post ID is required' });
+      return;
+    }
+    if (!['accept', 'reject'].includes(action)) {
+      res.status(400).json({ error: 'action must be "accept" or "reject"' });
+      return;
+    }
+
+    const post = await prisma.post.findFirst({
+      where: { id: postId, isActive: true },
+      select: {
+        id: true,
+        authorId: true,
+        metadata: true,
+      },
+    });
+    if (!post) {
+      res.status(404).json({ error: 'Post not found' });
+      return;
+    }
+    if (post.authorId === userId) {
+      res.status(400).json({ error: 'You cannot respond to your own collaboration invite' });
+      return;
+    }
+
+    const existingCollaboration = await (prisma as any).postCollaborator.findUnique({
+      where: { postId_userId: { postId, userId } },
+      select: { id: true, status: true },
+    }).catch(() => null);
+    const rawMetadata =
+      post.metadata && typeof post.metadata === 'object' && !Array.isArray(post.metadata)
+        ? { ...(post.metadata as Record<string, unknown>) }
+        : {};
+    const pendingFromMetadata = [
+      ...parseStringArrayField(rawMetadata.pendingCollaboratorIds),
+      ...parseStringArrayField(rawMetadata.collaboratorIds),
+    ];
+    const wasInvited = Boolean(existingCollaboration) || pendingFromMetadata.includes(userId);
+    if (!wasInvited) {
+      res.status(404).json({ error: 'Collaboration invite not found' });
+      return;
+    }
+
+    const nextStatus = action === 'accept' ? 'accepted' : 'rejected';
+    const now = new Date();
+
+    await prisma.$transaction(async (tx) => {
+      await (tx as any).postCollaborator.upsert({
+        where: { postId_userId: { postId, userId } },
+        create: {
+          id: randomUUID(),
+          postId,
+          userId,
+          invitedById: post.authorId,
+          status: nextStatus,
+          respondedAt: now,
+        },
+        update: {
+          status: nextStatus,
+          respondedAt: now,
+        },
+      });
+
+      const metadata = { ...rawMetadata };
+      const pendingCollaboratorIds = parseStringArrayField(metadata.pendingCollaboratorIds)
+        .filter((collaboratorId) => collaboratorId !== userId);
+      const collaboratorIds = parseStringArrayField(metadata.collaboratorIds)
+        .filter((collaboratorId) => collaboratorId !== userId);
+      if (nextStatus === 'accepted') {
+        collaboratorIds.push(userId);
+      }
+      metadata.pendingCollaboratorIds = Array.from(new Set(pendingCollaboratorIds));
+      metadata.collaboratorIds = Array.from(new Set(collaboratorIds));
+
+      await tx.post.update({
+        where: { id: postId },
+        data: { metadata },
+      });
+
+      const inviteNotifications = await tx.notifications.findMany({
+        where: {
+          userId,
+          postId,
+          type: 'mention',
+        },
+        select: {
+          id: true,
+          data: true,
+        },
+      });
+
+      await Promise.all(
+        inviteNotifications
+          .filter((notification) => {
+            const data = notification.data as Record<string, unknown> | null;
+            return data?.context === 'post_collab_invite';
+          })
+          .map((notification) => {
+            const data = (notification.data || {}) as Record<string, unknown>;
+            return tx.notifications.update({
+              where: { id: notification.id },
+              data: {
+                isRead: true,
+                readAt: now,
+                data: {
+                  ...data,
+                  collabStatus: nextStatus,
+                  respondedAt: now.toISOString(),
+                },
+              },
+            });
+          })
+      );
+    });
+
+    await cacheService.invalidateTags(
+      HOME_FEED_CACHE_GLOBAL_TAG,
+      `feed:${userId}`,
+      `user:${userId}`,
+      `user:${post.authorId}`,
+      `notifications:${userId}`
+    ).catch(() => undefined);
+
+    if (nextStatus === 'accepted') {
+      const collaborator = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { name: true, username: true },
+      });
+      const collaboratorName = collaborator?.name || collaborator?.username || 'Someone';
+      notificationService.createNotification({
+        userId: post.authorId,
+        type: 'mention',
+        title: '🤝 Collaboration accepted',
+        body: `${collaboratorName} accepted your post collaboration invite`,
+        actorId: userId,
+        postId,
+        data: {
+          type: 'mention',
+          screen: 'post',
+          context: 'post_collab_accepted',
+          actorId: userId,
+          postId,
+        },
+      }).catch(() => undefined);
+    }
+
+    const updatedPost = await prisma.post.findUnique({
+      where: { id: postId },
+      include: postResponseInclude(userId),
+    });
+
+    res.status(200).json({
+      success: true,
+      status: nextStatus,
+      post: updatedPost ? mapPostResponse(updatedPost, userId) : null,
+    });
+  } catch (error) {
+    console.error('respondToPostCollabInvite error:', error);
+    res.status(500).json({ error: 'Failed to respond to collaboration invite' });
   }
 };
 
@@ -699,7 +1257,7 @@ export const deletePost = async (req: AuthRequest, res: Response): Promise<void>
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.deleted.cache.invalidate',
-        tags: [`feed:${userId}`, `user:${userId}`],
+        tags: feedCacheTags(`feed:${userId}`, `user:${userId}`),
       });
     });
 
@@ -737,9 +1295,9 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
 
     const post = await prismaRead.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -774,7 +1332,7 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
         envelopes: [
           {
             event: 'post:liked',
-            rooms: [FEED_REALTIME_ROOM, `post:${postId}`],
+            rooms: getPostRealtimeRooms(postId, post.visibility),
             payload: {
               postId,
               userId,
@@ -791,7 +1349,7 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.like.cache.invalidate',
-        tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+        tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
       });
 
       if (nextLiked && post.authorId !== userId) {
@@ -865,7 +1423,7 @@ export const votePoll = async (req: AuthRequest, res: Response): Promise<void> =
       },
     });
 
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -926,7 +1484,7 @@ export const votePoll = async (req: AuthRequest, res: Response): Promise<void> =
         envelopes: [
           {
             event: 'poll:updated',
-            rooms: [FEED_REALTIME_ROOM, `post:${postId}`],
+            rooms: getPostRealtimeRooms(postId, post.visibility),
             payload: {
               postId,
               voterId: userId,
@@ -941,7 +1499,7 @@ export const votePoll = async (req: AuthRequest, res: Response): Promise<void> =
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.poll.cache.invalidate',
-        tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+        tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
       });
 
       return nextPollOptions;
@@ -978,9 +1536,9 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
 
     const post = await prismaRead.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, currentUserId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -996,6 +1554,7 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
               username: true,
               name: true,
               profileImage: true,
+              isVerified: true,
             },
           },
           _count: { select: { other_post_comments: true } },
@@ -1034,6 +1593,7 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
               username: true,
               name: true,
               profileImage: true,
+              isVerified: true,
             },
           },
           _count: { select: { other_post_comments: true } },
@@ -1129,11 +1689,22 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
 
     const post = await prismaRead.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, userId))) {
       res.status(404).json({ error: 'Post not found' });
       return;
+    }
+
+    if (parentId) {
+      const parentComment = await prismaRead.post_comments.findFirst({
+        where: { id: String(parentId), postId },
+        select: { id: true },
+      });
+      if (!parentComment) {
+        res.status(400).json({ error: 'Parent comment is invalid for this post' });
+        return;
+      }
     }
 
     const { comment, commentsCount, mapped } = await prisma.$transaction(async (tx) => {
@@ -1152,6 +1723,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
               name: true,
               profileImage: true,
               headline: true,
+              isVerified: true,
             },
           },
           comment_likes: {
@@ -1198,15 +1770,17 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
             commentsCount: nextCommentsCount,
           },
         },
-        {
+      ];
+      if (String(post.visibility || 'public').toLowerCase() === 'public') {
+        envelopes.push({
           event: 'comment:created',
           rooms: [FEED_REALTIME_ROOM],
           payload: {
             postId,
             commentsCount: nextCommentsCount,
           },
-        },
-      ];
+        });
+      }
 
       if (post.authorId !== userId) {
         envelopes.push({
@@ -1231,7 +1805,7 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.comment.cache.invalidate',
-        tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+        tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
       });
 
       return {
@@ -1275,6 +1849,22 @@ export const toggleCommentLike = async (req: AuthRequest, res: Response): Promis
 
     if (!postId || !commentId) {
       res.status(400).json({ error: 'Post ID and comment ID are required' });
+      return;
+    }
+
+    const comment = await prismaRead.post_comments.findUnique({
+      where: { id: commentId },
+      select: {
+        id: true,
+        postId: true,
+        posts: {
+          select: { id: true, authorId: true, visibility: true, isActive: true },
+        },
+      },
+    });
+
+    if (!comment || comment.postId !== postId || !(await canViewPost(comment.posts, userId))) {
+      res.status(404).json({ error: 'Comment not found' });
       return;
     }
 
@@ -1368,7 +1958,7 @@ export const deleteComment = async (req: AuthRequest, res: Response): Promise<vo
 
     const postRecord = await prismaRead.post.findUnique({
       where: { id: postId },
-      select: { authorId: true },
+      select: { authorId: true, visibility: true },
     });
 
     const commentsCount = await prisma.$transaction(async (tx) => {
@@ -1387,7 +1977,7 @@ export const deleteComment = async (req: AuthRequest, res: Response): Promise<vo
         envelopes: [
           {
             event: 'comment:deleted',
-            rooms: [`post:${postId}`, FEED_REALTIME_ROOM],
+            rooms: getPostRealtimeRooms(postId, postRecord?.visibility),
             payload: { postId, commentId, commentsCount: nextCommentsCount },
           },
         ],
@@ -1397,7 +1987,7 @@ export const deleteComment = async (req: AuthRequest, res: Response): Promise<vo
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.comment.deleted.cache.invalidate',
-        tags: [`feed:${postRecord?.authorId || userId}`, `user:${postRecord?.authorId || userId}`],
+        tags: feedCacheTags(`feed:${postRecord?.authorId || userId}`, `user:${postRecord?.authorId || userId}`),
       });
 
       return nextCommentsCount;
@@ -1427,9 +2017,9 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
 
     const post = await prismaRead.post.findFirst({
       where: { id: postId, isActive: true },
-      select: { id: true, authorId: true, sharesCount: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true, sharesCount: true },
     });
-    if (!post) {
+    if (!post || !(await canViewPost(post, String(req.user.userId)))) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -1448,7 +2038,7 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
         envelopes: [
           {
             event: 'post:shared',
-            rooms: [FEED_REALTIME_ROOM, `post:${postId}`],
+            rooms: getPostRealtimeRooms(postId, post.visibility),
             payload: {
               postId,
               userId: String(req.user!.userId),
@@ -1462,7 +2052,7 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.shared.cache.invalidate',
-        tags: [`feed:${post.authorId}`, `user:${post.authorId}`],
+        tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
       });
 
       return nextSharesCount;
@@ -1484,8 +2074,19 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
 export const getLikes = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const postId = ensureString(req.params.postId);
+    const currentUserId = req.user?.userId ? String(req.user.userId) : null;
     if (!postId) {
       res.status(400).json({ error: 'Post ID is required' });
+      return;
+    }
+
+    const post = await prismaRead.post.findFirst({
+      where: { id: postId, isActive: true },
+      select: { id: true, authorId: true, visibility: true, isActive: true },
+    });
+
+    if (!post || !(await canViewPost(post, currentUserId))) {
+      res.status(404).json({ error: 'Post not found' });
       return;
     }
 
@@ -1499,6 +2100,7 @@ export const getLikes = async (req: AuthRequest, res: Response): Promise<void> =
             name: true,
             profileImage: true,
             headline: true,
+            isVerified: true,
           },
         },
       },
@@ -1516,6 +2118,8 @@ export const getLikes = async (req: AuthRequest, res: Response): Promise<void> =
           name: likeWithUser.user.name,
           profileImage: likeWithUser.user.profileImage,
           headline: likeWithUser.user.headline,
+          verified: Boolean((likeWithUser.user as any).isVerified),
+          isVerified: Boolean((likeWithUser.user as any).isVerified),
           reactionType: 'LIKE',
           createdAt: like.createdAt,
         };

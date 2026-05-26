@@ -6,6 +6,7 @@ import { agentSessionService } from './session.service';
 import type { AgentActionRecord, AgentToolExecutionContext, AgentUiIntent } from './types';
 import { emitAgentEvent, serializeAgentAction, serializePendingAction } from './socket-events';
 import { describeNavigationPreview, resolveAgentSurfaceFromUiIntents } from './surface-utils';
+import { getAgentToolPolicy } from './action-policy.service';
 
 export interface PendingActionRecord {
   id: string;
@@ -21,6 +22,8 @@ export interface PendingActionRecord {
   createdAt: Date;
   expiresAt: Date;
   resolvedAt: Date | null;
+  riskLevel?: string | null;
+  autonomyMode?: string | null;
 }
 
 export interface CreatePendingParams {
@@ -72,9 +75,13 @@ class PendingActionsService {
 
     this.storageModePromise = (async () => {
       try {
-        const placeholders = REQUIRED_TABLES.map((t) => `'${t}'`).join(', ');
-        const rows = await prisma.$queryRawUnsafe<Array<{ table_name: string }>>(
-          `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN (${placeholders})`
+        const rows = await prisma.$queryRaw<Array<{ table_name: string }>>(
+          Prisma.sql`
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name IN (${Prisma.join(REQUIRED_TABLES)})
+          `
         );
         const foundTables = new Set(rows.map((r) => r.table_name));
         const missing = REQUIRED_TABLES.filter((t) => !foundTables.has(t));
@@ -273,8 +280,21 @@ class PendingActionsService {
         sessionId: action.sessionId,
         surface: contextSurface,
         surfaceContext: (action.context ?? {}) as Record<string, unknown>,
-        allowAutonomousActions: true,
+        allowAutonomousActions: false,
+        autonomyMode: 'approval',
+        effectiveAutonomyMode: 'approval',
+        requestedAutonomyMode: 'approval',
+        powerModeEligible: false,
+        isPremium: false,
+        approvedAction: {
+          actionId,
+          toolName: action.toolName,
+        },
       };
+      const policy = getAgentToolPolicy(action.toolName);
+      if (policy.blocked) {
+        return { success: false, error: 'That action is blocked by Vormex safety policy.' };
+      }
 
       const toolResult = await executeAgentTool(
         action.toolName,

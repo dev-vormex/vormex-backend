@@ -372,6 +372,15 @@ function normalizeResendSendError(
   return new EmailDeliveryError(`Failed to send email: ${message}`, statusCode);
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 async function sendEmail(params: {
   to: string;
   subject: string;
@@ -421,7 +430,7 @@ export async function sendPasswordResetEmail(
   resetToken: string
 ): Promise<void> {
   const { frontendUrl } = getEmailConfig();
-  const resetUrl = `${frontendUrl}/reset-password?token=${resetToken}`;
+  const resetUrl = `${frontendUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
   const htmlBody = `
 <!DOCTYPE html>
@@ -527,7 +536,8 @@ export async function sendVerificationEmail(
   name: string
 ): Promise<void> {
   const { frontendUrl } = getEmailConfig();
-  const verificationUrl = `${frontendUrl}/verify-email?token=${verificationToken}`;
+  const verificationUrl = `${frontendUrl}/verify-email?token=${encodeURIComponent(verificationToken)}`;
+  const escapedName = escapeHtml(name);
 
   const htmlBody = `
 <!DOCTYPE html>
@@ -547,7 +557,7 @@ export async function sendVerificationEmail(
               <h1 style="margin: 0 0 20px 0; color: #000000; font-size: 24px; font-weight: 600;">Welcome to Vormex!</h1>
 
               <p style="margin: 0 0 20px 0; color: #333333; font-size: 16px; line-height: 1.5;">
-                Hello ${name},
+                Hello ${escapedName},
               </p>
 
               <p style="margin: 0 0 20px 0; color: #333333; font-size: 16px; line-height: 1.5;">

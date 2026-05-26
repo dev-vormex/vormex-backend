@@ -1,6 +1,10 @@
 import { createHash } from 'crypto';
 import OpenAI from 'openai';
 import { logger } from '../lib/logger';
+import {
+  AI_UNTRUSTED_INPUT_POLICY,
+  wrapUntrustedPromptContent,
+} from '../utils/input-security.util';
 
 type ChatRole = 'system' | 'user' | 'assistant';
 type AIReasoningEffort = 'none' | 'low' | 'medium' | 'high';
@@ -180,7 +184,9 @@ class AIService {
       .filter((message) => message.role !== 'system')
       .map((message) => ({
         role: message.role,
-        content: message.content,
+        content: message.role === 'user'
+          ? wrapUntrustedPromptContent('user_message', message.content)
+          : wrapUntrustedPromptContent('assistant_message', message.content),
         type: 'message' as const,
       }));
     const reasoningEffort = options.reasoningEffort || 'none';
@@ -201,7 +207,7 @@ class AIService {
     try {
       const requestBody: any = {
         input: conversationMessages,
-        instructions: systemMessage?.content,
+        instructions: [AI_UNTRUSTED_INPUT_POLICY, systemMessage?.content].filter(Boolean).join('\n\n'),
         max_output_tokens: options.maxTokens || this.defaultMaxTokens,
         metadata: {
           route: options.metadata.route,

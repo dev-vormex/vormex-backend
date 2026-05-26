@@ -1,4 +1,4 @@
-import { redisCommand } from '../redis/client';
+import { isRedisEnabled, isRedisRequired, redisCommand } from '../redis/client';
 
 interface CacheEntry<T> {
   value: T;
@@ -18,6 +18,48 @@ export interface FixedWindowIncrementResult {
 
 const CACHE_PREFIX = 'vormex:';
 const TAG_PREFIX = `${CACHE_PREFIX}tag:`;
+const TAG_INVALIDATION_LUA = `
+local keys_to_delete = {}
+local seen = {}
+local chunk_size = 500
+
+for i = 1, #KEYS do
+  local members = redis.call('SMEMBERS', KEYS[i])
+  for j = 1, #members do
+    local key = members[j]
+    if not seen[key] then
+      seen[key] = true
+      keys_to_delete[#keys_to_delete + 1] = key
+    end
+  end
+end
+
+local deleted = 0
+
+for i = 1, #keys_to_delete, chunk_size do
+  local chunk = {}
+  local upper = math.min(i + chunk_size - 1, #keys_to_delete)
+  for j = i, upper do
+    chunk[#chunk + 1] = keys_to_delete[j]
+  end
+  if #chunk > 0 then
+    deleted = deleted + redis.call('DEL', unpack(chunk))
+  end
+end
+
+for i = 1, #KEYS, chunk_size do
+  local chunk = {}
+  local upper = math.min(i + chunk_size - 1, #KEYS)
+  for j = i, upper do
+    chunk[#chunk + 1] = KEYS[j]
+  end
+  if #chunk > 0 then
+    deleted = deleted + redis.call('DEL', unpack(chunk))
+  end
+end
+
+return deleted
+`;
 
 class RedisCacheService {
   private cache = new Map<string, CacheEntry<unknown>>();
@@ -32,13 +74,24 @@ class RedisCacheService {
     return `${TAG_PREFIX}${tag}`;
   }
 
+  private getRedisClient() {
+    return isRedisEnabled() ? redisCommand : null;
+  }
+
+  private handleRedisError(error: unknown): void {
+    if (isRedisRequired()) {
+      throw error;
+    }
+  }
+
   async get<T>(key: string): Promise<T | null> {
-    if (redisCommand) {
+    const client = this.getRedisClient();
+    if (client) {
       try {
-        const raw = await redisCommand.get(this.key(key));
+        const raw = await client.get(this.key(key));
         return raw ? (JSON.parse(raw) as T) : null;
-      } catch {
-        return null;
+      } catch (error) {
+        this.handleRedisError(error);
       }
     }
 
@@ -51,20 +104,21 @@ class RedisCacheService {
   }
 
   async set<T>(key: string, value: T, ttlSeconds = 300, tags: string[] = []): Promise<void> {
-    if (redisCommand) {
+    const client = this.getRedisClient();
+    if (client) {
       try {
         const redisKey = this.key(key);
-        await redisCommand.set(redisKey, JSON.stringify(value), 'EX', ttlSeconds);
+        await client.set(redisKey, JSON.stringify(value), 'EX', ttlSeconds);
         if (tags.length > 0) {
-          const pipeline = redisCommand.multi();
+          const pipeline = client.multi();
           for (const tag of tags) {
             pipeline.sadd(this.tagKey(tag), redisKey);
             pipeline.expire(this.tagKey(tag), ttlSeconds);
           }
           await pipeline.exec();
         }
-      } catch {
-        // Fall back to memory below.
+      } catch (error) {
+        this.handleRedisError(error);
       }
     }
 
@@ -80,8 +134,13 @@ class RedisCacheService {
   }
 
   async del(key: string): Promise<void> {
-    if (redisCommand) {
-      await redisCommand.del(this.key(key)).catch(() => undefined);
+    const client = this.getRedisClient();
+    if (client) {
+      try {
+        await client.del(this.key(key));
+      } catch (error) {
+        this.handleRedisError(error);
+      }
     }
     this.cache.delete(key);
   }
@@ -89,21 +148,26 @@ class RedisCacheService {
   async delPattern(pattern: string): Promise<void> {
     const regex = new RegExp(`^${pattern.replace(/\*/g, '.*')}$`);
 
-    if (redisCommand) {
-      let cursor = '0';
-      do {
-        const [nextCursor, keys] = await redisCommand.scan(
-          cursor,
-          'MATCH',
-          this.key(pattern),
-          'COUNT',
-          100
-        );
-        cursor = nextCursor;
-        if (keys.length > 0) {
-          await redisCommand.del(...keys);
-        }
-      } while (cursor !== '0');
+    const client = this.getRedisClient();
+    if (client) {
+      try {
+        let cursor = '0';
+        do {
+          const [nextCursor, keys] = await client.scan(
+            cursor,
+            'MATCH',
+            this.key(pattern),
+            'COUNT',
+            100
+          );
+          cursor = nextCursor;
+          if (keys.length > 0) {
+            await client.del(...keys);
+          }
+        } while (cursor !== '0');
+      } catch (error) {
+        this.handleRedisError(error);
+      }
     }
 
     for (const key of Array.from(this.cache.keys())) {
@@ -119,21 +183,17 @@ class RedisCacheService {
       return;
     }
 
-    if (redisCommand) {
-      const keysToDelete = new Set<string>();
-      for (const tag of uniqueTags) {
-        const members = await redisCommand.smembers(this.tagKey(tag)).catch(() => []);
-        members.forEach((member) => keysToDelete.add(member));
+    const client = this.getRedisClient();
+    if (client) {
+      try {
+        await client.eval(
+          TAG_INVALIDATION_LUA,
+          uniqueTags.length,
+          ...uniqueTags.map((tag) => this.tagKey(tag))
+        );
+      } catch (error) {
+        this.handleRedisError(error);
       }
-
-      const pipeline = redisCommand.multi();
-      if (keysToDelete.size > 0) {
-        pipeline.del(...Array.from(keysToDelete));
-      }
-      for (const tag of uniqueTags) {
-        pipeline.del(this.tagKey(tag));
-      }
-      await pipeline.exec().catch(() => undefined);
     }
 
     for (const tag of uniqueTags) {
@@ -147,8 +207,13 @@ class RedisCacheService {
   }
 
   async exists(key: string): Promise<boolean> {
-    if (redisCommand) {
-      return (await redisCommand.exists(this.key(key)).catch(() => 0)) === 1;
+    const client = this.getRedisClient();
+    if (client) {
+      try {
+        return (await client.exists(this.key(key))) === 1;
+      } catch (error) {
+        this.handleRedisError(error);
+      }
     }
     const entry = this.cache.get(key);
     return Boolean(entry && entry.expiresAt > Date.now());
@@ -161,10 +226,11 @@ class RedisCacheService {
     const resetAt = (windowIndex + 1) * windowMs;
     const fixedWindowKey = `${key}:${windowIndex}`;
 
-    if (redisCommand) {
+    const client = this.getRedisClient();
+    if (client) {
       try {
         const redisKey = this.key(fixedWindowKey);
-        const pipeline = redisCommand.multi();
+        const pipeline = client.multi();
         pipeline.incr(redisKey);
         pipeline.pttl(redisKey);
         const results = await pipeline.exec();
@@ -172,15 +238,15 @@ class RedisCacheService {
         let ttlMs = Number(results?.[1]?.[1] || 0);
         if (ttlMs <= 0) {
           ttlMs = Math.max(1_000, resetAt - now);
-          await redisCommand.pexpire(redisKey, ttlMs);
+          await client.pexpire(redisKey, ttlMs);
         }
         return {
           backend: 'redis',
           count,
           resetAt: now + ttlMs,
         };
-      } catch {
-        // Fall back to memory below.
+      } catch (error) {
+        this.handleRedisError(error);
       }
     }
 
@@ -205,7 +271,7 @@ class RedisCacheService {
 
   getStats() {
     return {
-      backend: redisCommand ? 'redis' : 'memory',
+      backend: isRedisEnabled() ? 'redis' : 'memory',
       keys: this.cache.size,
       rateWindows: this.fixedWindows.size,
     };

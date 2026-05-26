@@ -2,12 +2,19 @@ import { Router } from 'express';
 import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import {
+  imageUploadRule,
+  validateUploadedFiles,
+  videoUploadRule,
+} from '../middleware/upload-security.middleware';
 import {
   getFeed,
   getPost,
   createPost,
   updatePost,
   deletePost,
+  respondToPostCollabInvite,
   toggleLike,
   votePoll,
   getComments,
@@ -42,6 +49,20 @@ const mediaWriteLimit = createRateLimitMiddleware((req) => [
       }]
     : []),
 ]);
+const validatePostUpload = validateUploadedFiles({
+  fields: {
+    articleCoverImage: imageUploadRule(10 * 1024 * 1024),
+    image: imageUploadRule(10 * 1024 * 1024),
+    images: imageUploadRule(10 * 1024 * 1024),
+    media: {
+      allowedMimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'],
+      maxBytes: 100 * 1024 * 1024,
+    },
+    video: videoUploadRule(100 * 1024 * 1024),
+  },
+  maxFiles: 10,
+  requireKnownField: true,
+});
 
 // All post routes require authentication
 router.use(authenticate);
@@ -51,9 +72,10 @@ router.get('/feed', getFeed);
 
 // CRUD
 router.get('/:postId', getPost);
-router.post('/', mediaWriteLimit, postUpload.any(), createPost);
+router.post('/', mediaWriteLimit, postUpload.any(), validatePostUpload, validateMultipartFields, createPost);
 router.put('/:postId', updatePost);
 router.delete('/:postId', deletePost);
+router.post('/:postId/collaborators/respond', respondToPostCollabInvite);
 
 // Engagement
 router.post('/:postId/like', toggleLike);

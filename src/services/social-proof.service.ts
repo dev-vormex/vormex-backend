@@ -163,6 +163,7 @@ class SocialProofService {
                             profileImage: true,
                             college: true,
                             headline: true,
+                            isVerified: true,
                         },
                     },
                 },
@@ -192,6 +193,8 @@ class SocialProofService {
                     profileImage: view.users_profile_views_viewerIdTousers.profileImage,
                     college: view.users_profile_views_viewerIdTousers.college,
                     headline: view.users_profile_views_viewerIdTousers.headline,
+                    verified: Boolean(view.users_profile_views_viewerIdTousers.isVerified),
+                    isVerified: Boolean(view.users_profile_views_viewerIdTousers.isVerified),
                     isSameCollege:
                         !!normalizeCollege(profileOwner?.college) &&
                         normalizeCollege(profileOwner?.college) ===
@@ -270,6 +273,7 @@ class SocialProofService {
                     profileImage: true,
                     college: true,
                     headline: true,
+                    isVerified: true,
                 },
             })
             : [];
@@ -299,6 +303,8 @@ class SocialProofService {
                             profileImage: viewer.profileImage,
                             college: viewer.college,
                             headline: viewer.headline,
+                            verified: Boolean(viewer.isVerified),
+                            isVerified: Boolean(viewer.isVerified),
                         }
                         : null,
                 };

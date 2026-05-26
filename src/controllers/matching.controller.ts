@@ -2,6 +2,36 @@
 import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
+import { cacheService } from '../services/cache.service';
+
+const SMART_MATCH_CACHE_VERSION = 'v1';
+const SMART_MATCH_CACHE_TTL_SECONDS = 60;
+const SMART_MATCH_TYPES = new Set(['all', 'same_campus', 'same_goal', 'mentor', 'mentee']);
+
+const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
+
+const smartMatchCacheKey = (params: {
+  userId: string;
+  type: string;
+  page: number;
+  limit: number;
+}): string =>
+  [
+    'matching:smart',
+    SMART_MATCH_CACHE_VERSION,
+    `user:${params.userId}`,
+    `type:${params.type}`,
+    `page:${params.page}`,
+    `limit:${params.limit}`,
+  ].join(':');
+
+const smartMatchCacheTags = (userId: string): string[] =>
+  uniqueCacheTags([
+    'matching:global',
+    `matching:user:${userId}`,
+    `people:user:${userId}`,
+    `people:connections:${userId}`,
+  ]);
 
 /**
  * Get smart matches based on type filter
@@ -18,10 +48,18 @@ export const getSmartMatches = async (
       return;
     }
 
-    const type = (req.query.type as string) || 'all';
+    const rawType = String(req.query.type || 'all');
+    const type = SMART_MATCH_TYPES.has(rawType) ? rawType : 'all';
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
     const skip = (page - 1) * limit;
+    const cacheKey = smartMatchCacheKey({ userId, type, page, limit });
+    const cached = await cacheService.get(cacheKey);
+    if (cached) {
+      res.setHeader('X-Vormex-Cache', 'HIT');
+      res.status(200).json(cached);
+      return;
+    }
 
     const currentUser = await prisma.user.findUnique({
       where: { id: userId },
@@ -67,20 +105,32 @@ export const getSmartMatches = async (
 
     if (type === 'same_campus' && currentUser.college) {
       where.college = currentUser.college;
+    } else if (type === 'same_goal' && myPrimaryGoal) {
+      where.user_onboarding = { is: { primaryGoal: myPrimaryGoal } };
+    } else if (type === 'mentor' && myWantToLearn.length > 0) {
+      where.OR = [
+        { user_onboarding: { is: { canTeach: { hasSome: myWantToLearn } } } },
+        ...myWantToLearn.slice(0, 8).map((skill: string) => ({
+          skills: { some: { skill: { name: { contains: skill, mode: 'insensitive' } } } },
+        })),
+      ];
+    } else if (type === 'mentee' && myCanTeach.length > 0) {
+      where.user_onboarding = { is: { wantToLearn: { hasSome: myCanTeach } } };
     }
 
-    const [allUsers, totalCount] = await Promise.all([
+    const [users, total] = await Promise.all([
       prisma.user.findMany({
         where,
-        skip: 0,
-        take: Math.min(limit * 3, 150),
-        orderBy: { lastActiveAt: 'desc' },
+        skip,
+        take: limit,
+        orderBy: [{ lastActiveAt: 'desc' }, { id: 'asc' }],
         select: {
           id: true,
           username: true,
           name: true,
           profileImage: true,
           headline: true,
+          isVerified: true,
           college: true,
           branch: true,
           graduationYear: true,
@@ -100,25 +150,7 @@ export const getSmartMatches = async (
       prisma.user.count({ where }),
     ]);
 
-    let filteredUsers = allUsers;
-    if (type === 'same_goal' && myPrimaryGoal) {
-      filteredUsers = allUsers.filter((u) => u.user_onboarding?.primaryGoal === myPrimaryGoal);
-    } else if (type === 'mentor' && myWantToLearn.length > 0) {
-      filteredUsers = allUsers.filter((u) => {
-        const canTeach = Array.isArray(u.user_onboarding?.canTeach) ? u.user_onboarding.canTeach : [];
-        return myWantToLearn.some((s) => canTeach.some((t) => t?.toLowerCase().includes(s.toLowerCase())));
-      });
-    } else if (type === 'mentee' && myCanTeach.length > 0) {
-      filteredUsers = allUsers.filter((u) => {
-        const wantToLearn = Array.isArray(u.user_onboarding?.wantToLearn) ? u.user_onboarding.wantToLearn : [];
-        return myCanTeach.some((s) => wantToLearn.some((t) => t?.toLowerCase().includes(s.toLowerCase())));
-      });
-    }
-
-    const total = type === 'all' || type === 'same_campus' ? totalCount : filteredUsers.length;
-    const paginatedUsers = filteredUsers.slice(skip, skip + limit);
-
-    const matches = paginatedUsers.map((user) => {
+    const matches = users.map((user) => {
       const od = user.user_onboarding || {};
       let score = 0;
       const reasons: string[] = [];
@@ -155,6 +187,8 @@ export const getSmartMatches = async (
           username: user.username,
           profileImage: user.profileImage,
           headline: user.headline,
+          verified: Boolean(user.isVerified),
+          isVerified: Boolean(user.isVerified),
           college: user.college,
           branch: user.branch,
           graduationYear: user.graduationYear,
@@ -183,12 +217,18 @@ export const getSmartMatches = async (
       };
     });
 
-    res.status(200).json({
+    const response = {
       matches,
       total,
       page,
       totalPages: Math.ceil(total / limit),
-    });
+      hasMore: page < Math.ceil(total / limit),
+    };
+
+    await cacheService.set(cacheKey, response, SMART_MATCH_CACHE_TTL_SECONDS, smartMatchCacheTags(userId));
+
+    res.setHeader('X-Vormex-Cache', 'MISS');
+    res.status(200).json(response);
   } catch (error) {
     console.error('Error fetching smart matches:', error);
     res.status(500).json({ error: 'Failed to fetch smart matches' });
@@ -247,6 +287,7 @@ export const getMentorMatches = async (
         name: true,
         profileImage: true,
         headline: true,
+        isVerified: true,
         college: true,
         graduationYear: true,
         user_onboarding: { select: { canTeach: true } },
@@ -266,6 +307,8 @@ export const getMentorMatches = async (
           username: u.username,
           profileImage: u.profileImage,
           headline: u.headline,
+          verified: Boolean(u.isVerified),
+          isVerified: Boolean(u.isVerified),
           college: u.college,
           graduationYear: u.graduationYear,
         },
@@ -325,6 +368,7 @@ export const getAccountabilityMatches = async (
         name: true,
         profileImage: true,
         headline: true,
+        isVerified: true,
         college: true,
         user_onboarding: { select: { primaryGoal: true } },
       },
@@ -339,6 +383,8 @@ export const getAccountabilityMatches = async (
           username: u.username,
           profileImage: u.profileImage,
           headline: u.headline,
+          verified: Boolean(u.isVerified),
+          isVerified: Boolean(u.isVerified),
           college: u.college,
         },
         sharedGoal: (uo?.primaryGoal as string) || null,

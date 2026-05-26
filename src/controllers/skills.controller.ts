@@ -4,6 +4,8 @@ import { prisma } from '../config/prisma';
 import { AuthenticatedRequest } from '../types/auth.types';
 import { ensureString } from '../utils/request.util';
 import { isUUID } from '../utils/username.util';
+import { notificationService } from '../services/notification.service';
+import { getPremiumAccessSnapshot } from '../services/premium-access.service';
 
 const MAX_SKILL_LENGTH = 80;
 const DEFAULT_SESSION_LENGTH = 30;
@@ -207,7 +209,7 @@ function topRepoSkills(item: any): string[] {
   return uniqueStrings(values);
 }
 
-function buildPassport(user: any, endorsements: any[]) {
+function buildPassport(user: any, endorsements: any[], verificationLinks: any[] = [], accessSnapshot?: any) {
   const aggregates = new Map<string, any>();
   const allEvidence: any[] = [];
   const onboarding = user.user_onboarding;
@@ -377,6 +379,44 @@ function buildPassport(user: any, endorsements: any[]) {
     });
   }
 
+  verificationLinks.forEach((link) => {
+    if (link.status !== 'verified') return;
+    const provider = String(link.provider || '').toLowerCase();
+    if (provider === 'leetcode') {
+      ['Data Structures', 'Algorithms', 'Problem Solving'].forEach((skill) => {
+        addEvidence(skill, {
+          id: `verification_link:${link.id}:${skillKey(skill)}`,
+          type: 'LEETCODE',
+          title: `${link.username} on LeetCode`,
+          subtitle: 'Linked coding profile',
+          sourceUrl: link.profileUrl,
+          verified: true,
+          createdAt: link.verifiedAt || link.updatedAt || link.createdAt,
+        });
+      });
+    } else if (provider === 'github' && !user.githubStats) {
+      addEvidence('GitHub', {
+        id: `verification_link:${link.id}:github`,
+        type: 'GITHUB',
+        title: `${link.username} on GitHub`,
+        subtitle: 'Linked developer profile',
+        sourceUrl: link.profileUrl,
+        verified: true,
+        createdAt: link.verifiedAt || link.updatedAt || link.createdAt,
+      });
+    } else {
+      addEvidence(provider || 'Portfolio', {
+        id: `verification_link:${link.id}:${provider || 'profile'}`,
+        type: 'PROFILE_LINK',
+        title: `${link.username} linked profile`,
+        subtitle: provider ? `${provider} verification` : 'External verification',
+        sourceUrl: link.profileUrl,
+        verified: true,
+        createdAt: link.verifiedAt || link.updatedAt || link.createdAt,
+      });
+    }
+  });
+
   endorsements.forEach((endorsement) => {
     const aggregate = ensureAggregate(endorsement.skillName, { id: endorsement.skillId });
     if (!aggregate) return;
@@ -444,6 +484,9 @@ function buildPassport(user: any, endorsements: any[]) {
       endorsementsCount,
       passportScore,
       topCategory,
+      verificationLinksCount: verificationLinks.length,
+      hasVerifiedSkillsBadge: Boolean((accessSnapshot?.isPremium || accessSnapshot?.user?.isAdmin) && verifiedSkills > 0),
+      isPremium: Boolean(accessSnapshot?.isPremium || accessSnapshot?.user?.isAdmin),
     },
     learningGoals: wantToLearn,
     teachingSkills: canTeach,
@@ -459,6 +502,16 @@ function buildPassport(user: any, endorsements: any[]) {
       source: endorsement.source,
       createdAt: endorsement.createdAt?.toISOString?.() ?? null,
       endorsedBy: formatUserCard(endorsement.endorsedBy),
+    })),
+    verificationLinks: verificationLinks.map((link) => ({
+      id: link.id,
+      provider: link.provider,
+      username: link.username,
+      profileUrl: link.profileUrl,
+      status: link.status,
+      verifiedAt: link.verifiedAt?.toISOString?.() ?? null,
+      createdAt: link.createdAt?.toISOString?.() ?? null,
+      updatedAt: link.updatedAt?.toISOString?.() ?? null,
     })),
   };
 }
@@ -476,11 +529,18 @@ export const getSkillPassport = async (req: AuthenticatedRequest, res: Response)
       return;
     }
 
-    const endorsements = await prisma.skillEndorsement.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 80,
-    });
+    const [endorsements, verificationLinks, accessSnapshot] = await Promise.all([
+      prisma.skillEndorsement.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 80,
+      }),
+      prisma.skillVerificationLink.findMany({
+        where: { userId: user.id },
+        orderBy: { updatedAt: 'desc' },
+      }),
+      getPremiumAccessSnapshot(user.id).catch(() => null),
+    ]);
     const endorserIds = Array.from(new Set(endorsements.map((endorsement) => endorsement.endorsedById)));
     const endorsers = await prisma.user.findMany({
       where: { id: { in: endorserIds } },
@@ -493,11 +553,231 @@ export const getSkillPassport = async (req: AuthenticatedRequest, res: Response)
       endorsements.map((endorsement) => ({
         ...endorsement,
         endorsedBy: endorserById.get(endorsement.endorsedById),
-      }))
+      })),
+      verificationLinks,
+      accessSnapshot
     ));
   } catch (error) {
     console.error('Error building skill passport:', error);
     res.status(500).json({ error: 'Failed to build skill passport' });
+  }
+};
+
+async function areConnected(leftUserId: string, rightUserId: string): Promise<boolean> {
+  const connection = await prisma.connections.findFirst({
+    where: {
+      status: 'accepted',
+      OR: [
+        { requesterId: leftUserId, addresseeId: rightUserId },
+        { requesterId: rightUserId, addresseeId: leftUserId },
+      ],
+    },
+    select: { id: true },
+  });
+  return Boolean(connection);
+}
+
+function normalizeProvider(value: unknown): string {
+  const provider = ensureString(value).toLowerCase();
+  if (['github', 'leetcode', 'portfolio'].includes(provider)) return provider;
+  return '';
+}
+
+function providerProfileUrl(provider: string, username: string, profileUrl?: string | null): string | null {
+  if (profileUrl) return profileUrl;
+  if (provider === 'github') return `https://github.com/${encodeURIComponent(username)}`;
+  if (provider === 'leetcode') return `https://leetcode.com/${encodeURIComponent(username)}/`;
+  return null;
+}
+
+export const endorseSkill = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const endorserId = req.user?.userId ? String(req.user.userId) : null;
+    if (!endorserId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUserId = ensureString(req.params.userId);
+    const skillName = normalizeSkillName(req.body.skillName);
+    const note = ensureString(req.body.note).slice(0, 240) || null;
+    const rating = req.body.rating === undefined
+      ? null
+      : Math.min(5, Math.max(1, Number(req.body.rating) || 5));
+
+    if (!targetUserId || !skillName) {
+      res.status(400).json({ error: 'Target user and skillName are required' });
+      return;
+    }
+    if (targetUserId === endorserId) {
+      res.status(400).json({ error: 'You cannot endorse yourself' });
+      return;
+    }
+
+    const [target, endorser, connected] = await Promise.all([
+      prisma.user.findFirst({ where: { id: targetUserId, isBanned: false }, select: userCardSelect }),
+      prisma.user.findUnique({ where: { id: endorserId }, select: userCardSelect }),
+      areConnected(endorserId, targetUserId),
+    ]);
+    if (!target) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    if (!connected) {
+      res.status(403).json({
+        error: 'You can endorse skills only for connected users.',
+        code: 'connection_required_for_endorsement',
+      });
+      return;
+    }
+
+    const skill = await findOrCreateSkill(skillName);
+    const existing = await prisma.skillEndorsement.findFirst({
+      where: {
+        userId: targetUserId,
+        endorsedById: endorserId,
+        skillName: { equals: skill.name, mode: 'insensitive' },
+        source: 'manual',
+      },
+    });
+
+    const endorsement = existing
+      ? await prisma.skillEndorsement.update({
+          where: { id: existing.id },
+          data: { note, rating, skillId: skill.id, skillName: skill.name },
+        })
+      : await prisma.skillEndorsement.create({
+          data: {
+            userId: targetUserId,
+            endorsedById: endorserId,
+            skillId: skill.id,
+            skillName: skill.name,
+            source: 'manual',
+            note,
+            rating,
+          },
+        });
+
+    await prisma.userSkill.upsert({
+      where: { userId_skillId: { userId: targetUserId, skillId: skill.id } },
+      create: { userId: targetUserId, skillId: skill.id, proficiency: null, yearsOfExp: null },
+      update: {},
+    }).catch(() => null);
+
+    notificationService.notifySkillEndorsement(targetUserId, endorserId, {
+      endorserName: endorser?.name || 'Someone',
+      skillName: skill.name,
+      endorsementId: endorsement.id,
+    }).catch(console.error);
+
+    res.status(existing ? 200 : 201).json({
+      endorsement: {
+        id: endorsement.id,
+        skillName: endorsement.skillName,
+        note: endorsement.note,
+        rating: endorsement.rating,
+        source: endorsement.source,
+        createdAt: endorsement.createdAt?.toISOString?.() ?? null,
+        endorsedBy: formatUserCard(endorser),
+      },
+    });
+  } catch (error) {
+    console.error('Error endorsing skill:', error);
+    res.status(500).json({ error: 'Failed to endorse skill' });
+  }
+};
+
+export const upsertSkillVerificationLink = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const provider = normalizeProvider(req.body.provider);
+    const username = normalizeSkillName(req.body.username);
+    const rawProfileUrl = ensureString(req.body.profileUrl).slice(0, 500) || null;
+    if (!provider || !username) {
+      res.status(400).json({ error: 'provider must be github, leetcode, or portfolio, and username is required' });
+      return;
+    }
+
+    const profileUrl = providerProfileUrl(provider, username, rawProfileUrl);
+    const link = await prisma.skillVerificationLink.upsert({
+      where: { userId_provider: { userId, provider } },
+      create: {
+        userId,
+        provider,
+        username,
+        profileUrl,
+        status: 'verified',
+        verifiedAt: new Date(),
+        metadata: {
+          autoVerified: true,
+          source: 'profile_link',
+        },
+      },
+      update: {
+        username,
+        profileUrl,
+        status: 'verified',
+        verifiedAt: new Date(),
+        metadata: {
+          autoVerified: true,
+          source: 'profile_link',
+        },
+      },
+    });
+
+    if (provider === 'github') {
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          githubConnected: true,
+          githubUsername: username,
+          githubProfileUrl: profileUrl,
+        },
+      }).catch(() => null);
+    }
+
+    res.json({
+      verificationLink: {
+        id: link.id,
+        provider: link.provider,
+        username: link.username,
+        profileUrl: link.profileUrl,
+        status: link.status,
+        verifiedAt: link.verifiedAt?.toISOString?.() ?? null,
+        createdAt: link.createdAt.toISOString(),
+        updatedAt: link.updatedAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('Error upserting skill verification link:', error);
+    res.status(500).json({ error: 'Failed to link skill verification profile' });
+  }
+};
+
+export const deleteSkillVerificationLink = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const provider = normalizeProvider(req.params.provider);
+    if (!provider) {
+      res.status(400).json({ error: 'Invalid provider' });
+      return;
+    }
+
+    await prisma.skillVerificationLink.deleteMany({ where: { userId, provider } });
+    res.json({ deleted: true });
+  } catch (error) {
+    console.error('Error deleting skill verification link:', error);
+    res.status(500).json({ error: 'Failed to delete skill verification profile' });
   }
 };
 

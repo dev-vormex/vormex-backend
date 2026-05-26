@@ -2,6 +2,12 @@ import { Router } from 'express';
 import multer from 'multer';
 import { authenticate, optionalAuth } from '../middleware/auth.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import {
+  imageUploadRule,
+  validateUploadedFiles,
+  videoUploadRule,
+} from '../middleware/upload-security.middleware';
 import * as reelsController from '../controllers/reels.controller';
 
 const router = Router();
@@ -31,6 +37,14 @@ const mediaWriteLimit = createRateLimitMiddleware((req) => [
       }]
     : []),
 ]);
+const validateReelUpload = validateUploadedFiles({
+  fields: {
+    thumbnail: imageUploadRule(10 * 1024 * 1024),
+    video: videoUploadRule(150 * 1024 * 1024),
+  },
+  maxFiles: 2,
+  requireKnownField: true,
+});
 
 // Feed endpoints
 router.get('/feed', optionalAuth, reelsController.getReelsFeed);
@@ -59,7 +73,7 @@ router.get('/analytics/reel/:reelId', authenticate, reelsController.getReelAnaly
 router.post('/webhook/transcoding', reelsController.transcodingWebhook);
 
 // Create/Edit/Delete
-router.post('/', authenticate, mediaWriteLimit, uploadWithThumbnail, reelsController.createReel);
+router.post('/', authenticate, mediaWriteLimit, uploadWithThumbnail, validateReelUpload, validateMultipartFields, reelsController.createReel);
 router.put('/:reelId', authenticate, reelsController.updateReel);
 router.post('/:reelId/publish', authenticate, reelsController.publishDraft);
 router.delete('/:reelId', authenticate, reelsController.deleteReel);

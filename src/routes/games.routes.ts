@@ -22,6 +22,20 @@ import {
   finishTypingRace,
   getTypingHistory,
 } from '../controllers/games.controller';
+import {
+  abandonArcadeRoomController,
+  finishArcadeRoomController,
+  getArcadeCatalog,
+  getArcadeHistory,
+  getArcadeInvite,
+  getArcadeLeaderboard,
+  getArcadeRoom,
+  getArcadeRooms,
+  joinArcadeRoomById,
+  joinArcadeRoomByInvite,
+  postArcadeRoom,
+  readyArcadeRoom,
+} from '../controllers/arcade.controller';
 
 const router = Router();
 
@@ -29,6 +43,20 @@ const router = Router();
 router.get('/stats', authenticate, getMyGameStats);
 router.get('/xp-history', authenticate, getXPHistory);
 router.get('/leaderboard', optionalAuth, getLeaderboard);
+
+// Social Arcade
+router.get('/arcade/catalog', optionalAuth, getArcadeCatalog);
+router.get('/arcade/rooms', optionalAuth, getArcadeRooms);
+router.post('/arcade/rooms', authenticate, postArcadeRoom);
+router.get('/arcade/rooms/:roomId', authenticate, getArcadeRoom);
+router.post('/arcade/rooms/:roomId/join', authenticate, joinArcadeRoomById);
+router.post('/arcade/rooms/:roomId/ready', authenticate, readyArcadeRoom);
+router.post('/arcade/rooms/:roomId/finish', authenticate, finishArcadeRoomController);
+router.post('/arcade/rooms/:roomId/abandon', authenticate, abandonArcadeRoomController);
+router.get('/arcade/invite/:inviteCode', authenticate, getArcadeInvite);
+router.post('/arcade/invite/:inviteCode/join', authenticate, joinArcadeRoomByInvite);
+router.get('/arcade/history', authenticate, getArcadeHistory);
+router.get('/arcade/leaderboard', optionalAuth, getArcadeLeaderboard);
 
 // Trivia
 router.get('/trivia/daily', authenticate, getDailyTrivia);

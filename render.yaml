@@ -6,7 +6,7 @@ services:
     buildCommand: npm ci && npm run build
     preDeployCommand: npm run migrate:deploy
     startCommand: npm start
-    healthCheckPath: /api/health
+    healthCheckPath: /api/health/ready
     envVars:
       - key: NODE_ENV
         value: production

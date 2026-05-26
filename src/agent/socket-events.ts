@@ -15,6 +15,8 @@ export function serializeAgentAction(action: AgentActionRecord): AgentActionReco
     entityType: action.entityType || null,
     uiIntents: action.uiIntents || [],
     payload: action.payload || null,
+    riskLevel: action.riskLevel,
+    autonomyMode: action.autonomyMode,
   };
 }
 
@@ -30,6 +32,14 @@ export function serializePendingAction(action: PendingActionRecord): AgentPendin
     input: action.input || null,
     status: action.status,
     context: action.context || null,
+    riskLevel:
+      action.riskLevel ||
+      ((action.context as Record<string, unknown> | null)?.riskLevel as any) ||
+      null,
+    autonomyMode:
+      action.autonomyMode ||
+      ((action.context as Record<string, unknown> | null)?.autonomyMode as any) ||
+      null,
     createdAt: action.createdAt.toISOString(),
     expiresAt: action.expiresAt.toISOString(),
     resolvedAt: action.resolvedAt ? action.resolvedAt.toISOString() : null,

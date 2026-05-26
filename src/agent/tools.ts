@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
 import { prisma } from '../config/prisma';
+import { getConnectionRequestLimitState } from '../services/tier-limits.service';
 import { AgentActionRecord, AgentToolExecutionContext, AgentToolResult, AgentUiIntent } from './types';
+import { evaluateToolExecutionPolicy, getAgentToolPolicy } from './action-policy.service';
 
 type ConnectionState = 'none' | 'pending_sent' | 'pending_received' | 'connected';
 
@@ -186,6 +188,16 @@ function nullableBooleanSchema() {
   };
 }
 
+function nullableStringArraySchema(maxItems: number) {
+  return {
+    type: ['array', 'null'],
+    maxItems,
+    items: {
+      type: 'string',
+    },
+  };
+}
+
 function strictObjectParameters(properties: Record<string, unknown>) {
   return {
     type: 'object',
@@ -295,6 +307,29 @@ const agentToolSchemas = [
   },
   {
     type: 'function',
+    name: 'profile_update_summary',
+    description:
+      'Prepare an update to the current user profile headline, bio, or interests. This always requires explicit approval before it writes.',
+    strict: true,
+    parameters: strictObjectParameters({
+      headline: nullableStringSchema(),
+      bio: nullableStringSchema(),
+      interests: nullableStringArraySchema(10),
+    }),
+  },
+  {
+    type: 'function',
+    name: 'posts_create_text',
+    description:
+      'Prepare a text-only post for the current user. This always requires explicit approval before it publishes.',
+    strict: true,
+    parameters: strictObjectParameters({
+      content: { type: 'string' },
+      visibility: nullableStringSchema(),
+    }),
+  },
+  {
+    type: 'function',
     name: 'growth_get_snapshot',
     description: 'Get a compact growth snapshot for the current user.',
     strict: true,
@@ -357,6 +392,27 @@ function compactStringList(
   });
 
   return items.slice(0, maxItems);
+}
+
+function normalizeProfileInterestsForAgent(values: unknown): string[] | undefined {
+  if (!Array.isArray(values)) {
+    return undefined;
+  }
+
+  const normalized = values
+    .map((value) => String(value || '').trim())
+    .filter((value) => value.length >= 2 && value.length <= 30)
+    .map((value) =>
+      value
+        .split(/\s+/)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(' ')
+    );
+
+  return Array.from(new Map(normalized.map((value) => [value.toLowerCase(), value])).values()).slice(
+    0,
+    10
+  );
 }
 
 function summarizeRecentAgentPost(post: any): Record<string, unknown> {
@@ -714,7 +770,10 @@ function actionRecord(params: {
   entityType?: string | null;
   uiIntents?: AgentUiIntent[];
   payload?: Record<string, unknown>;
+  riskLevel?: AgentActionRecord['riskLevel'];
+  autonomyMode?: AgentActionRecord['autonomyMode'];
 }): AgentActionRecord {
+  const toolPolicy = getAgentToolPolicy(params.toolName);
   return {
     type: params.type,
     toolName: params.toolName,
@@ -725,6 +784,8 @@ function actionRecord(params: {
     entityType: params.entityType || null,
     uiIntents: params.uiIntents || [],
     payload: params.payload || null,
+    riskLevel: params.riskLevel || toolPolicy.riskLevel,
+    autonomyMode: params.autonomyMode,
   };
 }
 
@@ -950,7 +1011,7 @@ async function getOrCreateConversationForUsers(userId: string, otherUserId: stri
   return conversation;
 }
 
-function maybeSuggestInstead(
+function maybeGateAction(
   toolName: string,
   ctx: AgentToolExecutionContext,
   params: {
@@ -963,8 +1024,43 @@ function maybeSuggestInstead(
     payload?: Record<string, unknown>;
   }
 ): AgentToolResult | null {
-  if (ctx.allowAutonomousActions) {
+  const policyDecision = evaluateToolExecutionPolicy(toolName, ctx);
+  const effectiveAutonomyMode =
+    ctx.effectiveAutonomyMode ||
+    ctx.autonomyMode ||
+    (ctx.allowAutonomousActions ? 'power' : 'approval');
+
+  if (policyDecision.canExecute) {
     return null;
+  }
+
+  if (!policyDecision.shouldCreateApproval) {
+    const blockedAction = actionRecord({
+      type: params.type,
+      toolName,
+      status: 'blocked',
+      title: params.title,
+      summary: `${params.summary} This action is blocked by Vormex safety policy.`,
+      entityId: params.entityId,
+      entityType: params.entityType,
+      uiIntents: params.uiIntents,
+      payload: params.payload,
+      riskLevel: policyDecision.policy.riskLevel,
+      autonomyMode: effectiveAutonomyMode,
+    });
+
+    return {
+      summary: blockedAction.summary,
+      output: {
+        status: 'blocked',
+        reason: policyDecision.reason,
+        riskLevel: policyDecision.policy.riskLevel,
+        autonomyMode: effectiveAutonomyMode,
+        uiIntents: params.uiIntents || [],
+      },
+      blockedAction,
+      uiIntents: params.uiIntents || [],
+    };
   }
 
   const suggestedAction = actionRecord({
@@ -977,14 +1073,22 @@ function maybeSuggestInstead(
     entityType: params.entityType,
     uiIntents: params.uiIntents,
     payload: params.payload,
+    riskLevel: policyDecision.policy.riskLevel,
+    autonomyMode: effectiveAutonomyMode,
   });
 
   return {
-    summary: `${params.summary} Autonomous actions are currently disabled, so I’m surfacing it as a suggestion.`,
+    summary:
+      policyDecision.policy.riskLevel === 'approval_required'
+        ? `${params.summary} This action always needs your approval first.`
+        : `${params.summary} I saved it for approval because power mode is unavailable or off.`,
     output: {
-      status: 'suggested',
-      reason: 'autonomous_actions_disabled',
+      status: 'approval_required',
+      reason: policyDecision.reason,
       suggestion: params.summary,
+      riskLevel: policyDecision.policy.riskLevel,
+      autonomyMode: effectiveAutonomyMode,
+      powerModeEligible: Boolean(ctx.powerModeEligible),
       uiIntents: params.uiIntents || [],
     },
     suggestedAction,
@@ -1378,7 +1482,7 @@ export async function executeAgentTool(
         };
       }
 
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'send_connection_request',
         title: 'Prepared a connection request',
         summary: 'I found the user and prepared the connection request.',
@@ -1412,6 +1516,27 @@ export async function executeAgentTool(
             summary: 'This connection is already pending or already accepted.',
             entityId: existing.id,
             entityType: 'connection',
+          }),
+        };
+      }
+
+      const limitState = await getConnectionRequestLimitState(ctx.userId);
+      if (!limitState.allowed) {
+        return {
+          summary: 'Free accounts can send up to 10 connection requests per month. Premium unlocks unlimited requests.',
+          output: {
+            status: 'blocked',
+            reason: 'connection_request_limit_reached',
+            limit: limitState.limit,
+            used: limitState.used,
+            remaining: limitState.remaining,
+          },
+          blockedAction: actionRecord({
+            type: 'send_connection_request',
+            toolName,
+            status: 'blocked',
+            title: 'Connection request limit reached',
+            summary: 'The monthly free connection request limit has been reached.',
           }),
         };
       }
@@ -1466,7 +1591,7 @@ export async function executeAgentTool(
         };
       }
 
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'accept_connection_request',
         title: 'Prepared to accept a connection request',
         summary: 'I found the pending connection request and can accept it.',
@@ -1559,7 +1684,7 @@ export async function executeAgentTool(
         };
       }
 
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'open_chat',
         title: 'Prepared a chat handoff',
         summary: 'I found the user and can open the chat thread.',
@@ -1613,7 +1738,7 @@ export async function executeAgentTool(
         };
       }
 
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'send_message',
         title: 'Prepared a direct message',
         summary: 'I drafted the message and can send it when autonomous actions are enabled.',
@@ -1762,7 +1887,7 @@ export async function executeAgentTool(
         };
       }
 
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'join_group',
         title: 'Prepared a group join',
         summary: 'I found the group and can join it.',
@@ -1933,6 +2058,182 @@ export async function executeAgentTool(
       };
     }
 
+    case 'profile_update_summary': {
+      const headline =
+        args.headline !== undefined && args.headline !== null ? clip(String(args.headline), 120) : undefined;
+      const bio = args.bio !== undefined && args.bio !== null ? clip(String(args.bio), 500) : undefined;
+      const interests = normalizeProfileInterestsForAgent(args.interests);
+      const updateData: Record<string, unknown> = {};
+
+      if (headline !== undefined) updateData.headline = headline;
+      if (bio !== undefined) updateData.bio = bio;
+      if (interests !== undefined) updateData.interests = interests;
+
+      const updatedFields = Object.keys(updateData);
+      if (updatedFields.length === 0) {
+        return {
+          summary: 'I need at least one profile field to update.',
+          output: {
+            status: 'blocked',
+            reason: 'missing_profile_update_fields',
+          },
+          blockedAction: actionRecord({
+            type: 'profile_update',
+            toolName,
+            status: 'blocked',
+            title: 'Profile update missing',
+            summary: 'No supported profile fields were provided.',
+            uiIntents: [switchTabIntent('profile')],
+          }),
+          uiIntents: [switchTabIntent('profile')],
+        };
+      }
+
+      args.headline = headline ?? null;
+      args.bio = bio ?? null;
+      args.interests = interests ?? null;
+
+      const summary = `Update your profile ${updatedFields.join(', ')}.`;
+      const gated = maybeGateAction(toolName, ctx, {
+        type: 'profile_update',
+        title: 'Approve profile update',
+        summary,
+        entityId: ctx.userId,
+        entityType: 'user',
+        uiIntents: [switchTabIntent('profile')],
+        payload: {
+          fields: updatedFields,
+          preview: updateData,
+        },
+      });
+      if (gated) return gated;
+
+      const updatedUser = await prisma.user.update({
+        where: { id: ctx.userId },
+        data: updateData,
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          profileImage: true,
+          headline: true,
+          bio: true,
+          interests: true,
+          updatedAt: true,
+        },
+      });
+
+      return {
+        summary: `Updated your profile ${updatedFields.join(', ')}.`,
+        output: {
+          status: 'executed',
+          profile: updatedUser,
+          fields: updatedFields,
+        },
+        executedAction: actionRecord({
+          type: 'profile_update',
+          toolName,
+          status: 'executed',
+          title: 'Updated profile',
+          summary: `Updated your profile ${updatedFields.join(', ')}.`,
+          entityId: ctx.userId,
+          entityType: 'user',
+          uiIntents: [switchTabIntent('profile')],
+          payload: {
+            fields: updatedFields,
+          },
+        }),
+        uiIntents: [switchTabIntent('profile')],
+      };
+    }
+
+    case 'posts_create_text': {
+      const content = clip(String(args.content || ''), 3000);
+      if (!content) {
+        return {
+          summary: 'I need post text before I can prepare a post.',
+          output: {
+            status: 'blocked',
+            reason: 'missing_post_content',
+          },
+          blockedAction: actionRecord({
+            type: 'post_create',
+            toolName,
+            status: 'blocked',
+            title: 'Post content missing',
+            summary: 'No post content was provided.',
+            uiIntents: [switchTabIntent('post')],
+          }),
+          uiIntents: [switchTabIntent('post')],
+        };
+      }
+
+      const requestedVisibility = String(args.visibility || 'public').trim().toLowerCase();
+      const visibility = ['public', 'connections', 'private'].includes(requestedVisibility)
+        ? requestedVisibility
+        : 'public';
+      args.content = content;
+      args.visibility = visibility;
+
+      const gated = maybeGateAction(toolName, ctx, {
+        type: 'post_create',
+        title: 'Approve post',
+        summary: `Publish a ${visibility} text post.`,
+        entityType: 'post',
+        uiIntents: [switchTabIntent('post')],
+        payload: {
+          content,
+          visibility,
+        },
+      });
+      if (gated) return gated;
+
+      const post = await prisma.post.create({
+        data: {
+          id: randomUUID(),
+          authorId: ctx.userId,
+          content,
+          mediaUrls: [],
+          metadata: {
+            source: 'agent',
+          },
+          type: 'text',
+          visibility,
+        },
+        select: {
+          id: true,
+          authorId: true,
+          content: true,
+          visibility: true,
+          type: true,
+          createdAt: true,
+        },
+      });
+
+      return {
+        summary: 'Published the text post.',
+        output: {
+          status: 'executed',
+          post,
+        },
+        executedAction: actionRecord({
+          type: 'post_create',
+          toolName,
+          status: 'executed',
+          title: 'Published post',
+          summary: 'Published the text post.',
+          entityId: post.id,
+          entityType: 'post',
+          uiIntents: [switchTabIntent('feed')],
+          payload: {
+            postId: post.id,
+            visibility,
+          },
+        }),
+        uiIntents: [switchTabIntent('feed')],
+      };
+    }
+
     case 'growth_get_snapshot': {
       const [connectionCount, pendingConnections, unreadNotifications, partnerCount, postCount] =
         await Promise.all([
@@ -2068,7 +2369,7 @@ export async function executeAgentTool(
     }
 
     case 'notifications_mark_all_read': {
-      const gated = maybeSuggestInstead(toolName, ctx, {
+      const gated = maybeGateAction(toolName, ctx, {
         type: 'notifications_mark_all_read',
         title: 'Prepared to mark notifications as read',
         summary: 'I can mark the current notifications as read.',

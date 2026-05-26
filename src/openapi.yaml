@@ -150,14 +150,13 @@ components:
         - email
         - password
         - name
-        - username
       properties:
         email:
           type: string
           format: email
         password:
           type: string
-          minLength: 8
+          minLength: 12
         name:
           type: string
         username:
@@ -198,7 +197,21 @@ components:
           $ref: '#/components/schemas/User'
         token:
           type: string
-          description: JWT token for authentication
+          description: 'JWT token only when a non-browser client sends X-Auth-Token-Transport: bearer. Browser clients receive httpOnly cookies instead.'
+        refreshToken:
+          type: string
+          description: 'Refresh token only when a non-browser client sends X-Auth-Token-Transport: bearer. Browser clients receive httpOnly cookies instead.'
+        csrfToken:
+          type: string
+          description: Signed CSRF token to echo in X-CSRF-Token for browser cookie authentication.
+        session:
+          type: object
+          properties:
+            id:
+              type: string
+            expiresAt:
+              type: string
+              format: date-time
 
     FullProfileResponse:
       type: object
@@ -602,7 +615,7 @@ paths:
               branch: Computer Science
       responses:
         '201':
-          description: User registered successfully
+          description: User registered successfully. Email/password users must verify email before login.
           content:
             application/json:
               schema:
@@ -742,7 +755,7 @@ paths:
                   type: string
                 newPassword:
                   type: string
-                  minLength: 8
+                  minLength: 12
       responses:
         '200':
           description: Password reset successful
@@ -836,6 +849,44 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '401':
           description: Invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/google/code:
+    post:
+      tags:
+        - OAuth
+      summary: Google Sign-In with authorization code
+      description: Exchanges a Google OAuth authorization code server-side, verifies the resulting ID token, and starts a session without exposing Google client secrets to frontend apps.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+                - codeVerifier
+                - redirectUri
+              properties:
+                code:
+                  type: string
+                codeVerifier:
+                  type: string
+                redirectUri:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid or expired Google authorization code
           content:
             application/json:
               schema:

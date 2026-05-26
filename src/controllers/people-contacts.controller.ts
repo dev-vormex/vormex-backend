@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { hashEmail, normalizeEmail } from '../utils/email-hash.util';
@@ -23,6 +24,8 @@ interface PeopleYouKnowMatch {
   skills: string[];
   interests: string[];
   isOnline: boolean;
+  verified: boolean;
+  isVerified: boolean;
   connectionStatus: ConnectionState;
   mutualConnections: number;
   contactName: string | null;
@@ -48,6 +51,7 @@ interface PeopleYouKnowResponse {
 
 const MATCH_STATUS_MATCHED = 'matched';
 const MATCH_STATUS_UNMATCHED = 'unmatched';
+const EMAIL_HASH_BACKFILL_BATCH_SIZE = 500;
 
 const statusPriority: Record<ConnectionState, number> = {
   none: 0,
@@ -60,19 +64,40 @@ async function ensureUserEmailHashes(): Promise<void> {
   const usersMissingHashes = await prisma.user.findMany({
     where: { emailHash: null },
     select: { id: true, email: true },
+    take: EMAIL_HASH_BACKFILL_BATCH_SIZE,
   });
 
   if (usersMissingHashes.length === 0) {
     return;
   }
 
-  await Promise.all(
-    usersMissingHashes.map((user) =>
-      prisma.user.update({
-        where: { id: user.id },
-        data: { emailHash: hashEmail(user.email) },
-      })
-    )
+  const updates = usersMissingHashes
+    .map((user) => ({
+      id: user.id,
+      emailHash: hashEmail(user.email),
+    }))
+    .filter(
+      (update): update is { id: string; emailHash: string } =>
+        Boolean(update.emailHash)
+    );
+
+  if (updates.length === 0) {
+    return;
+  }
+
+  await prisma.$executeRaw(
+    Prisma.sql`
+      UPDATE "users" AS u
+      SET "emailHash" = v."emailHash",
+          "updatedAt" = NOW()
+      FROM (
+        VALUES ${Prisma.join(
+          updates.map((update) => Prisma.sql`(${update.id}, ${update.emailHash})`)
+        )}
+      ) AS v("id", "emailHash")
+      WHERE u."id" = v."id"
+        AND u."emailHash" IS NULL
+    `
   );
 }
 
@@ -205,6 +230,7 @@ async function buildPeopleYouKnowResponse(
           bio: true,
           interests: true,
           isOnline: true,
+          isVerified: true,
           lastActiveAt: true,
           skills: {
             select: { skill: { select: { name: true } } },
@@ -242,6 +268,8 @@ async function buildPeopleYouKnowResponse(
         skills: user.skills.map((skill) => skill.skill.name),
         interests: user.interests,
         isOnline: user.isOnline,
+        verified: Boolean(user.isVerified),
+        isVerified: Boolean(user.isVerified),
         connectionStatus,
         mutualConnections: mutualConnectionsMap.get(user.id) ?? 0,
         contactName: entry?.contactName ?? null,

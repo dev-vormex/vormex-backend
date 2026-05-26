@@ -15,6 +15,7 @@ const notificationInclude = {
       username: true,
       name: true,
       profileImage: true,
+      isVerified: true,
     },
   },
   posts: {

@@ -6,7 +6,15 @@ export type AgentSurface =
   | 'groups'
   | 'profile'
   | 'notifications'
-  | 'growth_hub';
+  | 'growth_hub'
+  | 'talk_with_vormex';
+
+export type AgentAutonomyMode = 'approval' | 'power';
+export type AgentActionRiskLevel =
+  | 'safe_read'
+  | 'low_risk_write'
+  | 'approval_required'
+  | 'blocked';
 
 export interface AgentSessionSummary {
   sessionId: string;
@@ -15,6 +23,10 @@ export interface AgentSessionSummary {
   currentSurface?: string | null;
   memorySummary?: string | null;
   allowAutonomousActions: boolean;
+  requestedAutonomyMode?: AgentAutonomyMode;
+  effectiveAutonomyMode?: AgentAutonomyMode;
+  powerModeEligible?: boolean;
+  isPremium?: boolean;
   lastResponseId?: string | null;
 }
 
@@ -23,6 +35,7 @@ export interface AgentSessionBootstrapRequest {
   mode?: string;
   surface?: string;
   allowAutonomousActions?: boolean;
+  autonomyMode?: AgentAutonomyMode | string;
   metadata?: Record<string, unknown>;
 }
 
@@ -31,6 +44,7 @@ export interface AgentTurnRequest {
   surface?: string;
   surfaceContext?: Record<string, unknown>;
   allowAutonomousActions?: boolean;
+  autonomyMode?: AgentAutonomyMode | string;
 }
 
 export interface AgentUiIntent {
@@ -56,6 +70,8 @@ export interface AgentActionRecord {
   entityType?: string | null;
   uiIntents?: AgentUiIntent[];
   payload?: Record<string, unknown> | null;
+  riskLevel?: AgentActionRiskLevel;
+  autonomyMode?: AgentAutonomyMode;
 }
 
 export interface AgentPendingActionSummary {
@@ -69,6 +85,8 @@ export interface AgentPendingActionSummary {
   input?: Record<string, unknown> | null;
   status: string;
   context?: Record<string, unknown> | null;
+  riskLevel?: AgentActionRiskLevel | null;
+  autonomyMode?: AgentAutonomyMode | null;
   createdAt: string;
   expiresAt: string;
   resolvedAt?: string | null;
@@ -107,6 +125,15 @@ export interface AgentToolExecutionContext {
   surface: string;
   surfaceContext: Record<string, unknown>;
   allowAutonomousActions: boolean;
+  autonomyMode?: AgentAutonomyMode;
+  requestedAutonomyMode?: AgentAutonomyMode;
+  effectiveAutonomyMode?: AgentAutonomyMode;
+  powerModeEligible?: boolean;
+  isPremium?: boolean;
+  approvedAction?: {
+    actionId: string;
+    toolName: string;
+  } | null;
 }
 
 export interface AgentToolResult {

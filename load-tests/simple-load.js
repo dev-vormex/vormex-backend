@@ -34,6 +34,17 @@ const scenarios = {
       { name: 'health-ready', method: 'GET', path: '/api/health/ready', weight: 1 },
     ],
   },
+  'app-public-read': {
+    description: 'Anonymous app-style read mix without health checks. Good for simulating public mobile browsing traffic.',
+    requiresAuth: false,
+    requests: [
+      { name: 'reels-feed', method: 'GET', path: '/api/reels/feed?limit=10', weight: 4 },
+      { name: 'people-search', method: 'GET', path: '/api/people?limit=10&includeTotal=false', weight: 3 },
+      { name: 'groups-list', method: 'GET', path: '/api/groups?limit=10', weight: 2 },
+      { name: 'jobs-list', method: 'GET', path: '/api/jobs?limit=10', weight: 2 },
+      { name: 'skills-search', method: 'GET', path: '/api/skills/search?q=ko&limit=10', weight: 1 },
+    ],
+  },
   'auth-read': {
     description: 'Authenticated read mix for app-home style traffic. Requires LOAD_TEST_TOKEN or --token.',
     requiresAuth: true,
@@ -61,6 +72,10 @@ Options:
   --file <path>           Custom JSON scenario file. Overrides --scenario.
   --duration <seconds>    Test duration. Default: ${DEFAULT_DURATION_SECONDS}
   --concurrency <number>  Number of concurrent workers. Default: ${DEFAULT_CONCURRENCY}
+  --target-rps <number>   Pace total request rate. Default: unlimited/closed-loop.
+  --start-jitter <ms>     Random initial delay per worker to avoid synchronized launch bursts.
+  --spread-start          Evenly spread first requests across the per-worker request interval.
+  --virtual-ips <number>  Send rotating X-Forwarded-For addresses for owned staging/local tests.
   --timeout <ms>          Per-request timeout. Default: ${DEFAULT_TIMEOUT_MS}
   --token <jwt>           Bearer token for authenticated scenarios.
   --tokens <jwt,jwt>      Comma-separated bearer tokens for multi-user tests.
@@ -212,6 +227,17 @@ function buildBodyAndHeaders(request, token) {
   return { body, headers };
 }
 
+function hasHeader(headers, headerName) {
+  return Object.keys(headers).some((key) => key.toLowerCase() === headerName.toLowerCase());
+}
+
+function virtualIpFor(workerId, requestIndex, virtualIps) {
+  const slot = ((workerId + requestIndex) % virtualIps) + 1;
+  const thirdOctet = Math.floor((slot - 1) / 250);
+  const fourthOctet = ((slot - 1) % 250) + 1;
+  return `10.255.${thirdOctet}.${fourthOctet}`;
+}
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -242,10 +268,24 @@ function increment(map, key, delta = 1) {
   map.set(key, (map.get(key) || 0) + delta);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function runWorker(workerId, config, stats, deadlineMs) {
   let requestIndex = workerId;
+  const perWorkerIntervalMs = config.targetRps > 0
+    ? (config.concurrency / config.targetRps) * 1000
+    : 0;
+
+  if (config.spreadStart && perWorkerIntervalMs > 0) {
+    await sleep((workerId / config.concurrency) * perWorkerIntervalMs);
+  } else if (config.startJitterMs > 0) {
+    await sleep(Math.random() * config.startJitterMs);
+  }
 
   while (performance.now() < deadlineMs) {
+    const loopStartedAt = performance.now();
     const request = config.requests[requestIndex % config.requests.length];
     requestIndex += config.concurrency;
 
@@ -254,6 +294,9 @@ async function runWorker(workerId, config, stats, deadlineMs) {
       : null;
     const url = buildUrl(config.baseUrl, request);
     const { body, headers } = buildBodyAndHeaders(request, token);
+    if (config.virtualIps > 0 && !hasHeader(headers, 'x-forwarded-for')) {
+      headers['x-forwarded-for'] = virtualIpFor(workerId, requestIndex, config.virtualIps);
+    }
     const startedAt = performance.now();
 
     try {
@@ -283,6 +326,21 @@ async function runWorker(workerId, config, stats, deadlineMs) {
       stats.latencies.push(latency);
       increment(stats.statuses, error.name === 'AbortError' ? 'timeout' : 'network-error');
       increment(stats.endpoints, request.name);
+    }
+
+    if (perWorkerIntervalMs > 0) {
+      const nowMs = performance.now();
+      if (nowMs >= deadlineMs) {
+        break;
+      }
+
+      const remainingDelayMs = Math.min(
+        perWorkerIntervalMs - (nowMs - loopStartedAt),
+        deadlineMs - nowMs
+      );
+      if (remainingDelayMs > 0) {
+        await sleep(remainingDelayMs);
+      }
     }
   }
 }
@@ -380,6 +438,14 @@ async function main() {
     baseUrl: args['base-url'] || DEFAULT_BASE_URL,
     durationSeconds: toPositiveNumber(args.duration, DEFAULT_DURATION_SECONDS, '--duration'),
     concurrency: Math.floor(toPositiveNumber(args.concurrency, DEFAULT_CONCURRENCY, '--concurrency')),
+    targetRps: args['target-rps'] === undefined ? 0 : toPositiveNumber(args['target-rps'], 0, '--target-rps'),
+    spreadStart: Boolean(args['spread-start']),
+    startJitterMs: args['start-jitter'] === undefined
+      ? 0
+      : toPositiveNumber(args['start-jitter'], 0, '--start-jitter'),
+    virtualIps: args['virtual-ips'] === undefined
+      ? 0
+      : Math.floor(toPositiveNumber(args['virtual-ips'], 0, '--virtual-ips')),
     timeoutMs: toPositiveNumber(args.timeout, DEFAULT_TIMEOUT_MS, '--timeout'),
     maxP95: args['max-p95'] === undefined ? null : toPositiveNumber(args['max-p95'], null, '--max-p95'),
     maxErrorRate: args['max-error-rate'] === undefined
@@ -395,6 +461,10 @@ async function main() {
   console.log(`  Description: ${scenario.description}`);
   console.log(`  Duration:    ${config.durationSeconds}s`);
   console.log(`  Concurrency: ${config.concurrency}`);
+  console.log(`  Target RPS:  ${config.targetRps > 0 ? config.targetRps : 'unlimited'}`);
+  console.log(`  Spread start:${config.spreadStart ? 'yes' : 'no'}`);
+  console.log(`  Start jitter:${config.startJitterMs}ms`);
+  console.log(`  Virtual IPs: ${config.virtualIps}`);
   console.log(`  Timeout:     ${config.timeoutMs}ms`);
   console.log(`  Auth tokens: ${config.tokens.length}`);
   console.log('');
