@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import type { CoarseLocationDTO } from '../utils/location-dto.util';
 
 /**
  * Register Request Body Interface
@@ -53,7 +54,7 @@ export interface UserResponse {
   // Enhanced Profile Fields
   headline?: string | null;
   bannerImageUrl?: string | null;
-  location?: string | null;
+  location?: CoarseLocationDTO | null;
   currentYear?: number | null;
   degree?: string | null;
   portfolioUrl?: string | null;
@@ -62,9 +63,13 @@ export interface UserResponse {
   isOpenToOpportunities: boolean;
   interests?: string[]; // Array of interests
   onboardingCompleted?: boolean;
+  identityTrustLevel?: string;
+  verificationBadges?: string[];
   isPremium?: boolean;
   canUseAgent?: boolean;
   canAccessProfileCustomization?: boolean;
+  profileBadgeStyle?: string | null;
+  profileTheme?: string;
   premiumDisplayAmount?: string;
   
   createdAt: Date;
@@ -95,6 +100,7 @@ export interface ErrorResponse {
   code?: string;
   requestId?: string;
   retryAfterSeconds?: number;
+  suspendedUntil?: string;
   details?: string;
   requiresVerification?: boolean; // Optional flag for email verification requirement
 }
@@ -144,4 +150,12 @@ export interface GoogleSignInRequestBody {
  */
 export interface ResendVerificationRequestBody {
   email: string;
+}
+
+/**
+ * Verify Email OTP Request Body Interface
+ */
+export interface VerifyEmailOtpRequestBody {
+  email: string;
+  code: string;
 }

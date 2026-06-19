@@ -1,4 +1,10 @@
 import { Resend } from 'resend';
+import {
+  executeWithCircuitBreaker,
+  fetchWithBreaker,
+} from './http-client-with-breaker.util';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 
 const resend = new Resend(process.env.RESEND_API_KEY || 're_placeholder');
 
@@ -15,6 +21,12 @@ type EmailServiceCheckCache = {
 };
 
 type ResendHeaders = Record<string, string | number | undefined> | null | undefined;
+type EmailAttachment = {
+  content: Buffer;
+  filename: string;
+  contentType: string;
+  contentId: string;
+};
 
 let emailServiceCheckCache: EmailServiceCheckCache | null = null;
 
@@ -214,11 +226,11 @@ async function assertEmailServiceReady(): Promise<void> {
   }
 
   try {
-    const response = await fetch(RESEND_DOMAINS_ENDPOINT, {
+    const response = await fetchWithBreaker('resend', 'list_domains', RESEND_DOMAINS_ENDPOINT, {
       headers: {
         Authorization: `Bearer ${resendApiKey}`,
       },
-    });
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 8_000 });
 
     if (!response.ok) {
       const responseBody = await parseJsonSafely(response);
@@ -381,23 +393,73 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function resolveVormexLogo(): {
+  src: string;
+  attachments?: EmailAttachment[];
+} {
+  const contentId = 'vormex-logo';
+  const configuredLogoPath = process.env.EMAIL_LOGO_PATH?.trim();
+  const localLogoCandidates = [
+    configuredLogoPath,
+    path.resolve(process.cwd(), '../vormex-web/public/logo.png'),
+    path.resolve(process.cwd(), '../admin/public/vormex-logo.png'),
+    path.resolve(process.cwd(), 'public/logo.png'),
+  ].filter((value): value is string => Boolean(value));
+
+  const localLogoPath = localLogoCandidates.find((candidate) => existsSync(candidate));
+  if (localLogoPath) {
+    return {
+      src: `cid:${contentId}`,
+      attachments: [
+        {
+          content: readFileSync(localLogoPath),
+          filename: 'vormex-logo.png',
+          contentType: 'image/png',
+          contentId,
+        },
+      ],
+    };
+  }
+
+  const configuredLogoUrl = process.env.EMAIL_LOGO_URL?.trim();
+  const frontendUrl = process.env.FRONTEND_URL?.trim();
+  const frontendLogoUrl =
+    frontendUrl && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(frontendUrl)
+      ? `${frontendUrl.replace(/\/+$/, '')}/logo.png`
+      : null;
+
+  return {
+    src: configuredLogoUrl || frontendLogoUrl || 'https://vormex.in/logo.png',
+  };
+}
+
 async function sendEmail(params: {
   to: string;
   subject: string;
   html: string;
   text: string;
+  attachments?: EmailAttachment[];
 }): Promise<void> {
   const { emailFrom } = getEmailConfig();
   await assertEmailServiceReady();
 
   try {
-    const result = await resend.emails.send({
-      from: emailFrom,
-      to: params.to,
-      subject: params.subject,
-      html: params.html,
-      text: params.text,
-    });
+    const result = await executeWithCircuitBreaker(
+      'resend',
+      'send_email',
+      () => resend.emails.send({
+        from: emailFrom,
+        to: params.to,
+        subject: params.subject,
+        html: params.html,
+        text: params.text,
+        attachments: params.attachments,
+      }),
+      {
+        connectTimeoutMs: 5_000,
+        requestTimeoutMs: 10_000,
+      }
+    );
 
     if (result.error) {
       throw normalizeResendSendError(result.error, getResendResponseHeaders(result));
@@ -523,21 +585,22 @@ The Vormex Team
 }
 
 /**
- * Send email verification email to user
+ * Send email verification OTP to user
  *
  * @param email - User's email address
- * @param verificationToken - Plain text verification token (will be included in URL)
+ * @param verificationCode - Plain text 6-digit verification code
  * @param name - User's name for personalization
  * @throws Error if email sending fails
  */
 export async function sendVerificationEmail(
   email: string,
-  verificationToken: string,
+  verificationCode: string,
   name: string
 ): Promise<void> {
-  const { frontendUrl } = getEmailConfig();
-  const verificationUrl = `${frontendUrl}/verify-email?token=${encodeURIComponent(verificationToken)}`;
   const escapedName = escapeHtml(name);
+  const escapedCode = escapeHtml(verificationCode);
+  const logo = resolveVormexLogo();
+  const escapedLogoSrc = escapeHtml(logo.src);
 
   const htmlBody = `
 <!DOCTYPE html>
@@ -545,7 +608,7 @@ export async function sendVerificationEmail(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Verify Your Account</title>
+  <title>Verify Your Vormex Email</title>
 </head>
 <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
   <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f5f5f5;">
@@ -554,34 +617,26 @@ export async function sendVerificationEmail(
         <table role="presentation" style="max-width: 600px; width: 100%; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
           <tr>
             <td style="padding: 40px 30px;">
-              <h1 style="margin: 0 0 20px 0; color: #000000; font-size: 24px; font-weight: 600;">Welcome to Vormex!</h1>
+              <div style="margin: 0 auto 26px auto; text-align: center;">
+                <img src="${escapedLogoSrc}" width="82" height="82" alt="Vormex" style="display: inline-block; width: 82px; height: 82px; border: 0; outline: none; text-decoration: none; border-radius: 18px;">
+              </div>
+
+              <h1 style="margin: 0 0 20px 0; color: #000000; font-size: 24px; font-weight: 600; text-align: center;">Verify your Vormex email</h1>
 
               <p style="margin: 0 0 20px 0; color: #333333; font-size: 16px; line-height: 1.5;">
                 Hello ${escapedName},
               </p>
 
               <p style="margin: 0 0 20px 0; color: #333333; font-size: 16px; line-height: 1.5;">
-                Thank you for joining Vormex! We're excited to have you on board. To get started and access all features, please verify your email address by clicking the button below.
+                Enter this verification code in the app to continue your Vormex verification.
               </p>
 
-              <table role="presentation" style="width: 100%; margin: 30px 0;">
-                <tr>
-                  <td align="center">
-                    <a href="${verificationUrl}" style="display: inline-block; padding: 14px 32px; background-color: #2563eb; color: #ffffff; text-decoration: none; border-radius: 6px; font-size: 16px; font-weight: 600; text-align: center;">Verify Email Address</a>
-                  </td>
-                </tr>
-              </table>
-
-              <p style="margin: 20px 0; color: #666666; font-size: 14px; line-height: 1.5;">
-                Or copy and paste this link into your browser:
-              </p>
-
-              <p style="margin: 0 0 20px 0; color: #2563eb; font-size: 14px; word-break: break-all; line-height: 1.5;">
-                ${verificationUrl}
-              </p>
+              <div style="margin: 30px 0; padding: 18px 24px; background-color: #f1f5f9; border-radius: 10px; text-align: center; letter-spacing: 8px; font-size: 32px; font-weight: 700; color: #111827;">
+                ${escapedCode}
+              </div>
 
               <p style="margin: 0 0 20px 0; color: #666666; font-size: 14px; line-height: 1.5;">
-                <strong>This verification link will expire in 24 hours.</strong> If you don't verify your email within this time, you can request a new verification email.
+                <strong>This code expires in 10 minutes.</strong> If it expires, request a new code from the app.
               </p>
 
               <p style="margin: 0 0 20px 0; color: #666666; font-size: 14px; line-height: 1.5;">
@@ -603,15 +658,15 @@ export async function sendVerificationEmail(
   `.trim();
 
   const textBody = `
-Welcome to Vormex!
+Verify your Vormex email
 
 Hello ${name},
 
-Thank you for joining Vormex! We're excited to have you on board. To get started and access all features, please verify your email address using the link below:
+Enter this verification code in the app to continue your Vormex verification:
 
-${verificationUrl}
+${verificationCode}
 
-This verification link will expire in 24 hours. If you don't verify your email within this time, you can request a new verification email.
+This code expires in 10 minutes. If it expires, request a new code from the app.
 
 If you didn't create a Vormex account, please ignore this email.
 
@@ -621,9 +676,10 @@ The Vormex Team
 
   await sendEmail({
     to: email,
-    subject: 'Verify Your Vormex Account',
+    subject: `${verificationCode} is your Vormex verification code`,
     html: htmlBody,
     text: textBody,
+    attachments: logo.attachments,
   });
 
   console.log('Verification email sent successfully to:', email);

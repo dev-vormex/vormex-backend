@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { requestWithBreaker } from './http-client-with-breaker.util';
 import { parseStoredMusicAttachment, type StoredMusicAttachment } from './music.util';
 import { validateHttpUrlLike } from './input-security.util';
 
@@ -263,7 +263,9 @@ export async function enrichLinkMetadataFromUrl(metadata: StoredPostMetadata): P
   if (!validateHttpUrlLike(url).ok) return;
 
   try {
-    const res = await axios.get<string>(url, {
+    const res = await requestWithBreaker<string>('open_graph', 'fetch_metadata', {
+      method: 'GET',
+      url,
       timeout: 9000,
       maxRedirects: 5,
       responseType: 'text',
@@ -272,7 +274,7 @@ export async function enrichLinkMetadataFromUrl(metadata: StoredPostMetadata): P
         Accept: 'text/html,application/xhtml+xml',
       },
       validateStatus: (s) => s >= 200 && s < 400,
-    });
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 9_000 });
     const html = typeof res.data === 'string' ? res.data : '';
     const pickOg = (prop: string): string | null => {
       const re1 = new RegExp(
@@ -394,6 +396,12 @@ export function mapPostResponse(post: any, currentUserId: string) {
       headline: post.author.headline,
       verified: Boolean(post.author.isVerified),
       isVerified: Boolean(post.author.isVerified),
+      profileBadgeStyle: post.author.profileBadgeStyle ?? null,
+      isPremium: Boolean(post.author.isPremium),
+      profileBoostActive: Boolean(post.author.profileBoostActive),
+      profileBoostEndsAt: post.author.profileBoostEndsAt ?? null,
+      profileBoostPriority: post.author.profileBoostPriority ?? 0,
+      discoveryPriority: post.author.discoveryPriority ?? 0,
     },
     content: post.content,
     contentType: metadata.contentType || DEFAULT_CONTENT_TYPE,
@@ -408,6 +416,12 @@ export function mapPostResponse(post: any, currentUserId: string) {
       headline: user.headline,
       verified: Boolean(user.isVerified),
       isVerified: Boolean(user.isVerified),
+      profileBadgeStyle: user.profileBadgeStyle ?? null,
+      isPremium: Boolean(user.isPremium),
+      profileBoostActive: Boolean(user.profileBoostActive),
+      profileBoostEndsAt: user.profileBoostEndsAt ?? null,
+      profileBoostPriority: user.profileBoostPriority ?? 0,
+      discoveryPriority: user.discoveryPriority ?? 0,
     })),
     collaborationStatus: currentUserCollaboration?.status ??
       (visiblePendingCollaboratorIds.includes(currentUserId)

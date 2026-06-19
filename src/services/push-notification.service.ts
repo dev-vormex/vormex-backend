@@ -1,6 +1,8 @@
 import { prisma } from '../config/prisma';
 import type * as admin from 'firebase-admin';
 import { getFirebaseMessaging, initializeFirebaseAdmin } from './firebase-admin.service';
+import { logger } from '../lib/logger';
+import { pushNotificationConfigCounter } from '../infrastructure/metrics/registry';
 
 /**
  * Push Notification Service
@@ -44,27 +46,136 @@ interface RecommendedMatchPushData {
   screen?: string;
   source?: string;
   tab?: string;
+  whySummary?: string;
 }
 
-let fcmEnabled = false;
+type PushNotificationMode = 'firebase' | 'disabled' | 'mock';
 
-function initializeFirebase(): boolean {
-  const initialized = initializeFirebaseAdmin();
-  if (!initialized) {
-    console.warn('Firebase credentials not configured. Push notifications disabled.');
-    console.log('Push notifications running in mock mode (FCM not configured)');
+let pushMode: PushNotificationMode = 'disabled';
+
+function hasFirebaseCredentials(): boolean {
+  return Boolean(
+    process.env.FIREBASE_PROJECT_ID &&
+      process.env.FIREBASE_CLIENT_EMAIL &&
+      process.env.FIREBASE_PRIVATE_KEY
+  );
+}
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production';
+}
+
+function isPushExplicitlyDisabled(): boolean {
+  return process.env.PUSH_NOTIFICATIONS_ENABLED === 'false';
+}
+
+function isExplicitMockMode(): boolean {
+  return process.env.FIREBASE_PUSH_MOCK_MODE === 'true' && !isProduction();
+}
+
+export function resolvePushNotificationMode(): PushNotificationMode {
+  if (isPushExplicitlyDisabled()) {
+    pushNotificationConfigCounter.inc({ state: 'disabled' });
+    logger.error({
+      event: 'push_notifications.disabled',
+      reason: 'PUSH_NOTIFICATIONS_ENABLED=false',
+    });
+    return 'disabled';
   }
-  fcmEnabled = initialized;
-  return initialized;
+
+  if (!hasFirebaseCredentials()) {
+    if (isExplicitMockMode()) {
+      pushNotificationConfigCounter.inc({ state: 'mock' });
+      logger.warn({
+        event: 'push_notifications.mock_enabled',
+        reason: 'FIREBASE_PUSH_MOCK_MODE=true',
+      });
+      return 'mock';
+    }
+
+    pushNotificationConfigCounter.inc({ state: 'missing_config' });
+    const message =
+      'Firebase Admin credentials are missing. Configure FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY, set PUSH_NOTIFICATIONS_ENABLED=false to disable push, or set FIREBASE_PUSH_MOCK_MODE=true in dev/test only.';
+
+    if (isProduction()) {
+      logger.fatal({
+        event: 'push_notifications.config_missing',
+      }, message);
+      throw new Error(message);
+    }
+
+    logger.error({
+      event: 'push_notifications.disabled',
+      reason: 'firebase_config_missing',
+    }, message);
+    return 'disabled';
+  }
+
+  const initialized = initializeFirebaseAdmin();
+  if (initialized) {
+    pushNotificationConfigCounter.inc({ state: 'firebase' });
+    return 'firebase';
+  }
+
+  pushNotificationConfigCounter.inc({ state: 'invalid_config' });
+  const message = 'Firebase Admin failed to initialize. Push notifications are not safe to send.';
+  if (isProduction()) {
+    logger.fatal({
+      event: 'push_notifications.config_invalid',
+    }, message);
+    throw new Error(message);
+  }
+
+  if (isExplicitMockMode()) {
+    pushNotificationConfigCounter.inc({ state: 'mock' });
+    logger.warn({
+      event: 'push_notifications.mock_enabled',
+      reason: 'firebase_initialize_failed',
+    });
+    return 'mock';
+  }
+
+  logger.error({
+    event: 'push_notifications.disabled',
+    reason: 'firebase_initialize_failed',
+  }, message);
+  return 'disabled';
 }
 
-class PushNotificationService {
+export class PushNotificationService {
   constructor() {
-    fcmEnabled = initializeFirebase();
+    pushMode = resolvePushNotificationMode();
+  }
+
+  isEnabled(): boolean {
+    return pushMode === 'firebase';
+  }
+
+  isMockMode(): boolean {
+    return pushMode === 'mock';
   }
 
   async sendToUser(userId: string, payload: NotificationPayload): Promise<boolean> {
     try {
+      if (pushMode === 'mock') {
+        logger.warn({
+          event: 'push_notification.mock_send',
+          userId,
+          title: payload.title,
+          hasData: Boolean(payload.data),
+        });
+        return true;
+      }
+
+      if (pushMode === 'disabled') {
+        logger.error({
+          event: 'push_notification.disabled_drop',
+          userId,
+          title: payload.title,
+        }, 'Push notification was not sent because Firebase push is disabled.');
+        return false;
+      }
+
       const tokens = await prisma.device_tokens.findMany({
         where: { userId, isActive: true },
         select: { id: true, token: true },
@@ -75,27 +186,15 @@ class PushNotificationService {
         return false;
       }
 
-      // Mock mode - log the notification
-      if (!fcmEnabled) {
-        console.log(`📱 [MOCK] Push notification to ${userId}:`);
-        console.log(`  Title: ${payload.title}`);
-        console.log(`  Body: ${payload.body}`);
-        if (payload.data) {
-          console.log(`  Data:`, payload.data);
-        }
-        return true;
-      }
-
       // Send via Firebase Cloud Messaging
       const messaging = getFirebaseMessaging();
       if (!messaging) {
-        console.log(`📱 [MOCK] Push notification to ${userId}:`);
-        console.log(`  Title: ${payload.title}`);
-        console.log(`  Body: ${payload.body}`);
-        if (payload.data) {
-          console.log(`  Data:`, payload.data);
-        }
-        return true;
+        logger.error({
+          event: 'push_notification.messaging_unavailable',
+          userId,
+          title: payload.title,
+        }, 'Firebase messaging is unavailable; push notification was not sent.');
+        return false;
       }
       const tokenStrings = tokens.map(t => t.token);
       

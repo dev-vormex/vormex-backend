@@ -23,6 +23,10 @@ import {
   revokeAllAuthSessions,
 } from '../services/auth-session.service';
 import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.service';
+import { cacheService } from '../services/cache.service';
+import { normalizeProfileThemeForStorage, serializeProfileTheme } from '../constants/profile-themes';
+import { deleteIdentityEvidence, readEncryptedIdentityEvidence } from '../services/identity-evidence.service';
+import { recordSafetyEvent, recomputeIdentityTrustLevel } from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string; sessionId?: string };
@@ -151,6 +155,7 @@ const buildUserAudienceWhere = ({
 
 const mapAdminUser = (user: any) => ({
   ...user,
+  profileTheme: serializeProfileTheme(user.profileTheme),
   hasActivePushToken: (user.device_tokens?.length ?? 0) > 0,
   activePushPlatforms: Array.from(new Set((user.device_tokens ?? []).map((entry: any) => entry.platform))),
   lastPushTokenAt: user.device_tokens?.[0]?.updatedAt ?? null,
@@ -877,6 +882,7 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
           lastActiveAt: true,
           isOnline: true,
           authProvider: true,
+          profileTheme: true,
           device_tokens: {
             where: {
               isActive: true,
@@ -969,11 +975,22 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     const { id } = req.params;
-    const allowedFields = ['name', 'email', 'role', 'isVerified', 'college', 'branch', 'graduationYear'];
+    const allowedFields = ['name', 'email', 'role', 'isVerified', 'college', 'branch', 'graduationYear', 'profileTheme'];
     const data: any = {};
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) {
-        data[field] = req.body[field];
+        if (field === 'profileTheme') {
+          try {
+            data.profileTheme = normalizeProfileThemeForStorage(req.body[field]);
+          } catch (error) {
+            res.status(400).json({
+              error: error instanceof Error ? error.message : 'Unsupported profile theme',
+            });
+            return;
+          }
+        } else {
+          data[field] = req.body[field];
+        }
       }
     }
 
@@ -984,8 +1001,17 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
     if (Object.prototype.hasOwnProperty.call(data, 'isVerified')) {
       await invalidateAuthUserStatus(id);
     }
+    if (Object.prototype.hasOwnProperty.call(data, 'profileTheme')) {
+      await cacheService.invalidateTags(`user:${id}`);
+    }
 
-    res.json({ user, message: 'User updated successfully' });
+    res.json({
+      user: {
+        ...user,
+        profileTheme: serializeProfileTheme(user.profileTheme),
+      },
+      message: 'User updated successfully',
+    });
   } catch (error) {
     console.error('updateUser error:', error);
     res.status(500).json({ error: 'Failed to update user' });
@@ -1000,6 +1026,7 @@ export const banUser = async (req: AuthRequest, res: Response): Promise<void> =>
     }
 
     const { id } = req.params;
+    const reason = normalizeOptionalString(req.body?.reason) || normalizeOptionalString(req.body?.banReason) || 'Admin ban';
 
     if (id === String(req.user.userId)) {
       res.status(400).json({ error: 'Cannot ban yourself' });
@@ -1008,7 +1035,18 @@ export const banUser = async (req: AuthRequest, res: Response): Promise<void> =>
 
     await prisma.user.update({
       where: { id },
-      data: { isBanned: true },
+      data: {
+        isBanned: true,
+        bannedReason: reason,
+        safetySuspendedUntil: null,
+        safetyRestrictedUntil: null,
+      },
+    });
+    await recordSafetyEvent({
+      actorId: String(req.user.userId),
+      targetUserId: id,
+      eventType: 'USER_BANNED',
+      reason,
     });
     await invalidateAuthUserStatus(id);
     await revokeAllAuthSessions(id);
@@ -1030,7 +1068,17 @@ export const unbanUser = async (req: AuthRequest, res: Response): Promise<void> 
     const { id } = req.params;
     await prisma.user.update({
       where: { id },
-      data: { isBanned: false },
+      data: {
+        isBanned: false,
+        bannedReason: null,
+        safetySuspendedUntil: null,
+        safetyRestrictedUntil: null,
+      },
+    });
+    await recordSafetyEvent({
+      actorId: String(req.user.userId),
+      targetUserId: id,
+      eventType: 'USER_UNBANNED',
     });
     await invalidateAuthUserStatus(id);
 
@@ -1935,6 +1983,453 @@ export const clearAllChats = async (req: AuthRequest, res: Response): Promise<vo
 };
 
 // ============================================
+// TRUST & SAFETY: IDENTITY REVIEWS
+// ============================================
+
+const identityReviewInclude = {
+  user: {
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+      profileImage: true,
+      identityTrustLevel: true,
+      phoneLast4: true,
+      phoneVerifiedAt: true,
+      isVerified: true,
+    },
+  },
+  reviewerUser: {
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+    },
+  },
+};
+
+function mapIdentityReview(row: any) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.userId,
+    type: row.type,
+    status: row.status,
+    valueMasked: row.valueMasked,
+    evidence: {
+      hasFile: Boolean(row.evidenceStorageKey && !row.evidenceDeletedAt),
+      fileName: row.evidenceFileName,
+      mimeType: row.evidenceMimeType,
+      size: row.evidenceSize,
+      deletedAt: row.evidenceDeletedAt?.toISOString?.() || null,
+    },
+    reviewNotes: row.reviewNotes,
+    rejectionReason: row.rejectionReason,
+    requestedAt: row.requestedAt?.toISOString?.() || row.requestedAt,
+    verifiedAt: row.verifiedAt?.toISOString?.() || null,
+    expiresAt: row.expiresAt?.toISOString?.() || null,
+    createdAt: row.createdAt?.toISOString?.() || row.createdAt,
+    updatedAt: row.updatedAt?.toISOString?.() || row.updatedAt,
+    user: row.user
+      ? {
+          id: row.user.id,
+          name: row.user.name,
+          username: row.user.username,
+          email: row.user.email,
+          profileImage: row.user.profileImage,
+          identityTrustLevel: row.user.identityTrustLevel,
+          emailVerified: Boolean(row.user.isVerified),
+          phoneMasked: row.user.phoneLast4 ? `•••• ${row.user.phoneLast4}` : null,
+          phoneVerifiedAt: row.user.phoneVerifiedAt?.toISOString?.() || null,
+        }
+      : null,
+    reviewer: (row.reviewerUser || row.reviewer)
+      ? {
+          id: (row.reviewerUser || row.reviewer).id,
+          name: (row.reviewerUser || row.reviewer).name,
+          username: (row.reviewerUser || row.reviewer).username,
+          email: (row.reviewerUser || row.reviewer).email,
+        }
+      : null,
+  };
+}
+
+export const getIdentityReviews = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const page = parseInt(req.query.page as string, 10) || 1;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
+    const skip = (page - 1) * limit;
+    const status = normalizeOptionalString(req.query.status) || 'PENDING';
+    const type = normalizeOptionalString(req.query.type);
+
+    const where: any = {};
+    if (status !== 'all') where.status = status;
+    if (type && type !== 'all') where.type = type;
+    const pendingWhere: any = { status: 'PENDING' };
+    if (type && type !== 'all') pendingWhere.type = type;
+
+    const [rows, total, pendingCount] = await Promise.all([
+      prisma.identity_verifications.findMany({
+        where,
+        include: identityReviewInclude,
+        orderBy: { createdAt: 'asc' },
+        skip,
+        take: limit,
+      }),
+      prisma.identity_verifications.count({ where }),
+      prisma.identity_verifications.count({ where: pendingWhere }),
+    ]);
+
+    res.json({
+      reviews: rows.map(mapIdentityReview),
+      pendingCount,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 0,
+      },
+    });
+  } catch (error) {
+    console.error('getIdentityReviews error:', error);
+    res.status(500).json({ error: 'Failed to load identity reviews' });
+  }
+};
+
+export const getIdentityReviewById = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const row = await prisma.identity_verifications.findUnique({
+      where: { id },
+      include: identityReviewInclude,
+    });
+    if (!row) {
+      res.status(404).json({ error: 'Identity review not found' });
+      return;
+    }
+    res.json({ review: mapIdentityReview(row) });
+  } catch (error) {
+    console.error('getIdentityReviewById error:', error);
+    res.status(500).json({ error: 'Failed to load identity review' });
+  }
+};
+
+export const getIdentityReviewEvidence = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const row = await prisma.identity_verifications.findUnique({
+      where: { id },
+      select: {
+        evidenceStorageKey: true,
+        evidenceFileName: true,
+        evidenceMimeType: true,
+        evidenceDeletedAt: true,
+      },
+    });
+    if (!row || !row.evidenceStorageKey || row.evidenceDeletedAt) {
+      res.status(404).json({ error: 'Identity evidence not found' });
+      return;
+    }
+
+    const evidence = await readEncryptedIdentityEvidence(row.evidenceStorageKey);
+    const fileName = String(row.evidenceFileName || 'student-proof').replace(/["\r\n]/g, '');
+    res.setHeader('Content-Type', row.evidenceMimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(evidence);
+  } catch (error) {
+    console.error('getIdentityReviewEvidence error:', error);
+    res.status(500).json({ error: 'Failed to load identity evidence' });
+  }
+};
+
+export const approveIdentityReview = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const reviewNotes = normalizeOptionalString(req.body?.reviewNotes) || 'Approved by Trust & Safety';
+
+    const review = await prisma.identity_verifications.findUnique({ where: { id } });
+    if (!review) {
+      res.status(404).json({ error: 'Identity review not found' });
+      return;
+    }
+    if (review.status !== 'PENDING') {
+      res.status(409).json({ error: 'Identity review has already been decided' });
+      return;
+    }
+
+    let evidenceDeletedAt: Date | null = null;
+    if (review.evidenceStorageKey) {
+      await deleteIdentityEvidence(review.evidenceStorageKey);
+      evidenceDeletedAt = new Date();
+    }
+
+    let trustLevel = 'BASIC';
+    await prisma.$transaction(async (tx) => {
+      await tx.identity_verifications.update({
+        where: { id },
+        data: {
+          status: 'VERIFIED',
+          verifiedAt: new Date(),
+          reviewedById: adminId,
+          reviewNotes,
+          evidenceDeletedAt,
+        },
+      });
+      trustLevel = await recomputeIdentityTrustLevel(review.userId, tx);
+      await recordSafetyEvent({
+        actorId: adminId,
+        targetUserId: review.userId,
+        eventType: 'IDENTITY_REVIEW_APPROVED',
+        entityType: 'identity_verification',
+        entityId: id,
+        reason: reviewNotes,
+        metadata: { type: review.type, evidenceDeleted: Boolean(evidenceDeletedAt) },
+        tx,
+      });
+    });
+    await notificationService.notifyIdentityVerificationApproved(review.userId, id, trustLevel);
+
+    const updated = await prisma.identity_verifications.findUnique({
+      where: { id },
+      include: identityReviewInclude,
+    });
+    res.json({ message: 'Identity review approved', review: mapIdentityReview(updated) });
+  } catch (error) {
+    console.error('approveIdentityReview error:', error);
+    res.status(500).json({ error: 'Failed to approve identity review' });
+  }
+};
+
+export const rejectIdentityReview = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const rejectionReason = normalizeOptionalString(req.body?.rejectionReason);
+    const reviewNotes = normalizeOptionalString(req.body?.reviewNotes) || rejectionReason;
+    if (!rejectionReason) {
+      res.status(400).json({ error: 'rejectionReason is required' });
+      return;
+    }
+
+    const review = await prisma.identity_verifications.findUnique({ where: { id } });
+    if (!review) {
+      res.status(404).json({ error: 'Identity review not found' });
+      return;
+    }
+    if (review.status !== 'PENDING') {
+      res.status(409).json({ error: 'Identity review has already been decided' });
+      return;
+    }
+
+    let evidenceDeletedAt: Date | null = null;
+    if (review.evidenceStorageKey) {
+      await deleteIdentityEvidence(review.evidenceStorageKey);
+      evidenceDeletedAt = new Date();
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.identity_verifications.update({
+        where: { id },
+        data: {
+          status: 'REJECTED',
+          reviewedById: adminId,
+          reviewNotes,
+          rejectionReason,
+          evidenceDeletedAt,
+        },
+      });
+      await recomputeIdentityTrustLevel(review.userId, tx);
+      await recordSafetyEvent({
+        actorId: adminId,
+        targetUserId: review.userId,
+        eventType: 'IDENTITY_REVIEW_REJECTED',
+        entityType: 'identity_verification',
+        entityId: id,
+        reason: rejectionReason,
+        metadata: { type: review.type, evidenceDeleted: Boolean(evidenceDeletedAt) },
+        tx,
+      });
+    });
+    await notificationService.notifyIdentityVerificationResubmitRequested(review.userId, id, rejectionReason);
+
+    const updated = await prisma.identity_verifications.findUnique({
+      where: { id },
+      include: identityReviewInclude,
+    });
+    res.json({ message: 'Identity review rejected', review: mapIdentityReview(updated) });
+  } catch (error) {
+    console.error('rejectIdentityReview error:', error);
+    res.status(500).json({ error: 'Failed to reject identity review' });
+  }
+};
+
+// ============================================
+// TRUST & SAFETY: USER ACTIONS
+// ============================================
+
+const parseSafetyDuration = (value: any, fallbackMs: number): Date => {
+  const explicit = parseOptionalDateInput(value);
+  if (explicit) return explicit;
+  const days = Number(value);
+  if (Number.isFinite(days) && days > 0) {
+    return new Date(Date.now() + Math.min(days, 365) * 24 * 60 * 60 * 1000);
+  }
+  return new Date(Date.now() + fallbackMs);
+};
+
+export const warnUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const reason = normalizeOptionalString(req.body?.reason);
+    if (!reason) {
+      res.status(400).json({ error: 'reason is required' });
+      return;
+    }
+    const user = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+    if (!user) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    await recordSafetyEvent({
+      actorId: adminId,
+      targetUserId: id,
+      eventType: 'USER_WARNED',
+      reason,
+      metadata: { note: normalizeOptionalString(req.body?.note) || null },
+    });
+
+    res.json({ message: 'Warning recorded' });
+  } catch (error) {
+    console.error('warnUser error:', error);
+    res.status(500).json({ error: 'Failed to warn user' });
+  }
+};
+
+export const restrictUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const reason = normalizeOptionalString(req.body?.reason);
+    if (!reason) {
+      res.status(400).json({ error: 'reason is required' });
+      return;
+    }
+    const restrictedUntil = parseSafetyDuration(req.body?.until || req.body?.days, 7 * 24 * 60 * 60 * 1000);
+    await prisma.user.update({
+      where: { id },
+      data: {
+        safetyRestrictedUntil: restrictedUntil,
+        safetyRestrictionReason: reason,
+      },
+    });
+    await recordSafetyEvent({
+      actorId: adminId,
+      targetUserId: id,
+      eventType: 'USER_RESTRICTED',
+      reason,
+      metadata: { until: restrictedUntil.toISOString() },
+    });
+    await invalidateAuthUserStatus(id);
+    res.json({ message: 'User restricted', restrictedUntil: restrictedUntil.toISOString() });
+  } catch (error) {
+    console.error('restrictUser error:', error);
+    res.status(500).json({ error: 'Failed to restrict user' });
+  }
+};
+
+export const suspendUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const reason = normalizeOptionalString(req.body?.reason);
+    if (!reason) {
+      res.status(400).json({ error: 'reason is required' });
+      return;
+    }
+    if (id === adminId) {
+      res.status(400).json({ error: 'Cannot suspend yourself' });
+      return;
+    }
+    const suspendedUntil = parseSafetyDuration(req.body?.until || req.body?.days, 7 * 24 * 60 * 60 * 1000);
+    await prisma.user.update({
+      where: { id },
+      data: {
+        safetySuspendedUntil: suspendedUntil,
+      },
+    });
+    await recordSafetyEvent({
+      actorId: adminId,
+      targetUserId: id,
+      eventType: 'USER_SUSPENDED',
+      reason,
+      metadata: { until: suspendedUntil.toISOString() },
+    });
+    await invalidateAuthUserStatus(id);
+    await revokeAllAuthSessions(id);
+    res.json({ message: 'User suspended', suspendedUntil: suspendedUntil.toISOString() });
+  } catch (error) {
+    console.error('suspendUser error:', error);
+    res.status(500).json({ error: 'Failed to suspend user' });
+  }
+};
+
+export const clearUserSafetyRestriction = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user?.userId ? String(req.user.userId) : null;
+    if (!adminId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    await prisma.user.update({
+      where: { id },
+      data: {
+        safetyRestrictedUntil: null,
+        safetyRestrictionReason: null,
+        safetySuspendedUntil: null,
+      },
+    });
+    await recordSafetyEvent({
+      actorId: adminId,
+      targetUserId: id,
+      eventType: 'USER_RESTRICTIONS_CLEARED',
+      reason: normalizeOptionalString(req.body?.reason) || null,
+    });
+    await invalidateAuthUserStatus(id);
+    res.json({ message: 'User safety restrictions cleared' });
+  } catch (error) {
+    console.error('clearUserSafetyRestriction error:', error);
+    res.status(500).json({ error: 'Failed to clear user safety restriction' });
+  }
+};
+
+// ============================================
 // REPORTS
 // ============================================
 
@@ -1945,6 +2440,10 @@ const reportUserSelect = {
   profileImage: true,
   email: true,
   isBanned: true,
+  bannedReason: true,
+  identityTrustLevel: true,
+  safetyRestrictedUntil: true,
+  safetySuspendedUntil: true,
 } as const;
 
 const moderationReportInclude = {
@@ -1972,6 +2471,10 @@ function mapUserToReportUser(u: any) {
     profileImage: u.profileImage,
     email: u.email,
     isBanned: u.isBanned,
+    bannedReason: u.bannedReason,
+    identityTrustLevel: u.identityTrustLevel,
+    safetyRestrictedUntil: u.safetyRestrictedUntil?.toISOString?.() || null,
+    safetySuspendedUntil: u.safetySuspendedUntil?.toISOString?.() || null,
   };
 }
 
@@ -1985,6 +2488,11 @@ function mapModerationReportToAdmin(row: any) {
     priority: row.priority,
     actionTaken: row.actionTaken,
     adminNotes: row.adminNotes,
+    banReason: row.banReason,
+    evidenceSnapshot: row.evidenceSnapshot,
+    reporterPriorReports: row.reporterPriorReports || 0,
+    reportedUserPriorReports: row.reportedUserPriorReports || 0,
+    blockedUserAfterReport: Boolean(row.blockedUserAfterReport),
     chatMessages: null,
     createdAt: row.createdAt?.toISOString?.() ?? row.createdAt,
     updatedAt: row.updatedAt?.toISOString?.() ?? row.updatedAt,
@@ -2002,6 +2510,58 @@ function mapModerationReportToAdmin(row: any) {
       : null,
     group: null,
     reviewedBy: mapUserToReportUser(row.reviewerUser),
+  };
+}
+
+async function getReportDeviceScopeSummary(row: any) {
+  if (!row.blockedUserAfterReport || !row.reporterId || !row.reportedUserId) {
+    return {
+      deviceScopedBlock: false,
+      deviceScopeCount: 0,
+      deviceLinkedAccountCount: 0,
+    };
+  }
+
+  const block = await prisma.user_blocks.findUnique({
+    where: {
+      blockerId_blockedId: {
+        blockerId: row.reporterId,
+        blockedId: row.reportedUserId,
+      },
+    },
+    include: {
+      deviceScopes: {
+        select: { installHash: true },
+      },
+    },
+  });
+  const installHashes = Array.from(new Set(
+    (block?.deviceScopes || [])
+      .map((scope: any) => scope.installHash)
+      .filter(Boolean)
+  ));
+  const linkedAccounts = installHashes.length > 0
+    ? await prisma.user_devices.findMany({
+        where: {
+          installHash: { in: installHashes },
+          userId: { not: row.reportedUserId },
+        },
+        select: { userId: true },
+        distinct: ['userId'],
+      })
+    : [];
+
+  return {
+    deviceScopedBlock: installHashes.length > 0,
+    deviceScopeCount: installHashes.length,
+    deviceLinkedAccountCount: linkedAccounts.length,
+  };
+}
+
+async function mapModerationReportToAdminWithSafety(row: any) {
+  return {
+    ...mapModerationReportToAdmin(row),
+    ...(await getReportDeviceScopeSummary(row)),
   };
 }
 
@@ -2048,7 +2608,7 @@ export const getReports = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     res.json({
-      reports: rows.map(mapModerationReportToAdmin),
+      reports: await Promise.all(rows.map(mapModerationReportToAdminWithSafety)),
       pagination: {
         page,
         limit,
@@ -2089,7 +2649,31 @@ export const getReportById = async (req: AuthRequest, res: Response): Promise<vo
       res.status(404).json({ error: 'Report not found' });
       return;
     }
-    res.json({ report: mapModerationReportToAdmin(row), previousReports: [] });
+    const previousReports = row.reportedUserId
+      ? await prisma.moderation_reports.findMany({
+          where: {
+            reportedUserId: row.reportedUserId,
+            id: { not: row.id },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          select: {
+            id: true,
+            reportType: true,
+            reason: true,
+            status: true,
+            actionTaken: true,
+            createdAt: true,
+          },
+        })
+      : [];
+    res.json({
+      report: await mapModerationReportToAdminWithSafety(row),
+      previousReports: previousReports.map((item) => ({
+        ...item,
+        createdAt: item.createdAt.toISOString(),
+      })),
+    });
   } catch (error) {
     console.error('getReportById error:', error);
     res.status(500).json({ error: 'Failed to load report' });
@@ -2109,7 +2693,7 @@ export const updateReportStatus = async (req: AuthRequest, res: Response): Promi
       data: { status },
       include: moderationReportInclude,
     });
-    res.json({ message: 'Updated', report: mapModerationReportToAdmin(updated) });
+    res.json({ message: 'Updated', report: await mapModerationReportToAdminWithSafety(updated) });
   } catch (error) {
     console.error('updateReportStatus error:', error);
     res.status(500).json({ error: 'Failed to update report' });
@@ -2129,7 +2713,7 @@ export const updateReportPriority = async (req: AuthRequest, res: Response): Pro
       data: { priority },
       include: moderationReportInclude,
     });
-    res.json({ message: 'Updated', report: mapModerationReportToAdmin(updated) });
+    res.json({ message: 'Updated', report: await mapModerationReportToAdminWithSafety(updated) });
   } catch (error) {
     console.error('updateReportPriority error:', error);
     res.status(500).json({ error: 'Failed to update report' });
@@ -2144,36 +2728,184 @@ export const takeReportAction = async (req: AuthRequest, res: Response): Promise
       return;
     }
     const { id } = req.params;
-    const { action, adminNotes, banReason } = req.body ?? {};
+    const { action, adminNotes, banReason, reason } = req.body ?? {};
+    const normalizedAction = normalizeOptionalString(action) || 'NONE';
+    const notes = normalizeOptionalString(adminNotes);
+    const actionReason = normalizeOptionalString(reason) || normalizeOptionalString(banReason) || notes;
 
     const report = await prisma.moderation_reports.findUnique({ where: { id } });
     if (!report) {
       res.status(404).json({ error: 'Report not found' });
       return;
     }
+    if (
+      !['MARK_UNDER_REVIEW', 'NONE'].includes(normalizedAction) &&
+      !notes
+    ) {
+      res.status(400).json({ error: 'adminNotes is required for moderation actions' });
+      return;
+    }
+    if (
+      ['USER_WARNED', 'USER_RESTRICTED', 'USER_SUSPENDED', 'USER_BANNED'].includes(normalizedAction) &&
+      !actionReason
+    ) {
+      res.status(400).json({ error: 'reason is required for user safety actions' });
+      return;
+    }
 
-    let bannedUserId: string | null = null;
+    let affectedUserId: string | null = null;
+    let revokeSessions = false;
+    const actionResults: Record<string, unknown> = {};
     await prisma.$transaction(async (tx) => {
-      if (action === 'USER_BANNED' && report.reportedUserId && report.reportedUserId !== adminId) {
-        await tx.user.update({
-          where: { id: report.reportedUserId },
-          data: { isBanned: true },
+      let nextStatus = 'RESOLVED';
+      if (normalizedAction === 'MARK_UNDER_REVIEW') {
+        nextStatus = 'UNDER_REVIEW';
+      }
+      if (['DISMISSED_INVALID', 'NO_VIOLATION', 'DISMISS'].includes(normalizedAction)) {
+        nextStatus = 'DISMISSED';
+      }
+
+      if (normalizedAction === 'CONTENT_REMOVED') {
+        if (report.reportedPostId) {
+          await tx.post.update({
+            where: { id: report.reportedPostId },
+            data: { isActive: false },
+          });
+          actionResults.postRemoved = report.reportedPostId;
+        }
+        if (report.reportedCommentId) {
+          await tx.post_comments.update({
+            where: { id: report.reportedCommentId },
+            data: { content: '[removed by moderation]' },
+          });
+          actionResults.commentRemoved = report.reportedCommentId;
+        }
+        if (report.conversationId && report.extra?.messageIds?.length) {
+          await tx.messages.updateMany({
+            where: {
+              id: { in: report.extra.messageIds.map(String) },
+              conversationId: report.conversationId,
+            },
+            data: {
+              content: '',
+              isDeleted: true,
+            },
+          });
+          actionResults.messagesRemoved = report.extra.messageIds.length;
+        }
+      }
+
+      if (report.reportedUserId && report.reportedUserId !== String(adminId)) {
+        affectedUserId = report.reportedUserId;
+
+        if (normalizedAction === 'USER_WARNED') {
+          await recordSafetyEvent({
+            actorId: String(adminId),
+            targetUserId: report.reportedUserId,
+            eventType: 'USER_WARNED',
+            entityType: 'moderation_report',
+            entityId: report.id,
+            reason: actionReason,
+            tx,
+          });
+          actionResults.warningRecorded = true;
+        }
+
+        if (normalizedAction === 'USER_RESTRICTED') {
+          const restrictedUntil = parseSafetyDuration(req.body?.until || req.body?.days, 7 * 24 * 60 * 60 * 1000);
+          await tx.user.update({
+            where: { id: report.reportedUserId },
+            data: {
+              safetyRestrictedUntil: restrictedUntil,
+              safetyRestrictionReason: actionReason,
+            },
+          });
+          await recordSafetyEvent({
+            actorId: String(adminId),
+            targetUserId: report.reportedUserId,
+            eventType: 'USER_RESTRICTED',
+            entityType: 'moderation_report',
+            entityId: report.id,
+            reason: actionReason,
+            metadata: { until: restrictedUntil.toISOString() },
+            tx,
+          });
+          actionResults.restrictedUntil = restrictedUntil.toISOString();
+        }
+
+        if (normalizedAction === 'USER_SUSPENDED') {
+          const suspendedUntil = parseSafetyDuration(req.body?.until || req.body?.days, 7 * 24 * 60 * 60 * 1000);
+          await tx.user.update({
+            where: { id: report.reportedUserId },
+            data: { safetySuspendedUntil: suspendedUntil },
+          });
+          await recordSafetyEvent({
+            actorId: String(adminId),
+            targetUserId: report.reportedUserId,
+            eventType: 'USER_SUSPENDED',
+            entityType: 'moderation_report',
+            entityId: report.id,
+            reason: actionReason,
+            metadata: { until: suspendedUntil.toISOString() },
+            tx,
+          });
+          revokeSessions = true;
+          actionResults.suspendedUntil = suspendedUntil.toISOString();
+        }
+
+        if (normalizedAction === 'USER_BANNED') {
+          await tx.user.update({
+            where: { id: report.reportedUserId },
+            data: {
+              isBanned: true,
+              bannedReason: actionReason,
+              safetyRestrictedUntil: null,
+              safetySuspendedUntil: null,
+            },
+          });
+          await recordSafetyEvent({
+            actorId: String(adminId),
+            targetUserId: report.reportedUserId,
+            eventType: 'USER_BANNED',
+            entityType: 'moderation_report',
+            entityId: report.id,
+            reason: actionReason,
+            tx,
+          });
+          revokeSessions = true;
+          actionResults.userBanned = report.reportedUserId;
+        }
+      }
+
+      if (normalizedAction === 'CONTENT_REMOVED') {
+        await recordSafetyEvent({
+          actorId: String(adminId),
+          targetUserId: report.reportedUserId || null,
+          eventType: 'CONTENT_REMOVED',
+          entityType: 'moderation_report',
+          entityId: report.id,
+          reason: notes,
+          tx,
         });
-        bannedUserId = report.reportedUserId;
       }
       await tx.moderation_reports.update({
         where: { id },
         data: {
-          actionTaken: typeof action === 'string' ? action : 'NONE',
-          adminNotes: typeof adminNotes === 'string' ? adminNotes : null,
-          banReason: typeof banReason === 'string' ? banReason : null,
-          status: 'RESOLVED',
-          reviewedById: adminId,
+          actionTaken: normalizedAction,
+          adminNotes: notes || null,
+          banReason: actionReason || null,
+          status: nextStatus,
+          reviewedById: String(adminId),
           reviewedAt: new Date(),
         },
       });
     });
-    await invalidateAuthUserStatus(bannedUserId);
+    if (affectedUserId) {
+      await invalidateAuthUserStatus(affectedUserId);
+      if (revokeSessions) {
+        await revokeAllAuthSessions(affectedUserId);
+      }
+    }
 
     const updated = await prisma.moderation_reports.findUnique({
       where: { id },
@@ -2181,8 +2913,8 @@ export const takeReportAction = async (req: AuthRequest, res: Response): Promise
     });
     res.json({
       message: 'Action recorded',
-      report: mapModerationReportToAdmin(updated),
-      actionResults: {},
+      report: updated ? await mapModerationReportToAdminWithSafety(updated) : null,
+      actionResults,
     });
   } catch (error) {
     console.error('takeReportAction error:', error);

@@ -1,7 +1,7 @@
 import { prisma } from '../config/prisma';
 import { getPremiumAccessSnapshot } from './premium-access.service';
 
-export const FREE_CONNECTION_REQUESTS_PER_MONTH = 10;
+export const FREE_CONNECTION_REQUESTS_PER_DAY = 10;
 export const FREE_HACKATHON_TEAM_APPLICATIONS_PER_MONTH = 3;
 export const FREE_PROFILE_PROJECT_LIMIT = 3;
 export const PREMIUM_PROFILE_PROJECT_LIMIT = 10;
@@ -19,10 +19,14 @@ export function getMonthlyUsageWindowStart(now = new Date()) {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 }
 
+export function getDailyUsageWindowStart(now = new Date()) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
 export async function getConnectionRequestLimitState(userId: string): Promise<LimitState> {
   const snapshot = await getPremiumAccessSnapshot(userId);
   const isPremium = snapshot.isPremium || snapshot.user.isAdmin;
-  const windowStart = getMonthlyUsageWindowStart();
+  const windowStart = getDailyUsageWindowStart();
 
   if (isPremium) {
     return {
@@ -45,11 +49,11 @@ export async function getConnectionRequestLimitState(userId: string): Promise<Li
   });
 
   return {
-    allowed: used < FREE_CONNECTION_REQUESTS_PER_MONTH,
+    allowed: used < FREE_CONNECTION_REQUESTS_PER_DAY,
     isPremium: false,
-    limit: FREE_CONNECTION_REQUESTS_PER_MONTH,
+    limit: FREE_CONNECTION_REQUESTS_PER_DAY,
     used,
-    remaining: Math.max(0, FREE_CONNECTION_REQUESTS_PER_MONTH - used),
+    remaining: Math.max(0, FREE_CONNECTION_REQUESTS_PER_DAY - used),
     windowStart,
   };
 }

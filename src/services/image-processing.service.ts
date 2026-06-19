@@ -23,6 +23,19 @@ export class ImageProcessingService {
       .toBuffer();
   }
 
+  // Android-friendly profile avatar for in-app rendering.
+  async processProfileAvatarWebp(buffer: Buffer): Promise<Buffer> {
+    return sharp(buffer)
+      .resize(400, 400, {
+        fit: 'fill',
+        withoutEnlargement: false,
+      })
+      .webp({
+        quality: 85,
+      })
+      .toBuffer();
+  }
+
   // Process banner image (already cropped by frontend)
   // Just resize to 1584x396 (4:1 ratio) and convert to AVIF
   async processBannerImage(buffer: Buffer): Promise<Buffer> {
@@ -34,6 +47,19 @@ export class ImageProcessingService {
       .avif({
         quality: 80,
         effort: 4,
+      })
+      .toBuffer();
+  }
+
+  // Android-friendly profile banner for in-app rendering.
+  async processProfileBannerWebp(buffer: Buffer): Promise<Buffer> {
+    return sharp(buffer)
+      .resize(1584, 396, {
+        fit: 'fill',
+        withoutEnlargement: false,
+      })
+      .webp({
+        quality: 82,
       })
       .toBuffer();
   }
@@ -89,4 +115,3 @@ export class ImageProcessingService {
 }
 
 export const imageProcessingService = new ImageProcessingService();
-

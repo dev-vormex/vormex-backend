@@ -103,7 +103,7 @@ The following usernames are blocked:
     "createdAt": "2024-12-05T07:00:00.000Z",
     "updatedAt": "2024-12-05T07:00:00.000Z"
   },
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -191,7 +191,7 @@ The following usernames are blocked:
     "createdAt": "2024-12-05T07:00:00.000Z",
     "updatedAt": "2024-12-05T07:00:00.000Z"
   },
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -399,7 +399,7 @@ GET /api/users/550e8400-e29b-41d4-a716-446655440000/activity
 **Request Body** (unchanged):
 ```json
 {
-  "idToken": "eyJhbGciOiJSUzI1NiIsImtpZCI6Ij..."
+  "idToken": "__EXAMPLE_GOOGLE_ID_TOKEN__"
 }
 ```
 
@@ -416,7 +416,7 @@ GET /api/users/550e8400-e29b-41d4-a716-446655440000/activity
     "authProvider": "google",
     "createdAt": "2024-12-05T07:00:00.000Z"
   },
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -772,5 +772,4 @@ For questions or issues:
 ---
 
 **Last Updated**: December 5, 2024
-
 

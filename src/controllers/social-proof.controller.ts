@@ -3,6 +3,16 @@ import { prisma } from '../config/prisma';
 import { socialProofService } from '../services/social-proof.service';
 import { ensureString } from '../utils/request.util';
 import { canViewGroup } from '../utils/access-control.util';
+import {
+  normalizeActivityType,
+  normalizeOptionalTrackingText,
+  normalizeRequiredTrackingId,
+  normalizeSocialProofMetadata,
+} from '../utils/social-proof-input.util';
+import {
+  ensurePremiumFeatureAccess,
+  type PremiumFeatureKey,
+} from '../services/premium-feature-gates.service';
 
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -15,6 +25,27 @@ import { canViewGroup } from '../utils/access-control.util';
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 1. LIVE ACTIVITY STATS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async function ensureOwnPremiumInsightAccess(
+  requestingUserId: string,
+  userId: string,
+  feature: PremiumFeatureKey,
+  res: Response,
+  forbiddenMessage: string
+): Promise<boolean> {
+  if (userId !== requestingUserId) {
+    res.status(403).json({ success: false, error: forbiddenMessage });
+    return false;
+  }
+
+  const premiumAccess = await ensurePremiumFeatureAccess(requestingUserId, feature);
+  if (premiumAccess.ok === false) {
+    res.status(premiumAccess.statusCode).json(premiumAccess.payload);
+    return false;
+  }
+
+  return true;
+}
 
 // GET /api/social-proof/live-stats
 export const getLiveStats = async (req: Request, res: Response) => {
@@ -40,12 +71,19 @@ export const trackProfileView = async (req: Request, res: Response) => {
     const viewerId = (req as any).user.userId;
     const { viewedId, source } = req.body;
 
-    if (!viewedId) {
-      res.status(400).json({ success: false, error: 'viewedId is required' });
+    const viewedIdResult = normalizeRequiredTrackingId(viewedId, 'viewedId');
+    if (!viewedIdResult.ok) {
+      res.status(400).json({ success: false, error: viewedIdResult.error });
       return;
     }
 
-    await socialProofService.trackProfileView(viewerId, viewedId, source);
+    const sourceResult = normalizeOptionalTrackingText(source, 'source');
+    if (!sourceResult.ok) {
+      res.status(400).json({ success: false, error: sourceResult.error });
+      return;
+    }
+
+    await socialProofService.trackProfileView(viewerId, viewedIdResult.value!, sourceResult.value);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error tracking profile view:', error);
@@ -63,9 +101,13 @@ export const getProfileViews = async (req: Request, res: Response) => {
     }
     const requestingUserId = (req as any).user.userId;
 
-    // Only allow users to view their own profile analytics
-    if (userId !== requestingUserId) {
-      res.status(403).json({ success: false, error: 'You can only view your own profile analytics' });
+    if (!(await ensureOwnPremiumInsightAccess(
+      requestingUserId,
+      userId,
+      'profile_viewers',
+      res,
+      'You can only view your own profile analytics'
+    ))) {
       return;
     }
 
@@ -87,8 +129,13 @@ export const getProfileViewHistory = async (req: Request, res: Response) => {
     }
 
     const requestingUserId = (req as any).user.userId;
-    if (userId !== requestingUserId) {
-      res.status(403).json({ success: false, error: 'You can only view your own profile analytics' });
+    if (!(await ensureOwnPremiumInsightAccess(
+      requestingUserId,
+      userId,
+      'profile_viewers',
+      res,
+      'You can only view your own profile analytics'
+    ))) {
       return;
     }
 
@@ -99,6 +146,102 @@ export const getProfileViewHistory = async (req: Request, res: Response) => {
     res.json({ success: true, data: history });
   } catch (error: any) {
     console.error('Error getting profile view history:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// POST /api/social-proof/profile-saves/:targetUserId/toggle
+export const toggleProfileSave = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+    const targetUserId = ensureString(req.params.targetUserId);
+
+    if (!targetUserId) {
+      res.status(400).json({ success: false, error: 'Target user ID is required' });
+      return;
+    }
+
+    const result = await socialProofService.toggleProfileSave(userId, targetUserId);
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    console.error('Error toggling profile save:', error);
+    const statusCode = error?.message === 'User not found'
+      ? 404
+      : error?.message === 'Invalid target user'
+        ? 400
+        : 500;
+    res.status(statusCode).json({ success: false, error: error.message });
+  }
+};
+
+// GET /api/social-proof/profile-saves/:userId
+export const getProfileSaves = async (req: Request, res: Response) => {
+  try {
+    const userId = ensureString(req.params.userId);
+    if (!userId) {
+      res.status(400).json({ success: false, error: 'User ID is required' });
+      return;
+    }
+
+    const requestingUserId = (req as any).user.userId;
+    if (!(await ensureOwnPremiumInsightAccess(
+      requestingUserId,
+      userId,
+      'profile_savers',
+      res,
+      'You can only view your own profile saves'
+    ))) {
+      return;
+    }
+
+    const page = parseInt(ensureString(req.query.page) || '1', 10) || 1;
+    const limit = parseInt(ensureString(req.query.limit) || '50', 10) || 50;
+    const savers = await socialProofService.getProfileSavers(userId, page, limit);
+    res.json({ success: true, data: savers });
+  } catch (error: any) {
+    console.error('Error getting profile savers:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// GET /api/social-proof/recent-profile-views
+export const getRecentProfileViews = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+    const page = parseInt(ensureString(req.query.page) || '1', 10) || 1;
+    const limit = parseInt(ensureString(req.query.limit) || '50', 10) || 50;
+    const recentProfiles = await socialProofService.getRecentlyViewedProfiles(userId, page, limit);
+    res.json({ success: true, data: recentProfiles });
+  } catch (error: any) {
+    console.error('Error getting recently viewed profiles:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// GET /api/social-proof/profile-insights/:userId
+export const getProfileInsights = async (req: Request, res: Response) => {
+  try {
+    const userId = ensureString(req.params.userId);
+    if (!userId) {
+      res.status(400).json({ success: false, error: 'User ID is required' });
+      return;
+    }
+
+    const requestingUserId = (req as any).user.userId;
+    if (!(await ensureOwnPremiumInsightAccess(
+      requestingUserId,
+      userId,
+      'profile_insights',
+      res,
+      'You can only view your own profile insights'
+    ))) {
+      return;
+    }
+
+    const insights = await socialProofService.getProfileInsights(userId);
+    res.json({ success: true, data: insights });
+  } catch (error: any) {
+    console.error('Error getting profile insights:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -186,12 +329,13 @@ export const trackEventView = async (req: Request, res: Response) => {
     const viewerId = (req as any).user?.userId;
     const { eventId } = req.body;
 
-    if (!eventId) {
-      res.status(400).json({ success: false, error: 'eventId is required' });
+    const eventIdResult = normalizeRequiredTrackingId(eventId, 'eventId');
+    if (!eventIdResult.ok) {
+      res.status(400).json({ success: false, error: eventIdResult.error });
       return;
     }
 
-    await socialProofService.trackEventView(eventId, viewerId);
+    await socialProofService.trackEventView(eventIdResult.value!, viewerId);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error tracking event view:', error);
@@ -222,12 +366,19 @@ export const recordActivity = async (req: Request, res: Response) => {
     const userId = (req as any).user?.userId;
     const { activityType, metadata } = req.body;
 
-    if (!activityType) {
-      res.status(400).json({ success: false, error: 'activityType is required' });
+    const activityTypeResult = normalizeActivityType(activityType);
+    if (!activityTypeResult.ok) {
+      res.status(400).json({ success: false, error: activityTypeResult.error });
       return;
     }
 
-    await socialProofService.recordActivity(userId, activityType, metadata || {});
+    const metadataResult = normalizeSocialProofMetadata(metadata);
+    if (!metadataResult.ok) {
+      res.status(400).json({ success: false, error: metadataResult.error });
+      return;
+    }
+
+    await socialProofService.recordActivity(userId, activityTypeResult.value!, metadataResult.value!);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error recording activity:', error);
@@ -278,7 +429,13 @@ export const updateActivity = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
     const { currentPage } = req.body;
-    await socialProofService.updateUserActivity(userId, currentPage);
+    const currentPageResult = normalizeOptionalTrackingText(currentPage, 'currentPage');
+    if (!currentPageResult.ok) {
+      res.status(400).json({ success: false, error: currentPageResult.error });
+      return;
+    }
+
+    await socialProofService.updateUserActivity(userId, currentPageResult.value);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error updating activity:', error);

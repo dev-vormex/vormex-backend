@@ -42,6 +42,7 @@ import {
   containsPromptInjection,
   wrapUntrustedPromptContent,
 } from '../utils/input-security.util';
+import { executeWithCircuitBreaker } from '../utils/http-client-with-breaker.util';
 
 const NodeWebSocket = require('ws');
 const CompatibleWebSocket = NodeWebSocket.WebSocket || NodeWebSocket;
@@ -1039,12 +1040,26 @@ class AgentRealtimeVoiceService {
 
     let rt: OpenAIRealtimeWebSocket | null = null;
     try {
+      const realtimeSocketPromise = executeWithCircuitBreaker(
+        'openai_realtime',
+        'voice_session_start',
+        async () => {
+          const socket = await OpenAIRealtimeWebSocket.create(client, { model });
+          await waitForRealtimeSocketOpen(socket);
+          return socket;
+        },
+        {
+          connectTimeoutMs: 5_000,
+          requestTimeoutMs: 15_000,
+        }
+      );
+
       const [preferences, explicitGoals, currentUserContext, accessSnapshot, realtimeSocket] = await Promise.all([
         preferencesPromise,
         goalsPromise,
         currentUserContextPromise,
         accessSnapshotPromise,
-        OpenAIRealtimeWebSocket.create(client, { model }),
+        realtimeSocketPromise,
       ]);
       const autonomyPolicy = resolveAgentAutonomyPolicy({
         requestedAutonomyMode: params.autonomyMode,
@@ -1086,7 +1101,6 @@ class AgentRealtimeVoiceService {
       this.attachRealtimeHandlers(state);
       this.emitVoiceState(state, 'connecting');
 
-      await waitForRealtimeSocketOpen(rt);
       await this.pushRealtimeInstructions(state);
     } catch (error) {
       if (params.socketId) {

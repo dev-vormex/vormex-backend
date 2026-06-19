@@ -1,5 +1,8 @@
 import type { UserResponse } from '../types/auth.types';
+import { serializeProfileTheme } from '../constants/profile-themes';
 import { getPremiumAccessSnapshot } from './premium-access.service';
+import { publicTrustFields, trustLevelRank } from './trust-safety.service';
+import { serializeCoarseLocation } from '../utils/location-dto.util';
 
 export const safeUserResponseSelect = {
   id: true,
@@ -24,6 +27,9 @@ export const safeUserResponseSelect = {
   headline: true,
   bannerImageUrl: true,
   location: true,
+  currentCity: true,
+  currentState: true,
+  currentCountry: true,
   currentYear: true,
   degree: true,
   portfolioUrl: true,
@@ -32,12 +38,47 @@ export const safeUserResponseSelect = {
   isOpenToOpportunities: true,
   interests: true,
   onboardingCompleted: true,
+  identityTrustLevel: true,
+  profileBadgeStyle: true,
+  profileTheme: true,
   createdAt: true,
   updatedAt: true,
 } as const;
 
+type ProfileCustomizationSource = {
+  profileBadgeStyle?: string | null;
+  profileTheme?: string | null;
+  profileRing?: string | null;
+  visitLoaderGiftId?: string | null;
+  identityTrustLevel?: string | null;
+};
+
+export function buildProfileCustomizationResponseFields(
+  user: ProfileCustomizationSource,
+  canAccessProfileCustomization: boolean
+) {
+  const earnedStudentBadge =
+    user.profileBadgeStyle?.toLowerCase() === 'student' &&
+    trustLevelRank(user.identityTrustLevel) >= trustLevelRank('STUDENT_VERIFIED');
+
+  return {
+    profileBadgeStyle: canAccessProfileCustomization || earnedStudentBadge
+      ? user.profileBadgeStyle ?? null
+      : null,
+    profileTheme: serializeProfileTheme(
+      canAccessProfileCustomization ? user.profileTheme : null
+    ),
+    profileRing: canAccessProfileCustomization ? user.profileRing ?? null : null,
+    visitLoaderGiftId: canAccessProfileCustomization ? user.visitLoaderGiftId ?? null : null,
+  };
+}
+
 export async function buildUserResponse(user: any): Promise<UserResponse> {
   const snapshot = await getPremiumAccessSnapshot(String(user.id));
+  const customizationFields = buildProfileCustomizationResponseFields(
+    user,
+    snapshot.canAccessProfileCustomization
+  );
 
   return {
     id: user.id,
@@ -61,7 +102,7 @@ export async function buildUserResponse(user: any): Promise<UserResponse> {
     githubLastSyncedAt: user.githubLastSyncedAt,
     headline: user.headline,
     bannerImageUrl: user.bannerImageUrl,
-    location: user.location,
+    location: serializeCoarseLocation(user),
     currentYear: user.currentYear,
     degree: user.degree,
     portfolioUrl: user.portfolioUrl,
@@ -70,9 +111,12 @@ export async function buildUserResponse(user: any): Promise<UserResponse> {
     isOpenToOpportunities: user.isOpenToOpportunities,
     interests: user.interests || [],
     onboardingCompleted: user.onboardingCompleted ?? false,
+    ...publicTrustFields(user.identityTrustLevel),
     isPremium: snapshot.isPremium,
     canUseAgent: snapshot.canUseAgent,
     canAccessProfileCustomization: snapshot.canAccessProfileCustomization,
+    profileBadgeStyle: customizationFields.profileBadgeStyle,
+    profileTheme: customizationFields.profileTheme,
     premiumDisplayAmount: snapshot.premiumDisplayAmount,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,

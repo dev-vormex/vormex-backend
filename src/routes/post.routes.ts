@@ -23,13 +23,17 @@ import {
   deleteComment,
   getLikes,
   sharePost,
+  getPostUploadUrl,
+  finalizePostUpload,
 } from '../controllers/post.controller';
 
 const router = Router();
+const POST_MULTIPART_FALLBACK_MAX_BYTES =
+  Number(process.env.POST_MULTIPART_FALLBACK_MAX_BYTES || 10 * 1024 * 1024);
 const postUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB for video
+    fileSize: POST_MULTIPART_FALLBACK_MAX_BYTES,
     files: 10,
     parts: 30,
     fieldSize: 1 * 1024 * 1024,
@@ -71,6 +75,8 @@ router.use(authenticate);
 router.get('/feed', getFeed);
 
 // CRUD
+router.post('/upload-url', mediaWriteLimit, getPostUploadUrl);
+router.post('/finalize-upload', mediaWriteLimit, finalizePostUpload);
 router.get('/:postId', getPost);
 router.post('/', mediaWriteLimit, postUpload.any(), validatePostUpload, validateMultipartFields, createPost);
 router.put('/:postId', updatePost);

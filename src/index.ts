@@ -8,11 +8,15 @@ import compression from 'compression';
 import cors from 'cors';
 import helmet from 'helmet';
 import { createAdapter } from '@socket.io/redis-adapter';
-import { prisma, disconnectPrisma } from './config/prisma';
+import { prisma, disconnectPrisma, collectDbConnectionMetrics } from './config/prisma';
 import { validateAuthRuntimeConfig } from './config/auth-security.config';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
-import { httpLogger } from './lib/logger';
-import { metricsMiddleware } from './middleware/metrics.middleware';
+import { httpLogger, logger } from './lib/logger';
+import {
+  metricsMiddleware,
+  requireMetricsIpAllowList,
+} from './middleware/metrics.middleware';
+import { requireAdmin } from './middleware/admin.middleware';
 import authRoutes from './routes/auth.routes';
 import passwordRoutes from './routes/password.routes';
 import oauthRoutes from './routes/oauth.routes';
@@ -47,6 +51,8 @@ import locationRoutes from './routes/location.routes';
 import socialProofRoutes from './routes/social-proof.routes';
 import notificationsRoutes from './routes/notifications.routes';
 import reportsRoutes from './routes/reports.routes';
+import identityRoutes from './routes/identity.routes';
+import safetyRoutes from './routes/safety.routes';
 import storeRoutes from './routes/store.routes';
 import badgesRoutes from './routes/badges.routes';
 import referralsRoutes from './routes/referrals.routes';
@@ -54,6 +60,7 @@ import learningRoutes from './routes/learning.routes';
 import jobsRoutes from './routes/jobs.routes';
 import interviewsRoutes from './routes/interviews.routes';
 import challengesRoutes from './routes/challenges.routes';
+import aiRoutes from './routes/ai.routes';
 import aiChatRoutes from './routes/ai-chat.routes';
 import agentRoutes from './routes/agent.routes';
 import talkRoutes from './routes/talk.routes';
@@ -61,6 +68,7 @@ import devicesRoutes from './routes/devices.routes';
 import reelsRoutes from './routes/reels.routes';
 import audioRoutes from './routes/audio.routes';
 import adminRoutes from './routes/admin.routes';
+import managedAdsRoutes from './routes/managed-ads.routes';
 import dailyHooksRoutes from './routes/daily-hooks.routes';
 import premiumRoutes from './routes/premium.routes';
 import { setupSwagger } from './swagger';
@@ -89,19 +97,31 @@ import {
 import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
 import { botGuard, generalApiRateLimit } from './middleware/abuse-protection.middleware';
 import { optionalAppCheck } from './middleware/app-check.middleware';
-import { optionalAuth } from './middleware/auth.middleware';
+import { authenticate, optionalAuth, verifyAccessToken } from './middleware/auth.middleware';
 import { ACCESS_TOKEN_COOKIE, parseCookieHeader } from './utils/auth-cookie.util';
-import { verifyToken, type JWTPayload } from './utils/jwt.util';
-import { getAuthSession } from './services/auth-session.service';
+import type { JWTPayload } from './utils/jwt.util';
 import { getPostMetadata, mapPollOptionsForResponse } from './utils/post.util';
 import { canViewPost, canViewReel, canViewStory } from './utils/access-control.util';
 import { pushNotificationService } from './services/push-notification.service';
+import { sendChatMessage } from './services/chat-message.service';
+import { emitRealtimeEnvelopes } from './infrastructure/realtime/emitter';
 import {
   getAgentAccessDeniedMessage,
   getPremiumAccessSnapshot,
 } from './services/premium-access.service';
+import { canUserUsePremiumFeature } from './services/premium-feature-gates.service';
+import { shouldNotifySenderAboutReadReceipt } from './services/chat-read-receipts.service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from './outbox/helpers';
 import { registerArcadeSocketHandlers } from './sockets/arcade.socket';
+import {
+  buildAuthorizedPresenceRooms,
+  buildCoarseSocketLocation,
+  buildSocketLocationEventPayload,
+  coarseNearbyRoom,
+  shouldThrottleSocketLocationUpdate,
+  validateSocketLocationPayload,
+} from './utils/socket-location-events.util';
+import { installProcessErrorHandlers } from './utils/process-error-handlers.util';
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -192,44 +212,144 @@ const io = new SocketIOServer(httpServer, {
     credentials: true,
     methods: ['GET', 'POST'],
   },
-  transports: ['websocket', 'polling'],
+  transports: ['websocket'],
 });
 
 // Share Socket.IO instance with controllers via the sockets module
 setIO(io);
 
-const redisStartupPromise = connectRedisClients().then(async () => {
-  if (isRedisEnabled() && redisPub && redisSub) {
-    io.adapter(createAdapter(redisPub, redisSub));
-    await initializeRealtimeSubscriptions(io);
+function shouldStartApiRedis(): boolean {
+  const mode = (process.env.API_REDIS_MODE || 'auto').toLowerCase();
+  if (['1', 'true', 'yes', 'enabled'].includes(mode)) {
+    return true;
   }
-});
+
+  if (['0', 'false', 'no', 'disabled'].includes(mode)) {
+    return false;
+  }
+
+  const redisUrl = process.env.REDIS_URL || '';
+  return process.env.NODE_ENV === 'production' || !/upstash\.io/i.test(redisUrl);
+}
+
+const redisStartupPromise = shouldStartApiRedis()
+  ? connectRedisClients().then(async () => {
+      if (isRedisEnabled() && redisPub && redisSub) {
+        io.adapter(createAdapter(redisPub, redisSub));
+        await initializeRealtimeSubscriptions(io);
+      }
+    })
+  : Promise.resolve().then(() => {
+      logger.warn({
+        event: 'redis.api.skipped',
+        reason: 'remote_upstash_in_development',
+        message: 'API Redis realtime infrastructure skipped. Set API_REDIS_MODE=true to enable it.',
+      });
+    });
 
 // Import activity service for engagement tracking
 import { recordActivity } from './services/activity.service';
 import { updateEngagementStreak } from './controllers/engagement.controller';
+import { safetyErrorResponse } from './services/trust-safety.service';
 
 // Track user socket mappings
 const userSockets = new Map<string, Set<string>>(); // userId -> Set of socketIds
 const socketUsers = new Map<string, string>(); // socketId -> userId
+const socketLocationUpdateTimestamps = new Map<string, number>();
 
 // Helper to get userId from socket
 const getSocketUserId = (socket: any): string | null => {
   return socket.data?.userId || socketUsers.get(socket.id) || null;
 };
 
+async function getAcceptedConnectionIdsForRealtime(userId: string): Promise<string[]> {
+  const connections = await prisma.connections.findMany({
+    where: {
+      status: 'accepted',
+      OR: [
+        { requesterId: userId },
+        { addresseeId: userId },
+      ],
+    },
+    select: {
+      requesterId: true,
+      addresseeId: true,
+    },
+    take: 500,
+  });
+
+  return Array.from(new Set(
+    connections.map((connection) =>
+      connection.requesterId === userId ? connection.addresseeId : connection.requesterId
+    )
+  ));
+}
+
+async function getRealtimeLocationUser(userId: string) {
+  return prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      shareLocationPublic: true,
+      currentCity: true,
+      currentState: true,
+      currentCountry: true,
+    },
+  });
+}
+
+async function getAuthorizedRealtimeRooms(user: {
+  id: string;
+  shareLocationPublic?: boolean | null;
+  currentCity?: string | null;
+  currentState?: string | null;
+  currentCountry?: string | null;
+}) {
+  if (user.shareLocationPublic !== true) {
+    return [];
+  }
+
+  const connectionIds = await getAcceptedConnectionIdsForRealtime(user.id);
+  const location = buildCoarseSocketLocation({}, user);
+  return buildAuthorizedPresenceRooms(connectionIds, location);
+}
+
+async function joinCoarseNearbyRoomIfAllowed(socket: any, userId: string): Promise<void> {
+  const user = await getRealtimeLocationUser(userId);
+  if (!user || user.shareLocationPublic !== true) {
+    return;
+  }
+
+  const room = coarseNearbyRoom(buildCoarseSocketLocation({}, user));
+  if (room) {
+    socket.join(room);
+  }
+}
+
+async function emitPresenceToAuthorizedRooms(
+  socket: any,
+  userId: string,
+  eventName: 'user:online' | 'user:offline'
+): Promise<void> {
+  const user = await getRealtimeLocationUser(userId);
+  if (!user) {
+    return;
+  }
+
+  const location = buildCoarseSocketLocation({}, user);
+  const payload = buildSocketLocationEventPayload(user, location);
+  if (!payload) {
+    return;
+  }
+
+  const rooms = await getAuthorizedRealtimeRooms(user);
+  for (const room of rooms) {
+    socket.to(room).emit(eventName, payload);
+  }
+}
+
 async function verifySocketAccessToken(token: string): Promise<JWTPayload> {
-  const decoded = verifyToken(token);
-  if (!decoded.sessionId) {
-    throw new Error('Session is no longer active');
-  }
-
-  const session = await getAuthSession(decoded.sessionId);
-  if (!session || session.userId !== String(decoded.userId)) {
-    throw new Error('Session is no longer active');
-  }
-
-  return decoded;
+  return verifyAccessToken(token);
 }
 
 function getSocketHandshakeToken(socket: any): string | null {
@@ -251,58 +371,10 @@ const chatUserSelect = {
   profileImage: true,
   isOnline: true,
   lastActiveAt: true,
+  isVerified: true,
+  profileBadgeStyle: true,
+  identityTrustLevel: true,
 };
-
-const normalizeClientMessageId = (clientMessageId: unknown): string | null => {
-  if (typeof clientMessageId !== 'string') {
-    return null;
-  }
-
-  const normalized = clientMessageId.trim();
-  return normalized ? normalized.slice(0, 128) : null;
-};
-
-const buildFallbackChatUser = (userId: string) => ({
-  id: userId,
-  username: '',
-  name: '',
-  profileImage: null,
-  isOnline: false,
-  lastActiveAt: null,
-});
-
-const mapSocketChatMessagePayload = (
-  message: any,
-  sender: any,
-  clientMessageIdOverride?: string | null
-) => ({
-  id: message.id,
-  clientMessageId: message.clientMessageId || clientMessageIdOverride || undefined,
-  conversationId: message.conversationId,
-  senderId: message.senderId,
-  receiverId: message.receiverId,
-  content: message.content,
-  contentType: message.contentType,
-  mediaUrl: message.mediaUrl,
-  mediaType: message.mediaType,
-  fileName: message.fileName,
-  fileSize: message.fileSize,
-  status: message.status,
-  deliveredAt: message.deliveredAt?.toISOString(),
-  readAt: message.readAt?.toISOString(),
-  isDeleted: message.isDeleted,
-  replyToId: message.replyToId,
-  replyTo: message.messages || null,
-  sender: sender || buildFallbackChatUser(message.senderId),
-  reactions: (message.message_reactions || []).map((reaction: any) => ({
-    id: reaction.id,
-    userId: reaction.userId,
-    emoji: reaction.emoji,
-    user: { id: reaction.userId, username: '', name: '' },
-  })),
-  createdAt: message.createdAt.toISOString(),
-  updatedAt: message.updatedAt.toISOString(),
-});
 
 const buildGroupMessagePreview = (content: string, contentType: string): string => {
   if (content && content.trim()) {
@@ -340,6 +412,34 @@ async function isConversationParticipant(conversationId: string, userId: string)
   });
 
   return Boolean(conversation);
+}
+
+async function getConversationPeerId(conversationId: string, userId: string): Promise<string | null> {
+  if (!conversationId || !userId) {
+    return null;
+  }
+
+  const conversation = await prisma.conversations.findFirst({
+    where: {
+      id: conversationId,
+      OR: [
+        { participant1Id: userId },
+        { participant2Id: userId },
+      ],
+    },
+    select: {
+      participant1Id: true,
+      participant2Id: true,
+    },
+  });
+
+  if (!conversation) {
+    return null;
+  }
+
+  return conversation.participant1Id === userId
+    ? conversation.participant2Id
+    : conversation.participant1Id;
 }
 
 const feedRealtimeRoom = 'feed:global';
@@ -903,7 +1003,19 @@ io.use(async (socket, next) => {
 
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
-  console.log(`🔌 Socket connected: ${socket.id}`);
+  const initialTransport = socket.conn.transport.name;
+  logger.info({
+    event: 'socket.connected',
+    socketId: socket.id,
+    transport: initialTransport,
+  });
+  socket.conn.on('upgrade', (transport) => {
+    logger.info({
+      event: 'socket.transport.upgrade',
+      socketId: socket.id,
+      transport: transport.name,
+    });
+  });
 
   socket.use((packet, next) => {
     const [eventName, payload] = packet;
@@ -961,8 +1073,18 @@ io.on('connection', async (socket) => {
     userSockets.get(userId)!.add(socket.id);
 
     // Join user's personal room for notifications
-    socket.join(`user:${userId}`);
-    socket.emit('socket:authenticated', { userId });
+      socket.join(`user:${userId}`);
+      joinCoarseNearbyRoomIfAllowed(socket, userId).catch((error) => {
+        console.error('Failed to join coarse nearby socket room:', error);
+      });
+      socket.emit('socket:authenticated', { userId });
+      logger.info({
+        event: 'socket.authenticated',
+        socketId: socket.id,
+        userId,
+        transport: socket.conn.transport.name,
+        rooms: Array.from(socket.rooms),
+      });
 
     if (wasOffline) {
       prisma.user.update({
@@ -971,7 +1093,9 @@ io.on('connection', async (socket) => {
       }).catch((error) => {
         console.error('Failed to mark socket user online:', error);
       });
-      socket.broadcast.emit('user:online', { userId });
+      emitPresenceToAuthorizedRooms(socket, userId, 'user:online').catch((error) => {
+        console.error('Failed to emit scoped online presence:', error);
+      });
     }
 
     console.log(`✅ Socket ${socket.id} authenticated as user ${userId}`);
@@ -1289,7 +1413,14 @@ io.on('connection', async (socket) => {
         }
 
         socket.join(`chat:${conversationId}`);
-        console.log(`Socket ${socket.id} joined chat:${conversationId}`);
+        logger.info({
+          event: 'chat.room.joined',
+          socketId: socket.id,
+          userId,
+          conversationId,
+          transport: socket.conn.transport.name,
+          rooms: Array.from(socket.rooms),
+        });
       } catch (error) {
         console.error('chat:join error:', error);
         socket.emit('error', { message: 'Failed to join conversation' });
@@ -1304,6 +1435,13 @@ io.on('connection', async (socket) => {
     const conversationId = data?.conversationId ?? data;
     if (conversationId && typeof conversationId === 'string') {
       socket.leave(`chat:${conversationId}`);
+      logger.info({
+        event: 'chat.room.left',
+        socketId: socket.id,
+        userId: getSocketUserId(socket) || undefined,
+        conversationId,
+        rooms: Array.from(socket.rooms),
+      });
     }
   });
 
@@ -1321,6 +1459,7 @@ io.on('connection', async (socket) => {
     }
 
     try {
+      const payload = data && typeof data === 'object' ? data : {};
       const {
         conversationId,
         content,
@@ -1330,174 +1469,72 @@ io.on('connection', async (socket) => {
         fileName,
         fileSize,
         replyToId,
-      } = data;
-      const clientMessageId = normalizeClientMessageId(data?.clientMessageId);
+        clientMessageId,
+      } = payload as {
+        conversationId?: unknown;
+        content?: unknown;
+        contentType?: unknown;
+        mediaUrl?: unknown;
+        mediaType?: unknown;
+        fileName?: unknown;
+        fileSize?: unknown;
+        replyToId?: unknown;
+        clientMessageId?: unknown;
+      };
       if (!conversationId || (!content && !mediaUrl)) {
         failSend('Content or media is required');
         return;
       }
 
-      // Verify user is part of conversation
-      const conversation = await prisma.conversations.findFirst({
-        where: {
-          id: conversationId,
-          OR: [
-            { participant1Id: senderId },
-            { participant2Id: senderId },
-          ],
-        },
+      const result = await sendChatMessage({
+        senderId,
+        conversationId: String(conversationId),
+        content,
+        contentType,
+        mediaUrl,
+        mediaType,
+        fileName,
+        fileSize,
+        replyToId,
+        clientMessageId,
       });
 
-      if (!conversation) {
-        failSend('Conversation not found');
-        return;
-      }
-
-      const receiverId = conversation.participant1Id === senderId
-        ? conversation.participant2Id
-        : conversation.participant1Id;
-      const sender = await prisma.user.findUnique({
-        where: { id: senderId },
-        select: chatUserSelect,
-      });
-
-      if (clientMessageId) {
-        const existingMessage = await prisma.messages.findFirst({
-          where: {
-            conversationId,
-            senderId,
-            clientMessageId,
-          },
-          include: {
-            message_reactions: true,
-            messages: {
-              select: {
-                id: true,
-                content: true,
-                contentType: true,
-                senderId: true,
-              },
-            },
-          },
+      if (!result.wasDuplicate) {
+        logger.info({
+          event: 'chat.message.persisted.emit_start',
+          socketId: socket.id,
+          senderId,
+          receiverId: result.receiverId,
+          conversationId: result.conversationId,
+          messageId: result.message.id,
+          clientMessageId: result.message.clientMessageId,
+          transport: socket.conn.transport.name,
         });
-
-        if (existingMessage) {
-          const existingPayload = mapSocketChatMessagePayload(existingMessage, sender);
-          emitToUser(senderId, 'chat:new_message', {
-            conversationId,
-            message: existingPayload,
-          });
-          emitToUser(receiverId, 'chat:new_message', {
-            conversationId,
-            message: existingPayload,
-          });
-          acknowledge?.({ ok: true, message: existingPayload });
-          return;
-        }
+        emitRealtimeEnvelopes(result.realtimeEnvelopes);
       }
-
-      const replyMessageId = replyToId ? String(replyToId).trim() : null;
-      const replyToMessage = replyMessageId
-        ? await prisma.messages.findFirst({
-            where: { id: replyMessageId, conversationId, isDeleted: false },
-            select: { id: true, content: true, contentType: true, senderId: true },
-          })
-        : null;
-      if (replyMessageId && !replyToMessage) {
-        failSend('Reply target is invalid for this conversation');
-        return;
-      }
-
-      // Create message in database
-      const message = await prisma.messages.create({
-        data: {
-          id: randomUUID(),
-          clientMessageId,
-          conversationId,
-          senderId,
-          receiverId,
-          content: content || '',
-          contentType: contentType || 'text',
-          mediaUrl,
-          mediaType,
-          fileName,
-          fileSize,
-          replyToId: replyMessageId || undefined,
-          status: 'SENT',
-          updatedAt: new Date(),
-        },
-        include: {
-          messages: {
-            select: {
-              id: true,
-              content: true,
-              contentType: true,
-              senderId: true,
-            },
-          },
-        },
-      });
-
-      // Update conversation lastMessageAt
-      await prisma.conversations.update({
-        where: { id: conversationId },
-        data: { lastMessageAt: new Date(), updatedAt: new Date() },
-      });
-
-      const messagePayload = mapSocketChatMessagePayload(message, sender, clientMessageId);
-
-      emitToUser(senderId, 'chat:new_message', {
-        conversationId,
-        message: messagePayload,
-      });
-
-      // Also emit the canonical message event to the receiver's personal room.
-      // This keeps mobile clients live even if they have not joined the chat room yet.
-      emitToUser(receiverId, 'chat:new_message', {
-        conversationId,
-        message: messagePayload,
-      });
-
-      // Emit a notification event too, so clients can show out-of-thread alerts.
-      emitToUser(receiverId, 'chat:notification', {
-        type: 'new_message',
-        conversationId,
-        message: messagePayload,
-        sender,
-      });
-
-      acknowledge?.({ ok: true, message: messagePayload });
-
-      if (sender) {
-        const preview = content ? (content.length > 100 ? content.substring(0, 97) + '...' : content) : 'Sent you a message';
-        pushNotificationService.pushNewMessage(
-          receiverId,
-          sender.name || sender.username || 'Someone',
-          preview,
-          conversationId,
-          senderId,
-          sender.profileImage || undefined,
-          {
-            id: messagePayload.id,
-            clientMessageId: messagePayload.clientMessageId,
-            content: messagePayload.content,
-            contentType: messagePayload.contentType,
-            mediaUrl: messagePayload.mediaUrl,
-            mediaType: messagePayload.mediaType,
-            fileName: messagePayload.fileName,
-            fileSize: messagePayload.fileSize,
-            createdAt: messagePayload.createdAt,
-            updatedAt: messagePayload.updatedAt,
-          }
-        ).catch(console.error);
-      }
+      acknowledge?.({ ok: true, message: result.message });
 
       // Record messaging activity and update streak (non-blocking)
-      recordActivity(senderId, 'message', 1, { sourceId: message.id }).catch(console.error);
+      recordActivity(senderId, 'message', 1, { sourceId: result.message.id }).catch(console.error);
       updateEngagementStreak(senderId, 'messaging').catch(console.error);
 
-      console.log(`Message sent in conversation ${conversationId} by user ${senderId}`);
+      console.log(`Message sent in conversation ${result.conversationId} by user ${senderId}`);
     } catch (error) {
+      const safety = safetyErrorResponse(error);
+      if (safety) {
+        socket.emit('error', safety.body);
+        acknowledge?.({ ok: false, ...safety.body });
+        return;
+      }
+      const message = error instanceof Error ? error.message : '';
+      if (
+        message === 'Content or media is required' ||
+        message === 'Conversation not found' ||
+        message === 'Reply target is invalid for this conversation'
+      ) {
+        failSend(message);
+        return;
+      }
       console.error('chat:send_message error:', error);
       failSend('Failed to send message');
     }
@@ -1507,13 +1544,36 @@ io.on('connection', async (socket) => {
   socket.on('chat:typing', async ({ conversationId, isTyping }) => {
     const userId = getSocketUserId(socket);
     if (!userId) return;
-    if (!conversationId || !socket.rooms.has(`chat:${conversationId}`)) return;
+    const targetConversationId = typeof conversationId === 'string' ? conversationId : '';
+    if (!targetConversationId) return;
 
-    socket.to(`chat:${conversationId}`).emit('chat:user_typing', {
-      conversationId,
-      userId,
-      isTyping,
-    });
+    try {
+      const peerId = await getConversationPeerId(targetConversationId, userId);
+      if (!peerId) return;
+
+      const payload = {
+        conversationId: targetConversationId,
+        userId,
+        isTyping: Boolean(isTyping),
+        serverEmittedAtMs: Date.now(),
+      };
+
+      socket.to(`chat:${targetConversationId}`).emit('chat:user_typing', payload);
+      emitToUser(peerId, 'chat:user_typing', payload);
+      logger.info({
+        event: 'chat.typing.emit',
+        socketId: socket.id,
+        userId,
+        peerId,
+        conversationId: targetConversationId,
+        isTyping: Boolean(isTyping),
+        transport: socket.conn.transport.name,
+        rooms: Array.from(socket.rooms),
+        targetRooms: [`chat:${targetConversationId}`, `user:${peerId}`],
+      });
+    } catch (error) {
+      console.error('chat:typing error:', error);
+    }
   });
 
   // Mark messages as read
@@ -1541,8 +1601,8 @@ io.on('connection', async (socket) => {
         ? conversation.participant2Id
         : conversation.participant1Id;
 
-      // Update unread messages
-      await prisma.messages.updateMany({
+      // Update unread messages for unread counts; premium only controls who can see receipts.
+      const updated = await prisma.messages.updateMany({
         where: {
           conversationId,
           receiverId: userId,
@@ -1555,19 +1615,17 @@ io.on('connection', async (socket) => {
         },
       });
 
-      // Notify sender that messages were read
-      io.to(`chat:${conversationId}`).emit('chat:messages_read', {
-        conversationId,
-        readBy: userId,
-        readAt: now,
-      });
-
-      // Also notify sender directly
-      emitToUser(senderId, 'chat:messages_read', {
-        conversationId,
-        readBy: userId,
-        readAt: now,
-      });
+      const senderCanUseReadReceipts = await canUserUsePremiumFeature(senderId, 'read_receipts');
+      if (shouldNotifySenderAboutReadReceipt({
+        updatedCount: updated.count,
+        senderCanUseReadReceipts,
+      })) {
+        emitToUser(senderId, 'chat:messages_read', {
+          conversationId,
+          readBy: userId,
+          readAt: now,
+        });
+      }
     } catch (error) {
       console.error('chat:mark_read error:', error);
     }
@@ -2124,12 +2182,45 @@ io.on('connection', async (socket) => {
   });
 
   // Location update
-  socket.on('location:update', (data) => {
+  socket.on('location:update', async (data) => {
     const userId = getSocketUserId(socket);
-    socket.broadcast.emit('user:location_changed', {
-      userId: userId || socket.id,
-      ...data,
-    });
+    if (!userId) {
+      socket.emit('error', { message: 'Authentication required for location updates' });
+      return;
+    }
+
+    const validation = validateSocketLocationPayload(data);
+    if (!validation.ok) {
+      socket.emit('error', { message: validation.error || 'Invalid location update payload' });
+      return;
+    }
+
+    if (shouldThrottleSocketLocationUpdate(socketLocationUpdateTimestamps, userId)) {
+      socket.emit('error', { message: 'Location updates are rate limited' });
+      return;
+    }
+
+    try {
+      const user = await getRealtimeLocationUser(userId);
+      if (!user || user.shareLocationPublic !== true) {
+        return;
+      }
+
+      const location = buildCoarseSocketLocation(validation.value || {}, user);
+      const payload = buildSocketLocationEventPayload(user, location);
+      if (!payload) {
+        return;
+      }
+
+      const connectionIds = await getAcceptedConnectionIdsForRealtime(user.id);
+      const rooms = buildAuthorizedPresenceRooms(connectionIds, location);
+      for (const room of rooms) {
+        socket.to(room).emit('user:location_changed', payload);
+      }
+    } catch (error) {
+      console.error('location:update error:', error);
+      socket.emit('error', { message: 'Failed to process location update' });
+    }
   });
 
   socket.on('disconnect', (reason) => {
@@ -2148,7 +2239,9 @@ io.on('connection', async (socket) => {
         }).catch((error) => {
           console.error('Failed to mark socket user offline:', error);
         });
-        socket.broadcast.emit('user:offline', { userId });
+        emitPresenceToAuthorizedRooms(socket, userId, 'user:offline').catch((error) => {
+          console.error('Failed to emit scoped offline presence:', error);
+        });
       }
       socketUsers.delete(socket.id);
 
@@ -2228,6 +2321,8 @@ app.use(cors({
     'X-Auth-Token-Transport',
     'X-Firebase-AppCheck',
     'X-Vormex-Client',
+    'X-Vormex-Install-Id',
+    'X-Vormex-Platform',
     'X-Vormex-App-Version',
     'X-Vormex-App-Build',
   ],
@@ -2301,15 +2396,22 @@ app.get('/api/health', async (_req: Request, res: Response): Promise<void> => {
   }
 });
 
-app.get('/metrics', async (_req: Request, res: Response): Promise<void> => {
-  res.setHeader('Content-Type', register.contentType);
-  res.status(200).send(await register.metrics());
-});
+app.get(
+  '/metrics',
+  requireMetricsIpAllowList,
+  authenticate,
+  requireAdmin,
+  async (_req: Request, res: Response): Promise<void> => {
+    await collectDbConnectionMetrics();
+    res.setHeader('Content-Type', register.contentType);
+    res.status(200).send(await register.metrics());
+  }
+);
 
 // API Documentation (Swagger UI)
 setupSwagger(app, PORT);
 app.use('/api', optionalAppCheck, botGuard, optionalAuth, generalApiRateLimit);
-app.use('/api/ai/chat', validateAIRequestInput);
+app.use('/api/ai', validateAIRequestInput);
 app.use('/api/agent', validateAIRequestInput);
 app.use('/api/talk', validateAIRequestInput);
 
@@ -2348,6 +2450,8 @@ app.use('/api/location', locationRoutes);
 app.use('/api/social-proof', socialProofRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/reports', reportsRoutes);
+app.use('/api/identity', identityRoutes);
+app.use('/api/safety', safetyRoutes);
 app.use('/api/store', storeRoutes);
 app.use('/api/premium', premiumRoutes);
 app.use('/api/badges', badgesRoutes);
@@ -2356,12 +2460,14 @@ app.use('/api/learning', learningRoutes);
 app.use('/api/jobs', jobsRoutes);
 app.use('/api/interviews', interviewsRoutes);
 app.use('/api/challenges', challengesRoutes);
+app.use('/api/ai', aiRoutes);
 app.use('/api/ai/chat', aiChatRoutes);
 app.use('/api/agent', agentRoutes);
 app.use('/api/talk', talkRoutes);
 app.use('/api/devices', devicesRoutes);
 app.use('/api/reels', reelsRoutes);
 app.use('/api/audio', audioRoutes);
+app.use('/api/ads', managedAdsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/daily-hooks', dailyHooksRoutes);
 
@@ -2402,11 +2508,17 @@ async function startServer(): Promise<void> {
   try {
     await redisStartupPromise;
   } catch (error) {
-    console.error('Failed to initialize Redis realtime infrastructure:', error);
     if (isRedisRequired()) {
+      console.error('Failed to initialize Redis realtime infrastructure:', error);
       await disconnectPrisma();
       process.exit(1);
     }
+
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn({
+      event: 'redis.api.disabled',
+      message,
+    });
   }
 
   server.listen(Number(PORT), HOST, (): void => {
@@ -2427,24 +2539,70 @@ async function startServer(): Promise<void> {
 void startServer();
 
 // Graceful shutdown
-const gracefulShutdown = async (signal: string): Promise<void> => {
-  console.log(`\n${signal} received. Starting graceful shutdown...`);
+let shutdownStarted = false;
 
-  server.close(async (): Promise<void> => {
-    console.log('HTTP server closed.');
+function closeHttpServer(timeoutMs = 10_000): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      logger.warn({
+        event: 'http_server.close_timeout',
+        timeoutMs,
+      });
+      resolve();
+    }, timeoutMs);
 
-    try {
-      await disconnectRedisClients();
-      await Promise.allSettled(getAllQueues().map((queue) => queue.close()));
-      await disconnectPrisma();
-      console.log('Database connection closed.');
-      process.exit(0);
-    } catch (error) {
-      console.error('Error during shutdown:', error);
-      process.exit(1);
-    }
+    server.close(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    });
   });
+}
+
+const gracefulShutdown = async (reason: string, exitCode = 0): Promise<void> => {
+  if (shutdownStarted) {
+    return;
+  }
+
+  shutdownStarted = true;
+  logger.info({
+    event: 'process.shutdown.start',
+    reason,
+    exitCode,
+  });
+
+  try {
+    await closeHttpServer();
+    logger.info({ event: 'http_server.closed', reason });
+
+    await disconnectRedisClients();
+    await Promise.allSettled(getAllQueues().map((queue) => queue.close()));
+    await disconnectPrisma();
+    logger.info({
+      event: 'process.shutdown.complete',
+      reason,
+      exitCode,
+    });
+    process.exit(exitCode);
+  } catch (error) {
+    logger.error({
+      event: 'process.shutdown.error',
+      reason,
+      error,
+    });
+    process.exit(1);
+  }
 };
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+installProcessErrorHandlers({
+  shutdown: async (reason) => {
+    await gracefulShutdown(reason, 1);
+  },
+});
+
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM', 0));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT', 0));

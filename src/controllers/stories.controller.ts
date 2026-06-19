@@ -10,6 +10,11 @@ import {
   canViewStory,
   getConnectedPeerIds,
 } from '../utils/access-control.util';
+import {
+  assertUsersCanInteract,
+  enforceTrustTierLimit,
+  safetyErrorResponse,
+} from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -664,6 +669,9 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
     
     // Don't send DM to self
     if (story.authorId !== userId) {
+      await assertUsersCanInteract(userId, story.authorId, 'story reaction');
+      await enforceTrustTierLimit(userId, 'dm');
+
       // Get or create conversation with story owner
       let conversation = await prisma.conversations.findFirst({
         where: {
@@ -766,6 +774,11 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
       reactionsCount,
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('React to story error:', error);
     res.status(500).json({ error: 'Failed to react to story' });
   }
@@ -844,6 +857,9 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
       res.status(400).json({ error: 'Cannot reply to your own story' });
       return;
     }
+
+    await assertUsersCanInteract(userId, story.authorId, 'story reply');
+    await enforceTrustTierLimit(userId, 'dm');
     
     // Get or create conversation with story owner
     let conversation = await prisma.conversations.findFirst({
@@ -939,6 +955,11 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
       },
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('Reply to story error:', error);
     res.status(500).json({ error: 'Failed to reply to story' });
   }

@@ -1,4 +1,4 @@
-import { redisCommand } from '../infrastructure/redis/client';
+import { isRedisRequired, redisCommand } from '../infrastructure/redis/client';
 import type { AuthenticatedRequest } from '../types/auth.types';
 
 export interface RateLimitRule {
@@ -6,13 +6,15 @@ export interface RateLimitRule {
   limit: number;
   windowSeconds: number;
   code?: string;
+  emergencyLimit?: number;
+  emergencyWindowSeconds?: number;
   message?: string;
   identifier?: (req: AuthenticatedRequest) => string | null | undefined;
 }
 
 export interface RateLimitResult {
   allowed: boolean;
-  backend: 'redis';
+  backend: 'emergency_memory' | 'memory' | 'redis';
   limit: number;
   remaining: number;
   resetAt: number;
@@ -41,6 +43,9 @@ class RateLimitUnavailableError extends Error {
   }
 }
 
+const memoryBuckets = new Map<string, { count: number; resetAt: number }>();
+const emergencyMemoryBuckets = new Map<string, { count: number; resetAt: number }>();
+
 function getRedisClient() {
   if (!redisCommand || redisCommand.status !== 'ready') {
     throw new RateLimitUnavailableError();
@@ -56,6 +61,53 @@ function normalizeRouteName(keyPrefix: string): string {
 
 function buildRateLimitKey(routeName: string, identifier: string, windowIndex: number): string {
   return `rate:${routeName}:${identifier}:${windowIndex}`;
+}
+
+function evaluateMemoryRateLimit(
+  identifier: string,
+  rule: RateLimitRule,
+  backend: RateLimitResult['backend'] = 'memory',
+  buckets: Map<string, { count: number; resetAt: number }> = memoryBuckets
+): RateLimitResult {
+  const routeName = normalizeRouteName(rule.keyPrefix);
+  const windowMs = Math.max(1, Math.floor(rule.windowSeconds * 1000));
+  const nowMs = Date.now();
+  const windowIndex = Math.floor(nowMs / windowMs);
+  const windowStartMs = windowIndex * windowMs;
+  const resetAt = windowStartMs + windowMs;
+  const key = buildRateLimitKey(routeName, identifier, windowIndex);
+  const bucket = buckets.get(key);
+  const count = bucket && bucket.resetAt > nowMs ? bucket.count + 1 : 1;
+
+  buckets.set(key, { count, resetAt });
+
+  if (buckets.size > 10_000) {
+    for (const [bucketKey, value] of buckets) {
+      if (value.resetAt <= nowMs) {
+        buckets.delete(bucketKey);
+      }
+    }
+  }
+
+  return {
+    allowed: count <= rule.limit,
+    backend,
+    limit: rule.limit,
+    remaining: Math.max(0, rule.limit - count),
+    resetAt,
+    retryAfterSeconds: Math.max(1, Math.ceil((resetAt - nowMs) / 1000)),
+  };
+}
+
+export function evaluateEmergencyRateLimit(identifier: string, rule: RateLimitRule): RateLimitResult {
+  const emergencyRule: RateLimitRule = {
+    ...rule,
+    keyPrefix: `${rule.keyPrefix}:emergency`,
+    limit: Math.max(1, Math.min(rule.limit, rule.emergencyLimit || 5)),
+    windowSeconds: Math.max(1, Math.min(rule.windowSeconds, rule.emergencyWindowSeconds || 60)),
+  };
+
+  return evaluateMemoryRateLimit(identifier, emergencyRule, 'emergency_memory', emergencyMemoryBuckets);
 }
 
 function parseRedisNumber(value: unknown): number {
@@ -114,7 +166,16 @@ export async function evaluateRateLimit(
   identifier: string,
   rule: RateLimitRule
 ): Promise<RateLimitResult> {
-  const client = getRedisClient();
+  let client: NonNullable<typeof redisCommand>;
+  try {
+    client = getRedisClient();
+  } catch (error) {
+    if (!isRedisRequired()) {
+      return evaluateMemoryRateLimit(identifier, rule);
+    }
+    throw error;
+  }
+
   const routeName = normalizeRouteName(rule.keyPrefix);
   const windowMs = Math.max(1, Math.floor(rule.windowSeconds * 1000));
   const nowMs = Date.now();
@@ -126,15 +187,24 @@ export async function evaluateRateLimit(
   const previousKey = buildRateLimitKey(routeName, identifier, windowIndex - 1);
   const ttlMs = windowMs * 2 + 1_000;
 
-  const { currentCount, previousCount } = parseEvalCounts(
-    await client.eval(
-      SLIDING_WINDOW_INCREMENT_LUA,
-      2,
-      currentKey,
-      previousKey,
-      String(ttlMs)
-    )
-  );
+  let currentCount: number;
+  let previousCount: number;
+  try {
+    ({ currentCount, previousCount } = parseEvalCounts(
+      await client.eval(
+        SLIDING_WINDOW_INCREMENT_LUA,
+        2,
+        currentKey,
+        previousKey,
+        String(ttlMs)
+      )
+    ));
+  } catch (error) {
+    if (!isRedisRequired()) {
+      return evaluateMemoryRateLimit(identifier, rule);
+    }
+    throw error;
+  }
   const estimatedCount = currentCount + previousCount * previousWindowWeight;
   const allowed = estimatedCount <= rule.limit;
   const retryAfterMs = calculateRetryAfterMs({

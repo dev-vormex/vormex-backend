@@ -31,13 +31,20 @@ export type NotificationType =
   | 'xp_earned'
   | 'post_share'
   | 'recommended_match'
+  | 'saved_search_digest'
   | 'people_you_know_joined'
   | 'hackathon_team_match'
+  | 'hackathon_new_match'
   | 'hackathon_team_application'
   | 'hackathon_team_application_accepted'
   | 'hackathon_weekly_digest'
   | 'skill_endorsement'
+  | 'skill_swap_request'
+  | 'skill_swap_accepted'
+  | 'skill_swap_completed'
   | 'college_community_joined'
+  | 'identity_verification_approved'
+  | 'identity_verification_resubmit_requested'
   | 'admin_announcement';
 
 interface CreateNotificationParams {
@@ -629,6 +636,76 @@ class NotificationService {
     });
   }
 
+  async notifyIdentityVerificationApproved(
+    userId: string,
+    verificationId: string,
+    trustLevel: string
+  ): Promise<void> {
+    const title = 'Student verification approved';
+    const body = 'Your Vormex student verification is successful. Claim your green student badge from Vormex.';
+
+    await this.createNotification({
+      userId,
+      type: 'identity_verification_approved',
+      title,
+      body,
+      data: {
+        branding: 'vormex',
+        senderType: 'vormex',
+        verificationId,
+        trustLevel,
+        badge: 'verified',
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'identity_verification_approved',
+        branding: 'vormex',
+        senderType: 'vormex',
+        verificationId,
+        trustLevel,
+        badge: 'verified',
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyIdentityVerificationResubmitRequested(
+    userId: string,
+    verificationId: string,
+    reason: string
+  ): Promise<void> {
+    const title = 'Student verification needs resubmission';
+    const body = reason
+      ? `Vormex could not verify this submission. Comment: ${reason}`
+      : 'Vormex could not verify this submission. Please resubmit your proof.';
+
+    await this.createNotification({
+      userId,
+      type: 'identity_verification_resubmit_requested',
+      title,
+      body,
+      data: {
+        branding: 'vormex',
+        senderType: 'vormex',
+        verificationId,
+        reason,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'identity_verification_resubmit_requested',
+        branding: 'vormex',
+        senderType: 'vormex',
+        verificationId,
+        reason,
+      },
+    }).catch(() => undefined);
+  }
+
   async notifyHackathonTeamMatch(
     userId: string,
     actorId: string,
@@ -669,6 +746,53 @@ class NotificationService {
         hackathonId: params.hackathonId,
         teamId: params.teamId,
         actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifyNewHackathonMatch(
+    userId: string,
+    params: {
+      hackathonId: string;
+      hackathonTitle: string;
+      source?: string | null;
+      skills?: string[];
+      startsAt?: Date | string | null;
+      deadline?: Date | string | null;
+      actorId?: string | null;
+    }
+  ): Promise<void> {
+    const skillText = params.skills?.length
+      ? ` Matches ${params.skills.slice(0, 2).join(', ')}.`
+      : '';
+    const sourceText = params.source ? `${params.source} ` : '';
+    const title = 'New hackathon for you';
+    const body = `${sourceText}${params.hackathonTitle} just opened.${skillText}`.slice(0, 220);
+
+    await this.createNotification({
+      userId,
+      type: 'hackathon_new_match',
+      title,
+      body,
+      actorId: params.actorId || undefined,
+      data: {
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        source: params.source || null,
+        skills: params.skills || [],
+        startsAt: params.startsAt instanceof Date ? params.startsAt.toISOString() : params.startsAt || null,
+        deadline: params.deadline instanceof Date ? params.deadline.toISOString() : params.deadline || null,
+      },
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'hackathon_new_match',
+        screen: 'hackathons',
+        hackathonId: params.hackathonId,
+        source: params.source || '',
+        actorId: params.actorId || '',
       },
     }).catch(() => undefined);
   }
@@ -820,6 +944,129 @@ class NotificationService {
         skillName: params.skillName,
         endorsementId: params.endorsementId,
         actorId,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifySkillSwapRequest(
+    userId: string,
+    requesterId: string,
+    params: {
+      requesterName: string;
+      requestId: string;
+      skillName: string;
+      mode: string;
+      sessionLengthMinutes?: number;
+    }
+  ): Promise<void> {
+    const title = 'Skill Swap request';
+    const body = params.mode === 'teach'
+      ? `${params.requesterName} offered to help you with ${params.skillName}`
+      : `${params.requesterName} asked to learn ${params.skillName} from you`;
+    const data = {
+      screen: 'skill_swap',
+      tab: 'requests',
+      requestId: params.requestId,
+      skillName: params.skillName,
+      mode: params.mode,
+      sessionLengthMinutes: String(params.sessionLengthMinutes || ''),
+    };
+
+    await this.createNotification({
+      userId,
+      type: 'skill_swap_request',
+      title,
+      body,
+      actorId: requesterId,
+      data,
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'skill_swap_request',
+        actorId: requesterId,
+        ...data,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifySkillSwapAccepted(
+    userId: string,
+    accepterId: string,
+    params: {
+      accepterName: string;
+      requestId: string;
+      sessionId: string;
+      skillName: string;
+      sessionLengthMinutes?: number;
+    }
+  ): Promise<void> {
+    const title = 'Skill Swap accepted';
+    const body = `${params.accepterName} accepted your ${params.skillName} swap`;
+    const data = {
+      screen: 'skill_swap',
+      tab: 'sessions',
+      requestId: params.requestId,
+      sessionId: params.sessionId,
+      skillName: params.skillName,
+      sessionLengthMinutes: String(params.sessionLengthMinutes || ''),
+    };
+
+    await this.createNotification({
+      userId,
+      type: 'skill_swap_accepted',
+      title,
+      body,
+      actorId: accepterId,
+      data,
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'skill_swap_accepted',
+        actorId: accepterId,
+        ...data,
+      },
+    }).catch(() => undefined);
+  }
+
+  async notifySkillSwapCompleted(
+    userId: string,
+    actorId: string,
+    params: {
+      actorName: string;
+      sessionId: string;
+      requestId: string;
+      skillName: string;
+    }
+  ): Promise<void> {
+    const title = 'Skill Swap completed';
+    const body = `${params.actorName} completed your ${params.skillName} session`;
+    const data = {
+      screen: 'skill_swap',
+      tab: 'sessions',
+      requestId: params.requestId,
+      sessionId: params.sessionId,
+      skillName: params.skillName,
+    };
+
+    await this.createNotification({
+      userId,
+      type: 'skill_swap_completed',
+      title,
+      body,
+      actorId,
+      data,
+    });
+    pushNotificationService.sendToUser(userId, {
+      title,
+      body,
+      data: {
+        type: 'skill_swap_completed',
+        actorId,
+        ...data,
       },
     }).catch(() => undefined);
   }

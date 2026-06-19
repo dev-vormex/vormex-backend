@@ -1,5 +1,8 @@
 import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
-import type { FixedWindowIncrementResult } from '../infrastructure/cache/redis-cache.service';
+import type {
+  CacheGetOrSetOptions,
+  FixedWindowIncrementResult,
+} from '../infrastructure/cache/redis-cache.service';
 
 class BackendCacheService {
   async get<T>(key: string): Promise<T | null> {
@@ -13,6 +16,14 @@ class BackendCacheService {
     tags: string[] = []
   ): Promise<void> {
     return redisCacheService.set(key, value, ttlSeconds, tags);
+  }
+
+  async getOrSet<T>(
+    key: string,
+    compute: () => Promise<T>,
+    options: CacheGetOrSetOptions = {}
+  ): Promise<T> {
+    return redisCacheService.getOrSet(key, compute, options);
   }
 
   async del(key: string): Promise<void> {

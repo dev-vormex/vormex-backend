@@ -11,10 +11,12 @@ import {
 import * as reelsController from '../controllers/reels.controller';
 
 const router = Router();
+const REEL_MULTIPART_FALLBACK_MAX_BYTES =
+  Number(process.env.REEL_MULTIPART_FALLBACK_MAX_BYTES || 15 * 1024 * 1024);
 const uploadWithThumbnail = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 150 * 1024 * 1024,
+    fileSize: REEL_MULTIPART_FALLBACK_MAX_BYTES,
     files: 2,
     parts: 20,
     fieldSize: 1 * 1024 * 1024,

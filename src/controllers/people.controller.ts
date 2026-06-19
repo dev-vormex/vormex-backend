@@ -3,6 +3,49 @@ import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prismaRead } from '../config/prisma';
 import { cacheService } from '../services/cache.service';
+import {
+  applyPremiumVisibilityToUser,
+  getPremiumVisibilityByUserIds,
+  sortByPremiumVisibility,
+  type PremiumVisibilityState,
+} from '../services/premium-visibility.service';
+import {
+  buildPeopleDiscoveryWhere,
+  buildPremiumRequiredDiscoveryResponse,
+  createSavedDiscoverySearch,
+  deleteSavedDiscoverySearch,
+  getActiveDiscoveryPassTargetIds,
+  getDiscoveryAccess,
+  getSuggestionQuotaState,
+  hasActiveDiscoveryPasses,
+  hasPremiumPeopleDiscoveryFilters,
+  listSavedDiscoverySearches,
+  passDiscoveryUser,
+  recordPeopleSearchAppearances,
+  recordSuggestionImpressions,
+  rewindLastDiscoveryPass,
+  updateSavedDiscoverySearch,
+} from '../services/discovery-power.service';
+import { ensurePremiumFeatureAccess } from '../services/premium-feature-gates.service';
+import {
+  CollegeSuggestion,
+  fetchCollegeDbSuggestions,
+  fetchCollegeLogoImage,
+  fetchDirectoryCollegeSuggestions,
+  fetchGooglePlacesSchoolSuggestions,
+  mergeCollegeSuggestions,
+  searchCatalogColleges,
+} from '../services/college-catalog.service';
+import { getBlockedUserIds } from '../services/trust-safety.service';
+import {
+  CoarseLocationDTO,
+  serializeCoarseLocation,
+} from '../utils/location-dto.util';
+import {
+  decodeKeysetCursor,
+  encodeKeysetCursor,
+  nullableDateDescIdAscWhere,
+} from '../utils/keyset-pagination.util';
 
 interface PersonCard {
   id: string;
@@ -14,11 +57,18 @@ interface PersonCard {
   college: string | null;
   branch: string | null;
   bio: string | null;
+  location: CoarseLocationDTO | null;
   skills: string[];
   interests: string[];
   isOnline: boolean;
   verified: boolean;
   isVerified: boolean;
+  profileBadgeStyle?: string | null;
+  isPremium: boolean;
+  profileBoostActive: boolean;
+  profileBoostEndsAt?: string | null;
+  profileBoostPriority?: number;
+  discoveryPriority?: number;
   connectionStatus: 'none' | 'pending_sent' | 'pending_received' | 'connected';
   mutualConnections?: number;
 }
@@ -30,6 +80,16 @@ interface PeopleResponse {
   totalPages: number;
   hasMore: boolean;
   nextCursor?: string | null;
+  totalIsApproximate?: boolean;
+}
+
+interface SuggestionQuota {
+  isPremium: boolean;
+  limit: number | null;
+  used: number;
+  remaining: number | null;
+  window: 'day';
+  resetsAt: string | null;
 }
 
 interface FilterOptions {
@@ -39,7 +99,7 @@ interface FilterOptions {
   locations: string[];
 }
 
-const PEOPLE_CACHE_VERSION = 'v2';
+const PEOPLE_CACHE_VERSION = 'v6';
 const PEOPLE_GLOBAL_CACHE_TAG = 'people:global';
 const PEOPLE_PUBLIC_CACHE_TTL_SECONDS = 15;
 const PEOPLE_AUTH_CACHE_TTL_SECONDS = 30;
@@ -51,7 +111,6 @@ const PEOPLE_FILTER_OPTION_LIMIT = 100;
 const PEOPLE_DEFAULT_LIMIT = 20;
 const PEOPLE_MAX_LIMIT = 40;
 const PEOPLE_PERSONALIZED_MAX_LIMIT = 20;
-const PEOPLE_MAX_OFFSET_PAGE = 25;
 const PEOPLE_MAX_FILTER_VALUES = 10;
 const PEOPLE_MAX_PERSON_CARD_SKILLS = 8;
 const PEOPLE_MAX_ACCEPTED_CONNECTION_IDS = 1_000;
@@ -70,12 +129,38 @@ const PEOPLE_LIST_CACHE_QUERY_KEYS = new Set([
   'interests',
   'location',
   'isOpenToOpportunities',
+  'skillLevel',
+  'intent',
+  'availability',
+  'verifiedOnly',
+  'radiusKm',
+  'lat',
+  'lng',
+  'scope',
   'page',
   'limit',
   'cursor',
   'includeTotal',
   'includeMutuals',
   'includeMutualConnections',
+]);
+const PEOPLE_SEARCH_APPEARANCE_QUERY_KEYS = new Set([
+  'search',
+  'college',
+  'branch',
+  'graduationYear',
+  'skills',
+  'interests',
+  'location',
+  'isOpenToOpportunities',
+  'skillLevel',
+  'intent',
+  'availability',
+  'verifiedOnly',
+  'radiusKm',
+  'lat',
+  'lng',
+  'scope',
 ]);
 
 type PeopleCursor = {
@@ -136,20 +221,54 @@ const shouldBypassPeopleCache = (req: AuthenticatedRequest): boolean => {
   );
 };
 
+const shouldRecordPeopleSearchAppearances = (
+  userId: string | null,
+  query: AuthenticatedRequest['query']
+): userId is string => {
+  if (!userId) return false;
+  return Object.entries(query).some(([key, value]) => {
+    if (!PEOPLE_SEARCH_APPEARANCE_QUERY_KEYS.has(key)) return false;
+    if (key === 'scope') {
+      return normalizeSearchText(value, 20).toLowerCase() === 'global';
+    }
+    if (key === 'isOpenToOpportunities' || key === 'verifiedOnly') {
+      const normalized = normalizeSearchText(value, 20).toLowerCase();
+      return normalized === 'true' || normalized === '1';
+    }
+    return normalizeQueryValue(value).trim().length > 0;
+  });
+};
+
+const recordPeopleSearchAppearancesIfNeeded = async (
+  userId: string | null,
+  query: AuthenticatedRequest['query'],
+  people: Array<{ id: string }>
+): Promise<void> => {
+  if (!shouldRecordPeopleSearchAppearances(userId, query) || people.length === 0) return;
+  try {
+    await recordPeopleSearchAppearances(userId, people.map((person) => person.id));
+  } catch (error) {
+    console.warn('Failed to record people search appearances:', error);
+  }
+};
+
 const encodePeopleCursor = (user: { id: string; lastActiveAt?: Date | string | null }): string => {
-  const payload: PeopleCursor = {
+  return encodeKeysetCursor({
+    scope: 'people.discovery',
     id: user.id,
-    lastActiveAt: user.lastActiveAt
+    t: user.lastActiveAt
       ? new Date(user.lastActiveAt).toISOString()
       : null,
-  };
-
-  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+  });
 };
 
 const decodePeopleCursor = (value: unknown): PeopleCursor | null => {
-  if (typeof value !== 'string' || value.trim() === '') return null;
+  const signedCursor = decodeKeysetCursor(value, 'people.discovery');
+  if (signedCursor) {
+    return { id: signedCursor.id, lastActiveAt: signedCursor.t ?? null };
+  }
 
+  if (typeof value !== 'string' || value.trim() === '' || value.includes('.')) return null;
   try {
     const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<PeopleCursor>;
     if (!decoded || typeof decoded.id !== 'string') return null;
@@ -165,25 +284,10 @@ const decodePeopleCursor = (value: unknown): PeopleCursor | null => {
 };
 
 const buildCursorWhere = (cursor: PeopleCursor | null): any | null => {
-  if (!cursor) return null;
-
-  if (!cursor.lastActiveAt) {
-    return {
-      lastActiveAt: null,
-      id: { gt: cursor.id },
-    };
-  }
-
-  const cursorDate = new Date(cursor.lastActiveAt);
-  if (Number.isNaN(cursorDate.getTime())) return null;
-
-  return {
-    OR: [
-      { lastActiveAt: { lt: cursorDate } },
-      { lastActiveAt: cursorDate, id: { gt: cursor.id } },
-      { lastActiveAt: null },
-    ],
-  };
+  return nullableDateDescIdAscWhere(
+    cursor ? { id: cursor.id, t: cursor.lastActiveAt, scope: 'people.discovery' } : null,
+    'lastActiveAt'
+  );
 };
 
 const peopleOrderBy: any[] = [
@@ -224,6 +328,25 @@ const getAcceptedConnectionIdsCacheKey = (userId: string): string =>
 const peopleCollegesCacheKey = (query: string, limit: number): string =>
   `people:colleges:${PEOPLE_CACHE_VERSION}:q:${createHash('sha256').update(query).digest('hex').slice(0, 24)}:limit:${limit}`;
 
+const peopleCollegeLogoProxyUrl = (req: AuthenticatedRequest, domain?: string | null): string | null => {
+  const normalizedDomain = normalizeSearchText(domain, 120).toLowerCase();
+  if (!normalizedDomain) return null;
+  const forwardedProto = normalizeSearchText(req.headers['x-forwarded-proto'], 20).split(',')[0]?.trim();
+  const protocol = forwardedProto || req.protocol || 'http';
+  const host = req.get('host');
+  if (!host) return null;
+  return `${protocol}://${host}${req.baseUrl}/college-logo?domain=${encodeURIComponent(normalizedDomain)}`;
+};
+
+const withCollegeLogoProxyUrls = (
+  req: AuthenticatedRequest,
+  colleges: CollegeSuggestion[]
+): CollegeSuggestion[] =>
+  colleges.map((college) => ({
+    ...college,
+    logoUrl: peopleCollegeLogoProxyUrl(req, college.domain) || college.logoUrl,
+  }));
+
 const peopleNearMeCacheKey = (userId: string, limit: number): string =>
   `people:near-me:${PEOPLE_CACHE_VERSION}:user:${userId}:limit:${limit}`;
 
@@ -236,11 +359,14 @@ const peopleCacheTags = (userId?: string | null): string[] =>
     userId ? `people:connections:${userId}` : '',
   ]);
 
-const peopleSuggestionsCacheKey = (userId: string, limit: number): string =>
-  `people:suggestions:${PEOPLE_CACHE_VERSION}:user:${userId}:limit:${limit}`;
-
 const peopleSameCollegeCacheKey = (userId: string, limit: number): string =>
   `people:same-college:${PEOPLE_CACHE_VERSION}:user:${userId}:limit:${limit}`;
+
+const filterBlockedPeople = <T extends { id: string }>(people: T[], blockedUserIds: string[]): T[] => {
+  if (blockedUserIds.length === 0) return people;
+  const blockedSet = new Set(blockedUserIds);
+  return people.filter((person) => !blockedSet.has(person.id));
+};
 
 const personCardUserSelect = {
   id: true,
@@ -252,9 +378,13 @@ const personCardUserSelect = {
   college: true,
   branch: true,
   bio: true,
+  currentCity: true,
+  currentState: true,
+  currentCountry: true,
   interests: true,
   isOnline: true,
   isVerified: true,
+  profileBadgeStyle: true,
   skills: {
     take: PEOPLE_MAX_PERSON_CARD_SKILLS,
     select: { skill: { select: { name: true } } },
@@ -379,24 +509,38 @@ const getRelationshipSummary = async (
   return { connectionStatusByUser, mutualConnectionsByUser };
 };
 
-const mapUserToPersonCard = (user: any, relationship: RelationshipSummary): PersonCard => ({
-  id: user.id,
-  username: user.username,
-  name: user.name,
-  profileImage: user.profileImage,
-  bannerImageUrl: user.bannerImageUrl,
-  headline: user.headline,
-  college: user.college,
-  branch: user.branch,
-  bio: user.bio,
-  skills: user.skills?.map((s: any) => s.skill.name) || [],
-  interests: user.interests || [],
-  isOnline: user.isOnline,
-  verified: Boolean(user.isVerified),
-  isVerified: Boolean(user.isVerified),
-  connectionStatus: relationship.connectionStatusByUser.get(user.id) || 'none',
-  mutualConnections: relationship.mutualConnectionsByUser.get(user.id) || 0,
-});
+const mapUserToPersonCard = (
+  user: any,
+  relationship: RelationshipSummary,
+  visibilityByUser: Map<string, PremiumVisibilityState> = new Map()
+): PersonCard => {
+  const visibleUser = applyPremiumVisibilityToUser(user, visibilityByUser);
+  return {
+    id: visibleUser.id,
+    username: visibleUser.username,
+    name: visibleUser.name,
+    profileImage: visibleUser.profileImage,
+    bannerImageUrl: visibleUser.bannerImageUrl,
+    headline: visibleUser.headline,
+    college: visibleUser.college,
+    branch: visibleUser.branch,
+    bio: visibleUser.bio,
+    location: serializeCoarseLocation(visibleUser),
+    skills: visibleUser.skills?.map((s: any) => s.skill.name) || [],
+    interests: visibleUser.interests || [],
+    isOnline: visibleUser.isOnline,
+    verified: Boolean(visibleUser.isVerified),
+    isVerified: Boolean(visibleUser.isVerified),
+    profileBadgeStyle: visibleUser.profileBadgeStyle ?? null,
+    isPremium: visibleUser.isPremium,
+    profileBoostActive: visibleUser.profileBoostActive,
+    profileBoostEndsAt: visibleUser.profileBoostEndsAt,
+    profileBoostPriority: visibleUser.profileBoostPriority,
+    discoveryPriority: visibleUser.discoveryPriority,
+    connectionStatus: relationship.connectionStatusByUser.get(visibleUser.id) || 'none',
+    mutualConnections: relationship.mutualConnectionsByUser.get(visibleUser.id) || 0,
+  };
+};
 
 const getConnectionStatus = async (
   currentUserId: string,
@@ -470,35 +614,25 @@ export const getPeople = async (
 ): Promise<void> => {
   try {
     const userId = req.user?.userId ? String(req.user.userId) : null;
-    const {
-      search,
-      college,
-      branch,
-      graduationYear,
-      skills,
-      interests,
-      location,
-      isOpenToOpportunities,
-    } = req.query;
+    const access = await getDiscoveryAccess(userId);
 
-    const cursor = decodePeopleCursor(req.query.cursor);
-    const requestedPage = parseBoundedInt(req.query.page, 1, 1, Number.MAX_SAFE_INTEGER);
-    if (!cursor && requestedPage > PEOPLE_MAX_OFFSET_PAGE) {
-      res.status(400).json({ error: 'Use cursor pagination for deeper people discovery pages' });
+    if (hasPremiumPeopleDiscoveryFilters(req.query) && !access.isPremium) {
+      res.status(403).json(buildPremiumRequiredDiscoveryResponse('Premium discovery filters'));
       return;
     }
 
+    const cursor = decodePeopleCursor(req.query.cursor);
+    const requestedPage = parseBoundedInt(req.query.page, 1, 1, Number.MAX_SAFE_INTEGER);
     const page = cursor ? 1 : requestedPage;
     const limit = parseBoundedInt(req.query.limit, PEOPLE_DEFAULT_LIMIT, 1, PEOPLE_MAX_LIMIT);
-    const skip = (page - 1) * limit;
-    const includeTotal = shouldIncludeTotal(req.query.includeTotal);
     const includeMutualConnections = req.query.includeMutuals !== 'false' && req.query.includeMutualConnections !== 'false';
     const cursorWhere = buildCursorWhere(cursor);
     const cacheKey = buildPeopleListCacheKey(userId, req.query);
-    const rawSearch = normalizeSearchText(search);
-    const hasSearchParam = typeof search === 'string' && search.trim().length > 0;
+    const rawSearch = normalizeSearchText(req.query.search);
+    const hasSearchParam = typeof req.query.search === 'string' && req.query.search.trim().length > 0;
     const normalizedSearch = rawSearch.length >= PEOPLE_MIN_TEXT_SEARCH_LENGTH ? rawSearch : '';
     const bypassCache = shouldBypassPeopleCache(req);
+    const blockedUserIds = userId ? await getBlockedUserIds(userId) : [];
 
     if (hasSearchParam && rawSearch.length < PEOPLE_MIN_TEXT_SEARCH_LENGTH) {
       res.status(200).json({
@@ -512,133 +646,79 @@ export const getPeople = async (
       return;
     }
 
-    if (!bypassCache && cacheKey) {
-      const cached = await cacheService.get<PeopleResponse>(cacheKey);
-      if (cached) {
-        res.setHeader('X-Vormex-Cache', 'HIT');
-        res.status(200).json(cached);
-        return;
-      }
-    }
+    const computeResponse = async (): Promise<PeopleResponse> => {
+      const { where } = await buildPeopleDiscoveryWhere({
+        userId,
+        query: req.query,
+        access,
+        applyDefaultLocalScope: !access.isPremium,
+      });
 
-    const where: any = {
-      isBanned: false,
-    };
+      const blockedWhere = blockedUserIds.length > 0 ? { id: { notIn: blockedUserIds } } : null;
+      const countWhere = blockedWhere ? { AND: [where, blockedWhere] } : where;
+      const findWhere = cursorWhere
+        ? { AND: [where, cursorWhere, ...(blockedWhere ? [blockedWhere] : [])] }
+        : countWhere;
+      const baseRequestedTake = limit + 1;
+      const requestedTake = cursor
+        ? baseRequestedTake
+        : Math.min(baseRequestedTake * 3, PEOPLE_SUGGESTION_POOL_MAX);
 
-    if (userId) {
-      where.id = { not: userId };
-    }
-
-    if (normalizedSearch) {
-      where.OR = [
-        { name: { contains: normalizedSearch, mode: 'insensitive' } },
-        { username: { contains: normalizedSearch, mode: 'insensitive' } },
-        { headline: { contains: normalizedSearch, mode: 'insensitive' } },
-        { bio: { contains: normalizedSearch, mode: 'insensitive' } },
-        { college: { contains: normalizedSearch, mode: 'insensitive' } },
-        { branch: { contains: normalizedSearch, mode: 'insensitive' } },
-        {
-          skills: {
-            some: {
-              skill: {
-                name: { contains: normalizedSearch, mode: 'insensitive' },
-              },
-            },
-          },
-        },
-        { interests: { hasSome: interestSearchVariants(normalizedSearch) } },
-      ];
-    }
-
-    const normalizedCollege = normalizeSearchText(college, 120);
-    if (normalizedCollege) {
-      where.college = normalizedCollege;
-    }
-
-    const normalizedBranch = normalizeSearchText(branch, 120);
-    if (normalizedBranch) {
-      where.branch = normalizedBranch;
-    }
-
-    const parsedGraduationYear = parseInt(String(graduationYear ?? ''), 10);
-    if (Number.isFinite(parsedGraduationYear)) {
-      where.graduationYear = parsedGraduationYear;
-    }
-
-    const skillList = splitQueryList(skills).map((s) => s.toLowerCase());
-    if (skillList.length > 0) {
-      where.skills = {
-        some: {
-          skill: {
-            name: { in: skillList, mode: 'insensitive' },
-          },
-        },
-      };
-    }
-
-    const interestList = splitQueryList(interests);
-    if (interestList.length > 0) {
-      where.interests = { hasSome: interestList };
-    }
-
-    const normalizedLocation = normalizeSearchText(location, 120);
-    if (normalizedLocation) {
-      where.location = { contains: normalizedLocation, mode: 'insensitive' };
-    }
-
-    if (isOpenToOpportunities === 'true') {
-      where.isOpenToOpportunities = true;
-    }
-
-    const findWhere = cursorWhere ? { AND: [where, cursorWhere] } : where;
-    const shouldFetchExtra = Boolean(cursor) || !includeTotal;
-    const requestedTake = shouldFetchExtra ? limit + 1 : limit;
-
-    const [fetchedUsers, countedTotal] = await Promise.all([
-      prismaRead.user.findMany({
+      const fetchedUsers = await prismaRead.user.findMany({
         where: findWhere,
-        skip: cursor ? 0 : skip,
         take: requestedTake,
         orderBy: peopleOrderBy,
         select: personCardUserSelectWithCursor,
-      }),
-      includeTotal ? prismaRead.user.count({ where }) : Promise.resolve(null),
-    ]);
+      });
 
-    const hasExtraUser = shouldFetchExtra && fetchedUsers.length > limit;
-    const users = hasExtraUser ? fetchedUsers.slice(0, limit) : fetchedUsers;
-    const relationship = await getRelationshipSummary(
-      userId,
-      users.map((user) => user.id),
-      includeMutualConnections
-    );
-    const people: PersonCard[] = users.map((user) => mapUserToPersonCard(user, relationship));
+      const visibilityByUser = await getPremiumVisibilityByUserIds(
+        fetchedUsers.map((user) => user.id)
+      );
+      const sortedUsers = sortByPremiumVisibility(fetchedUsers, visibilityByUser);
+      const hasExtraUser = sortedUsers.length > limit;
+      const users = sortedUsers.slice(0, limit);
+      const relationship = await getRelationshipSummary(
+        userId,
+        users.map((user) => user.id),
+        includeMutualConnections
+      );
+      const people: PersonCard[] = users.map((user) =>
+        mapUserToPersonCard(user, relationship, visibilityByUser)
+      );
 
-    const total = countedTotal ?? (skip + people.length + (hasExtraUser ? 1 : 0));
-    const totalPages = includeTotal
-      ? Math.max(1, Math.ceil(total / limit))
-      : (hasExtraUser ? page + 1 : page);
-    const hasMore = shouldFetchExtra ? hasExtraUser : page < totalPages;
-    const response: PeopleResponse = {
-      people,
-      total,
-      page,
-      totalPages,
-      hasMore,
-      nextCursor: hasMore && users.length > 0 ? encodePeopleCursor(users[users.length - 1]) : null,
+      const total = people.length + (hasExtraUser ? 1 : 0);
+      const totalPages = hasExtraUser ? page + 1 : page;
+      const hasMore = hasExtraUser;
+      return {
+        people,
+        total,
+        page,
+        totalPages,
+        hasMore,
+        nextCursor: hasMore && users.length > 0 ? encodePeopleCursor(users[users.length - 1]) : null,
+        totalIsApproximate: true,
+      };
     };
 
-    if (!bypassCache && cacheKey) {
-      await cacheService.set(
-        cacheKey,
-        response,
-        userId ? PEOPLE_AUTH_CACHE_TTL_SECONDS : PEOPLE_PUBLIC_CACHE_TTL_SECONDS,
-        peopleCacheTags(userId)
-      );
-    }
+    const response = !bypassCache && cacheKey
+      ? await cacheService.getOrSet(cacheKey, computeResponse, {
+          tags: peopleCacheTags(userId),
+          swr: {
+            softTtlSeconds: userId ? PEOPLE_AUTH_CACHE_TTL_SECONDS : PEOPLE_PUBLIC_CACHE_TTL_SECONDS,
+            hardTtlSeconds: (userId ? PEOPLE_AUTH_CACHE_TTL_SECONDS : PEOPLE_PUBLIC_CACHE_TTL_SECONDS) * 4,
+          },
+        })
+      : await computeResponse();
+
+    const filteredPeople = filterBlockedPeople(response.people, blockedUserIds);
+    const filteredResponse = filteredPeople.length === response.people.length
+      ? response
+      : { ...response, people: filteredPeople };
+
+    await recordPeopleSearchAppearancesIfNeeded(userId, req.query, filteredPeople);
 
     res.setHeader('X-Vormex-Cache', bypassCache ? 'BYPASS' : 'MISS');
-    res.status(200).json(response);
+    res.status(200).json(filteredResponse);
   } catch (error) {
     console.error('Error fetching people:', error);
     res.status(500).json({
@@ -653,7 +733,13 @@ export const getPeople = async (
  */
 export const getSuggestions = async (
   req: AuthenticatedRequest,
-  res: Response<{ suggestions: PersonCard[]; total?: number; hasMore?: boolean } | ErrorResponse>
+  res: Response<{
+    suggestions: PersonCard[];
+    total?: number;
+    hasMore?: boolean;
+    quota?: SuggestionQuota;
+    canRewind?: boolean;
+  } | ErrorResponse>
 ): Promise<void> => {
   try {
     if (!req.user?.userId) {
@@ -663,11 +749,21 @@ export const getSuggestions = async (
 
     const userId = String(req.user.userId);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
-    const cacheKey = peopleSuggestionsCacheKey(userId, limit);
-    const cached = await cacheService.get<{ suggestions: PersonCard[]; total?: number; hasMore?: boolean }>(cacheKey);
-    if (cached) {
-      res.setHeader('X-Vormex-Cache', 'HIT');
-      res.status(200).json(cached);
+    const quota = await getSuggestionQuotaState(userId);
+    const effectiveLimit = quota.isPremium
+      ? limit
+      : Math.min(limit, quota.remaining ?? 0);
+    const canRewind = await hasActiveDiscoveryPasses(userId);
+
+    if (effectiveLimit <= 0) {
+      res.setHeader('X-Vormex-Cache', 'BYPASS');
+      res.status(200).json({
+        suggestions: [],
+        total: 0,
+        hasMore: false,
+        quota,
+        canRewind,
+      });
       return;
     }
 
@@ -681,6 +777,11 @@ export const getSuggestions = async (
       return;
     }
 
+    const [passedTargetIds, blockedUserIds] = await Promise.all([
+      getActiveDiscoveryPassTargetIds(userId),
+      getBlockedUserIds(userId),
+    ]);
+
     const suggestionSignals: any[] = [];
     if (currentUser.college) suggestionSignals.push({ college: currentUser.college });
     if (currentUser.branch) suggestionSignals.push({ branch: currentUser.branch });
@@ -690,12 +791,12 @@ export const getSuggestions = async (
     if (currentUser.graduationYear) suggestionSignals.push({ graduationYear: currentUser.graduationYear });
 
     const candidateTake = Math.min(
-      Math.max(limit * PEOPLE_SUGGESTION_POOL_MULTIPLIER, limit + 10),
+      Math.max(effectiveLimit * PEOPLE_SUGGESTION_POOL_MULTIPLIER, effectiveLimit + 10),
       PEOPLE_SUGGESTION_POOL_MAX
     );
     const users = await prismaRead.user.findMany({
       where: {
-        id: { not: userId },
+        id: { notIn: [userId, ...passedTargetIds, ...blockedUserIds] },
         isBanned: false,
         ...(suggestionSignals.length > 0 ? { OR: suggestionSignals } : {}),
       },
@@ -704,21 +805,28 @@ export const getSuggestions = async (
       select: personCardUserSelect,
     });
 
+    const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
     const relationship = await getRelationshipSummary(userId, users.map((user) => user.id));
-    const suggestions: PersonCard[] = users
-      .filter((user) => !relationship.connectionStatusByUser.has(user.id))
-      .slice(0, limit)
-      .map((user) => mapUserToPersonCard(user, relationship));
-    const response = { suggestions, total: suggestions.length, hasMore: false };
-
-    await cacheService.set(
-      cacheKey,
-      response,
-      PEOPLE_PERSONALIZED_CACHE_TTL_SECONDS,
-      peopleCacheTags(userId)
+    const suggestions: PersonCard[] = sortByPremiumVisibility(
+      users.filter((user) => !relationship.connectionStatusByUser.has(user.id)),
+      visibilityByUser
+    )
+      .slice(0, effectiveLimit)
+      .map((user) => mapUserToPersonCard(user, relationship, visibilityByUser));
+    const updatedQuota = await recordSuggestionImpressions(
+      userId,
+      suggestions.map((suggestion) => suggestion.id),
+      quota
     );
+    const response = {
+      suggestions,
+      total: suggestions.length,
+      hasMore: updatedQuota.isPremium ? false : (updatedQuota.remaining ?? 0) > 0,
+      quota: updatedQuota,
+      canRewind,
+    };
 
-    res.setHeader('X-Vormex-Cache', 'MISS');
+    res.setHeader('X-Vormex-Cache', 'BYPASS');
     res.status(200).json(response);
   } catch (error) {
     console.error('Error fetching suggestions:', error);
@@ -750,6 +858,7 @@ export const getPeopleFromSameCollege = async (
     const userId = String(req.user.userId);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
     const cacheKey = peopleSameCollegeCacheKey(userId, limit);
+    const blockedUserIds = await getBlockedUserIds(userId);
     const cached = await cacheService.get<{
       people: PersonCard[];
       userCollege?: string | null;
@@ -759,8 +868,9 @@ export const getPeopleFromSameCollege = async (
       hasMore?: boolean;
     }>(cacheKey);
     if (cached) {
+      const filteredPeople = filterBlockedPeople(cached.people, blockedUserIds);
       res.setHeader('X-Vormex-Cache', 'HIT');
-      res.status(200).json(cached);
+      res.status(200).json({ ...cached, people: filteredPeople, total: filteredPeople.length });
       return;
     }
 
@@ -784,7 +894,7 @@ export const getPeopleFromSameCollege = async (
 
     const users = await prismaRead.user.findMany({
       where: {
-        id: { not: userId },
+        id: { notIn: [userId, ...blockedUserIds] },
         isBanned: false,
         college: currentUser.college,
       },
@@ -793,8 +903,12 @@ export const getPeopleFromSameCollege = async (
       select: personCardUserSelect,
     });
 
-    const relationship = await getRelationshipSummary(userId, users.map((user) => user.id));
-    const people: PersonCard[] = users.map((user) => mapUserToPersonCard(user, relationship));
+    const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
+    const sortedUsers = sortByPremiumVisibility(users, visibilityByUser);
+    const relationship = await getRelationshipSummary(userId, sortedUsers.map((user) => user.id));
+    const people: PersonCard[] = sortedUsers.map((user) =>
+      mapUserToPersonCard(user, relationship, visibilityByUser)
+    );
 
     const response = {
       people,
@@ -821,61 +935,85 @@ export const getPeopleFromSameCollege = async (
 };
 
 /**
- * Search colleges on the platform
+ * Search Google Places India, platform, catalog, and directory education institutions
  * GET /api/people/colleges?q=search_term
- * Returns unique college names from all users
+ * Returns school/college/institute names with member counts and optional logo metadata
  */
 export const searchColleges = async (
   req: AuthenticatedRequest,
-  res: Response<{ colleges: { name: string; count: number }[] } | ErrorResponse>
+  res: Response<{ colleges: CollegeSuggestion[] } | ErrorResponse>
 ): Promise<void> => {
   try {
     const query = normalizeSearchText(req.query.q, 80);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
-    if (query.length > 0 && query.length < PEOPLE_MIN_TEXT_SEARCH_LENGTH) {
-      res.status(200).json({ colleges: [] });
-      return;
+
+    const lat = req.query.lat ? parseFloat(req.query.lat as string) : undefined;
+    const lng = req.query.lng ? parseFloat(req.query.lng as string) : undefined;
+
+    let userLat = lat;
+    let userLng = lng;
+    if (userLat === undefined || userLng === undefined) {
+      if (req.user?.userId) {
+        const user = await prismaRead.user.findUnique({
+          where: { id: String(req.user.userId) },
+          select: { latitude: true, longitude: true },
+        });
+        if (user?.latitude && user?.longitude) {
+          userLat = user.latitude;
+          userLng = user.longitude;
+        }
+      }
     }
 
-    const cacheKey = peopleCollegesCacheKey(query.toLowerCase(), limit);
-    const cached = await cacheService.get<{ colleges: { name: string; count: number }[] }>(cacheKey);
+    const latKey = userLat !== undefined ? Math.round(userLat * 10) / 10 : '';
+    const lngKey = userLng !== undefined ? Math.round(userLng * 10) / 10 : '';
+    const cacheKey = `${peopleCollegesCacheKey(query.toLowerCase(), limit)}:lat:${latKey}:lng:${lngKey}`;
+
+    const cached = await cacheService.get<{ colleges: CollegeSuggestion[] }>(cacheKey);
     if (cached) {
       res.setHeader('X-Vormex-Cache', 'HIT');
-      res.status(200).json(cached);
+      res.status(200).json({ colleges: withCollegeLogoProxyUrls(req, cached.colleges) });
       return;
     }
 
-    const collegeData = await prismaRead.user.groupBy({
-      by: ['college'],
-      where: {
-        isBanned: false,
-        college: {
-          not: null,
-          ...(query ? { contains: query, mode: 'insensitive' } : {}),
+    const [collegeData, googlePlacesColleges, collegeDbColleges, directoryColleges] = await Promise.all([
+      prismaRead.user.groupBy({
+        by: ['college'],
+        where: {
+          isBanned: false,
+          college: {
+            not: null,
+            ...(query ? { contains: query, mode: 'insensitive' } : {}),
+          },
         },
-      },
-      _count: {
-        college: true,
-      },
-      orderBy: {
         _count: {
-          college: 'desc',
+          college: true,
         },
-      },
-      take: limit,
-    });
+        orderBy: {
+          _count: {
+            college: 'desc',
+          },
+        },
+        take: limit,
+      }),
+      fetchGooglePlacesSchoolSuggestions(query, limit, userLat, userLng),
+      fetchCollegeDbSuggestions(query, limit),
+      fetchDirectoryCollegeSuggestions(query, limit),
+    ]);
 
-    const colleges = collegeData
+    const platformColleges = collegeData
       .filter((c) => c.college !== null)
       .map((c) => ({
         name: c.college!,
         count: c._count.college,
       }));
+    const catalogColleges = searchCatalogColleges(query, limit);
+    const colleges = mergeCollegeSuggestions(platformColleges, googlePlacesColleges, collegeDbColleges, catalogColleges, directoryColleges, limit);
 
-    const response = { colleges };
+    const response = { colleges: withCollegeLogoProxyUrls(req, colleges) };
     await cacheService.set(
       cacheKey,
-      response,
+      { colleges },
       PEOPLE_COLLEGE_SEARCH_CACHE_TTL_SECONDS,
       ['people:filters']
     );
@@ -885,6 +1023,32 @@ export const searchColleges = async (
   } catch (error) {
     console.error('Error searching colleges:', error);
     res.status(500).json({ error: 'Failed to search colleges' });
+  }
+};
+
+export const getCollegeLogo = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  try {
+    const domain = normalizeSearchText(req.query.domain, 120).toLowerCase();
+    if (!domain) {
+      res.status(400).json({ error: 'domain is required' });
+      return;
+    }
+
+    const logo = await fetchCollegeLogoImage(domain);
+    if (!logo) {
+      res.status(404).json({ error: 'College logo not found' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+    res.setHeader('Content-Type', logo.contentType);
+    res.send(logo.data);
+  } catch (error) {
+    console.error('Error proxying college logo:', error);
+    res.status(500).json({ error: 'Failed to fetch college logo' });
   }
 };
 
@@ -905,10 +1069,12 @@ export const getPeopleNearMe = async (
     const userId = String(req.user.userId);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
     const cacheKey = peopleNearMeCacheKey(userId, limit);
+    const blockedUserIds = await getBlockedUserIds(userId);
     const cached = await cacheService.get<{ people: PersonCard[] }>(cacheKey);
     if (cached) {
+      const filteredPeople = filterBlockedPeople(cached.people, blockedUserIds);
       res.setHeader('X-Vormex-Cache', 'HIT');
-      res.status(200).json(cached);
+      res.status(200).json({ ...cached, people: filteredPeople });
       return;
     }
 
@@ -934,7 +1100,7 @@ export const getPeopleNearMe = async (
 
     const users = await prismaRead.user.findMany({
       where: {
-        id: { not: userId },
+        id: { notIn: [userId, ...blockedUserIds] },
         isBanned: false,
         OR: [
           { location: { contains: locationSearch || '', mode: 'insensitive' } },
@@ -946,8 +1112,12 @@ export const getPeopleNearMe = async (
       select: personCardUserSelect,
     });
 
-    const relationship = await getRelationshipSummary(userId, users.map((user) => user.id));
-    const people: PersonCard[] = users.map((user) => mapUserToPersonCard(user, relationship));
+    const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
+    const sortedUsers = sortByPremiumVisibility(users, visibilityByUser);
+    const relationship = await getRelationshipSummary(userId, sortedUsers.map((user) => user.id));
+    const people: PersonCard[] = sortedUsers.map((user) =>
+      mapUserToPersonCard(user, relationship, visibilityByUser)
+    );
 
     const response = { people };
     await cacheService.set(
@@ -1003,10 +1173,10 @@ export const getFilterOptions = async (
         take: PEOPLE_FILTER_OPTION_LIMIT,
       }),
       prismaRead.user.groupBy({
-        by: ['location'],
-        where: { isBanned: false, location: { not: null } },
-        _count: { location: true },
-        orderBy: { _count: { location: 'desc' } },
+        by: ['currentCity'],
+        where: { isBanned: false, currentCity: { not: null } },
+        _count: { currentCity: true },
+        orderBy: { _count: { currentCity: 'desc' } },
         take: PEOPLE_FILTER_OPTION_LIMIT,
       }),
     ]);
@@ -1015,7 +1185,7 @@ export const getFilterOptions = async (
       colleges: collegesResult.map((c) => c.college!).filter(Boolean).sort(),
       branches: branchesResult.map((b) => b.branch!).filter(Boolean).sort(),
       graduationYears: yearsResult.map((y) => y.graduationYear!).filter(Boolean),
-      locations: locationsResult.map((l) => l.location!).filter(Boolean).sort(),
+      locations: locationsResult.map((l) => l.currentCity!).filter(Boolean).sort(),
     };
 
     await cacheService.set(
@@ -1030,5 +1200,175 @@ export const getFilterOptions = async (
   } catch (error) {
     console.error('Error fetching filter options:', error);
     res.status(500).json({ error: 'Failed to fetch filter options' });
+  }
+};
+
+export const passDiscoverySuggestion = async (
+  req: AuthenticatedRequest,
+  res: Response<{ message: string; targetUserId: string; canRewind: boolean } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const targetUserId = normalizeSearchText(req.body?.targetUserId || req.body?.userId, 80);
+    if (!targetUserId) {
+      res.status(400).json({ error: 'targetUserId is required' });
+      return;
+    }
+
+    await passDiscoveryUser(userId, targetUserId);
+    res.status(200).json({
+      message: 'Suggestion passed',
+      targetUserId,
+      canRewind: true,
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Failed to pass suggestion';
+    res.status(message === 'User not found' ? 404 : 400).json({ error: message });
+  }
+};
+
+export const rewindDiscoveryPass = async (
+  req: AuthenticatedRequest,
+  res: Response<{ rewound: boolean; targetUserId?: string | null; canRewind: boolean } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const premiumAccess = await ensurePremiumFeatureAccess(userId, 'discovery_rewind');
+    if (premiumAccess.ok === false) {
+      res.status(premiumAccess.statusCode).json(premiumAccess.payload);
+      return;
+    }
+
+    const rewound = await rewindLastDiscoveryPass(userId);
+    res.status(200).json({
+      rewound: Boolean(rewound),
+      targetUserId: rewound?.targetUserId || null,
+      canRewind: await hasActiveDiscoveryPasses(userId),
+    });
+  } catch (error) {
+    console.error('Error rewinding discovery pass:', error);
+    res.status(500).json({ error: 'Failed to rewind suggestion' });
+  }
+};
+
+export const getSavedDiscoverySearches = async (
+  req: AuthenticatedRequest,
+  res: Response<{ searches: any[] } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const access = await getDiscoveryAccess(userId);
+    if (!access.isPremium) {
+      res.status(403).json(buildPremiumRequiredDiscoveryResponse('Saved discovery searches'));
+      return;
+    }
+
+    const searches = await listSavedDiscoverySearches(userId);
+    res.status(200).json({ searches });
+  } catch (error) {
+    console.error('Error fetching saved discovery searches:', error);
+    res.status(500).json({ error: 'Failed to fetch saved searches' });
+  }
+};
+
+export const createSavedDiscoverySearchController = async (
+  req: AuthenticatedRequest,
+  res: Response<{ search: any } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const access = await getDiscoveryAccess(userId);
+    if (!access.isPremium) {
+      res.status(403).json(buildPremiumRequiredDiscoveryResponse('Saved discovery searches'));
+      return;
+    }
+
+    const search = await createSavedDiscoverySearch(userId, req.body || {});
+    res.status(201).json({ search });
+  } catch (error) {
+    console.error('Error creating saved discovery search:', error);
+    res.status(500).json({ error: 'Failed to save search' });
+  }
+};
+
+export const updateSavedDiscoverySearchController = async (
+  req: AuthenticatedRequest,
+  res: Response<{ search: any } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const access = await getDiscoveryAccess(userId);
+    if (!access.isPremium) {
+      res.status(403).json(buildPremiumRequiredDiscoveryResponse('Saved discovery searches'));
+      return;
+    }
+
+    const searchId = normalizeSearchText(req.params.id, 80);
+    const search = await updateSavedDiscoverySearch(userId, searchId, req.body || {});
+    if (!search) {
+      res.status(404).json({ error: 'Saved search not found' });
+      return;
+    }
+
+    res.status(200).json({ search });
+  } catch (error) {
+    console.error('Error updating saved discovery search:', error);
+    res.status(500).json({ error: 'Failed to update saved search' });
+  }
+};
+
+export const deleteSavedDiscoverySearchController = async (
+  req: AuthenticatedRequest,
+  res: Response<{ message: string } | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const access = await getDiscoveryAccess(userId);
+    if (!access.isPremium) {
+      res.status(403).json(buildPremiumRequiredDiscoveryResponse('Saved discovery searches'));
+      return;
+    }
+
+    const searchId = normalizeSearchText(req.params.id, 80);
+    const deleted = await deleteSavedDiscoverySearch(userId, searchId);
+    if (!deleted) {
+      res.status(404).json({ error: 'Saved search not found' });
+      return;
+    }
+
+    res.status(200).json({ message: 'Saved search deleted' });
+  } catch (error) {
+    console.error('Error deleting saved discovery search:', error);
+    res.status(500).json({ error: 'Failed to delete saved search' });
   }
 };

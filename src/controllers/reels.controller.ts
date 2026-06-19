@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { Request, Response } from 'express';
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { bunnyStreamService } from '../services/bunny-stream.service';
@@ -10,9 +11,26 @@ import { notificationService } from '../services/notification.service';
 import { recordActivity } from '../services/activity.service';
 import { cacheService } from '../services/cache.service';
 import { buildReelVisibilityWhere, canViewReel } from '../utils/access-control.util';
+import { selectManagedAdPlacements } from '../services/managed-ad.service';
+import {
+  createBunnyStreamUploadIntent,
+  createStorageUploadIntent,
+  validateFinalizedStorageMedia,
+  validateFinalizedStreamMedia,
+} from '../utils/direct-media-upload.util';
+import {
+  clampPageSize,
+  dateDescKeysetWhere,
+  decodeKeysetCursor,
+  encodeKeysetCursor,
+} from '../utils/keyset-pagination.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
 
 const reelCommentAuthorSelect = {
@@ -22,6 +40,7 @@ const reelCommentAuthorSelect = {
   profileImage: true,
   headline: true,
   isVerified: true,
+  profileBadgeStyle: true,
 };
 
 function verifyBunnyStreamSignature(req: Request): boolean {
@@ -58,11 +77,12 @@ function mapReelCommentAuthor(author: any) {
       id: '',
       username: 'unknown',
       name: 'Unknown user',
-      profileImage: null,
-      headline: null,
-      verified: false,
-      isVerified: false,
-    };
+    profileImage: null,
+    headline: null,
+    verified: false,
+    isVerified: false,
+    profileBadgeStyle: null,
+  };
   }
 
   return {
@@ -73,6 +93,7 @@ function mapReelCommentAuthor(author: any) {
     headline: author.headline,
     verified: Boolean(author.isVerified),
     isVerified: Boolean(author.isVerified),
+    profileBadgeStyle: author.profileBadgeStyle ?? null,
   };
 }
 
@@ -134,6 +155,7 @@ function mapReelResponse(reel: any, currentUserId?: string) {
           headline: author.headline,
           verified: Boolean(author.isVerified),
           isVerified: Boolean(author.isVerified),
+          profileBadgeStyle: author.profileBadgeStyle ?? null,
           isFollowing: Boolean(author.follows_follows_followingIdTousers?.length),
         }
       : null,
@@ -208,6 +230,7 @@ const reelInclude = (currentUserId?: string) => ({
       profileImage: true,
       headline: true,
       isVerified: true,
+      profileBadgeStyle: true,
       ...(currentUserId
         ? {
             follows_follows_followingIdTousers: {
@@ -255,12 +278,66 @@ function invalidateReelsFeedCache(): void {
   cacheService.invalidateTags('reels:feed').catch(() => undefined);
 }
 
+function invalidateReelCacheTags(reel: { id: string; authorId: string }): void {
+  cacheService
+    .invalidateTags(
+      'reels:feed',
+      'feed:global',
+      `reel:${reel.id}`,
+      `reels:user:${reel.authorId}`,
+      `feed:${reel.authorId}`
+    )
+    .catch((error: unknown) => {
+      console.warn('Failed to invalidate reel cache tags:', error);
+    });
+}
+
+function applyDateCursor(whereClause: any, cursorValue: unknown, scope: string, fieldName = 'createdAt'): void {
+  const cursor = decodeKeysetCursor(cursorValue, scope);
+  const cursorWhere = dateDescKeysetWhere(cursor, fieldName);
+  if (!cursorWhere) return;
+  whereClause.AND = [...(Array.isArray(whereClause.AND) ? whereClause.AND : []), cursorWhere];
+}
+
+function encodeDateCursor(scope: string, item: any, fieldName = 'createdAt'): string | null {
+  const value = item?.[fieldName];
+  if (!item?.id || !value) return null;
+  return encodeKeysetCursor({
+    scope,
+    id: item.id,
+    t: new Date(value).toISOString(),
+  });
+}
+
+async function selectReelsAdPlacements(
+  currentUserId: string | undefined,
+  itemCount: number,
+  itemOffset: number,
+  sessionId?: string | null
+) {
+  try {
+    return await selectManagedAdPlacements({
+      userId: currentUserId,
+      placement: 'reels',
+      itemCount,
+      itemOffset,
+      sessionId,
+    });
+  } catch (error) {
+    console.error('Failed to select reels ads:', error);
+    return [];
+  }
+}
+
 export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const currentUserId = req.user?.userId;
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '10', 10), 1), 30);
+    const limit = clampPageSize(req.query.limit, 10, 30);
     const mode = ensureString(req.query.mode) as 'foryou' | 'following' | undefined;
+    const adSessionId = ensureString(req.query.adSessionId);
+    const requestedAdItemOffset = parseInt(ensureString(req.query.adItemOffset) || '0', 10);
+    const adItemOffset = Math.min(Math.max(Number.isFinite(requestedAdItemOffset) ? requestedAdItemOffset : 0, 0), 10000);
 
     let whereClause: any = {
       status: 'ready',
@@ -271,13 +348,6 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
     const cacheKey = !currentUserId && mode !== 'following'
       ? anonymousReelsFeedCacheKey(req.query as Record<string, unknown>)
       : null;
-    if (cacheKey) {
-      const cached = await cacheService.get(cacheKey);
-      if (cached) {
-        res.json(cached);
-        return;
-      }
-    }
 
     if (mode === 'following' && currentUserId) {
       const following = await prisma.follows.findMany({
@@ -289,32 +359,40 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
       if (followingIds.length > 0) {
         whereClause.authorId = { in: followingIds };
       } else {
-        res.json({ reels: [], nextCursor: null, hasMore: false });
+        res.json({ reels: [], nextCursor: null, hasMore: false, adPlacements: [] });
         return;
       }
     }
 
-    const reels = await prisma.reels.findMany({
-      where: whereClause,
-      include: reelInclude(currentUserId),
-      orderBy: [{ publishedAt: 'desc' }, { viewsCount: 'desc' }, { id: 'desc' }],
-      take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    });
+    const feedScope = mode === 'following' && currentUserId ? `reels.feed.following:${currentUserId}` : 'reels.feed';
+    applyDateCursor(whereClause, cursor, feedScope, 'publishedAt');
 
-    const hasMore = reels.length > limit;
-    const pageItems = hasMore ? reels.slice(0, limit) : reels;
-    const rankedItems = mode === 'following' ? pageItems : rankForYouReels(pageItems);
+    const computeResponse = async () => {
+      const reels = await prisma.reels.findMany({
+        where: whereClause,
+        include: reelInclude(currentUserId),
+        orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      });
 
-    const response = {
-      reels: rankedItems.map((reel) => mapReelResponse(reel, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
-      hasMore,
+      const hasMore = reels.length > limit;
+      const pageItems = hasMore ? reels.slice(0, limit) : reels;
+      const rankedItems = mode === 'following' ? pageItems : rankForYouReels(pageItems);
+
+      return {
+        reels: rankedItems.map((reel) => mapReelResponse(reel, currentUserId)),
+        nextCursor: hasMore ? encodeDateCursor(feedScope, pageItems[pageItems.length - 1], 'publishedAt') : null,
+        hasMore,
+        adPlacements: await selectReelsAdPlacements(currentUserId, rankedItems.length, adItemOffset, adSessionId),
+      };
     };
 
-    if (cacheKey) {
-      await cacheService.set(cacheKey, response, 10, ['reels:feed']);
-    }
+    const response = cacheKey
+      ? await cacheService.getOrSet(cacheKey, computeResponse, {
+          tags: ['reels:feed'],
+          swr: { softTtlSeconds: 10, hardTtlSeconds: 45 },
+        })
+      : await computeResponse();
 
     res.json(response);
   } catch (error) {
@@ -342,7 +420,7 @@ export const getTrendingReels = async (req: AuthRequest, res: Response): Promise
   try {
     const currentUserId = req.user?.userId;
     const hours = parseInt(ensureString(req.query.hours) || '24', 10);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
 
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
 
@@ -537,17 +615,63 @@ export const getUploadUrl = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    const mimeType = ensureString(req.body?.mimeType);
+    const sizeBytes = Number(req.body?.sizeBytes);
+    const uploadKind = ensureString(req.body?.uploadKind) || 'video';
+
+    if (!mimeType || !Number.isFinite(sizeBytes)) {
+      res.status(400).json({ error: 'mimeType and sizeBytes are required' });
+      return;
+    }
+
+    if (uploadKind === 'thumbnail') {
+      const credential = createStorageUploadIntent({
+        userId: req.user.userId,
+        purpose: 'reel_thumbnail',
+        mimeType,
+        sizeBytes,
+      });
+
+      res.json({
+        provider: 'bunny_storage',
+        uploadMethod: 'PUT',
+        uploadUrl: credential.uploadUrl,
+        uploadHeaders: credential.headers,
+        objectKey: credential.objectKey,
+        cdnUrl: credential.cdnUrl,
+        uploadToken: credential.token,
+        expiresAt: credential.intent.expiresAt,
+        maxBytes: credential.intent.maxBytes,
+        mimeType,
+      });
+      return;
+    }
+
     const title = `reel_${req.user.userId}_${Date.now()}`;
     const { videoId, uploadUrl } = await bunnyStreamService.createVideo(title);
+    const credential = createBunnyStreamUploadIntent({
+      userId: req.user.userId,
+      videoId,
+      mimeType,
+      sizeBytes,
+    });
 
     res.json({
+      provider: 'bunny_stream',
+      uploadMethod: 'TUS',
       videoId,
-      uploadUrl,
-      tusUrl: `https://video.bunnycdn.com/tusupload?libraryId=${process.env.BUNNY_STREAM_LIBRARY_ID}&videoId=${videoId}`,
+      uploadUrl: credential.uploadUrl,
+      uploadHeaders: credential.headers,
+      uploadToken: credential.token,
+      expiresAt: credential.intent.expiresAt,
+      maxBytes: credential.intent.maxBytes,
+      mimeType,
+      legacyUploadUrl: uploadUrl,
     });
   } catch (error) {
     console.error('getUploadUrl error:', error);
-    res.status(500).json({ error: 'Failed to get upload URL' });
+    const message = error instanceof Error ? error.message : 'Failed to get upload URL';
+    res.status(message.includes('large') || message.includes('Unsupported') ? 400 : 500).json({ error: message });
   }
 };
 
@@ -739,11 +863,55 @@ export const onUploadComplete = async (req: AuthRequest, res: Response): Promise
     }
 
     const userId = req.user.userId;
-    const { videoId, title, caption, hashtags, visibility, ...metadata } = req.body;
+    const {
+      videoId,
+      title,
+      caption,
+      hashtags,
+      visibility,
+      uploadToken,
+      mimeType,
+      sizeBytes,
+      thumbnail,
+      ...metadata
+    } = req.body;
 
-    if (!videoId) {
-      res.status(400).json({ error: 'Video ID is required' });
+    if (!videoId || !uploadToken || !mimeType || !Number.isFinite(Number(sizeBytes))) {
+      res.status(400).json({ error: 'videoId, uploadToken, mimeType, and sizeBytes are required' });
       return;
+    }
+
+    validateFinalizedStreamMedia({
+      userId,
+      token: String(uploadToken),
+      videoId: String(videoId),
+      mimeType: String(mimeType),
+      sizeBytes: Number(sizeBytes),
+    });
+
+    const videoInfo = await bunnyStreamService.getVideo(String(videoId)).catch(() => null);
+    if (videoInfo?.storageSize && Number(videoInfo.storageSize) > Number(sizeBytes)) {
+      res.status(400).json({ error: 'Uploaded video size does not match the issued credential' });
+      return;
+    }
+
+    let thumbnailUrl = bunnyStreamService.getThumbnailUrl(videoId);
+    if (thumbnail?.objectKey && thumbnail?.uploadToken && thumbnail?.mimeType && thumbnail?.sizeBytes) {
+      try {
+        thumbnailUrl = await validateFinalizedStorageMedia({
+          userId,
+          token: String(thumbnail.uploadToken),
+          objectKey: String(thumbnail.objectKey),
+          mimeType: String(thumbnail.mimeType),
+          sizeBytes: Number(thumbnail.sizeBytes),
+          purpose: 'reel_thumbnail',
+        });
+      } catch (thumbnailError) {
+        res.status(400).json({
+          error: thumbnailError instanceof Error ? thumbnailError.message : 'Invalid thumbnail upload',
+        });
+        return;
+      }
     }
 
     const isDraft = metadata.saveAsDraft === true;
@@ -758,11 +926,12 @@ export const onUploadComplete = async (req: AuthRequest, res: Response): Promise
         videoId,
         videoUrl: bunnyStreamService.getMp4Url(videoId),
         hlsUrl: bunnyStreamService.getHlsUrl(videoId),
-        thumbnailUrl: bunnyStreamService.getThumbnailUrl(videoId),
+        thumbnailUrl,
         previewGifUrl: bunnyStreamService.getPreviewUrl(videoId),
         durationSeconds: metadata.durationSeconds || 0,
-        width: metadata.width || 1080,
-        height: metadata.height || 1920,
+        width: metadata.width || videoInfo?.width || 1080,
+        height: metadata.height || videoInfo?.height || 1920,
+        fileSize: Number(sizeBytes),
         title: title || null,
         caption: caption || null,
         hashtags: hashtags || [],
@@ -999,22 +1168,56 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
     });
 
     let liked = false;
+    let likesCount = reel.likesCount || 0;
     if (existingLike) {
-      await prisma.reel_likes.delete({
-        where: { reelId_userId: { reelId, userId } },
-      });
-    } else {
-      await prisma.reel_likes.create({
-        data: { reelId, userId },
-      });
-      liked = true;
-    }
+      const result = await prisma.$transaction(async (tx) => {
+        const deleted = await tx.reel_likes.deleteMany({
+          where: { reelId, userId },
+        });
+        if (deleted.count !== 1) {
+          const current = await tx.reels.findUnique({
+            where: { id: reelId },
+            select: { likesCount: true },
+          });
+          return { liked: false, likesCount: current?.likesCount || 0 };
+        }
 
-    const likesCount = await prisma.reel_likes.count({ where: { reelId } });
-    await prisma.reels.update({
-      where: { id: reelId },
-      data: { likesCount },
-    });
+        const updatedReel = await tx.reels.update({
+          where: { id: reelId },
+          data: { likesCount: { decrement: 1 } },
+          select: { likesCount: true },
+        });
+        return { liked: false, likesCount: updatedReel.likesCount };
+      });
+      liked = result.liked;
+      likesCount = result.likesCount;
+    } else {
+      try {
+        const result = await prisma.$transaction(async (tx) => {
+          await tx.reel_likes.create({
+            data: { reelId, userId },
+          });
+          const updatedReel = await tx.reels.update({
+            where: { id: reelId },
+            data: { likesCount: { increment: 1 } },
+            select: { likesCount: true },
+          });
+          return { liked: true, likesCount: updatedReel.likesCount };
+        });
+        liked = result.liked;
+        likesCount = result.likesCount;
+      } catch (error) {
+        if (!isUniqueViolation(error)) {
+          throw error;
+        }
+        liked = true;
+        const current = await prisma.reels.findUnique({
+          where: { id: reelId },
+          select: { likesCount: true },
+        });
+        likesCount = current?.likesCount || 0;
+      }
+    }
 
     const io = getIO();
     if (io) {
@@ -1145,21 +1348,40 @@ export const shareReel = async (req: AuthRequest, res: Response): Promise<void> 
       return;
     }
 
-    await prisma.reel_shares.create({
-      data: {
-        reelId,
-        userId,
-        shareType: shareType || 'copy_link',
-        platform,
-        recipientId,
-      },
-    });
+    let createdShare = false;
+    let sharesCount = reel.sharesCount || 0;
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.reel_shares.create({
+          data: {
+            reelId,
+            userId,
+            shareType: shareType || 'copy_link',
+            platform,
+            recipientId,
+          },
+        });
 
-    const sharesCount = reel.sharesCount + 1;
-    await prisma.reels.update({
-      where: { id: reelId },
-      data: { sharesCount },
-    });
+        const updatedReel = await tx.reels.update({
+          where: { id: reelId },
+          data: { sharesCount: { increment: 1 } },
+          select: { sharesCount: true },
+        });
+
+        return { createdShare: true, sharesCount: updatedReel.sharesCount };
+      });
+      createdShare = result.createdShare;
+      sharesCount = result.sharesCount;
+    } catch (error) {
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+      const current = await prisma.reels.findUnique({
+        where: { id: reelId },
+        select: { sharesCount: true },
+      });
+      sharesCount = current?.sharesCount || 0;
+    }
 
     const io = getIO();
     if (io) {
@@ -1171,7 +1393,7 @@ export const shareReel = async (req: AuthRequest, res: Response): Promise<void> 
     }
 
     // Notify reel author about the share
-    if (reel.authorId !== userId && user) {
+    if (createdShare && reel.authorId !== userId && user) {
       notificationService.notifyReelShare(
         reel.authorId,
         userId,
@@ -1231,6 +1453,7 @@ export const shareReelInChat = async (req: AuthRequest, res: Response): Promise<
               name: true,
               profileImage: true,
               isVerified: true,
+              profileBadgeStyle: true,
             },
           },
         },
@@ -1690,40 +1913,46 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
 
     const normalizedMentions = normalizeMentionUsernames(content, mentions);
 
-    const comment = await prisma.reel_comments.create({
-      data: {
-        reelId,
-        authorId: userId,
-        content: content.trim(),
-        parentId: parentId || null,
-        mentions: normalizedMentions,
-      },
-      include: {
-        users: { select: reelCommentAuthorSelect },
-        reel_comments: parentId ? {
-          select: {
-            authorId: true,
-            users: {
-              select: { name: true, username: true },
+    const { comment, commentsCount } = await prisma.$transaction(async (tx) => {
+      const createdComment = await tx.reel_comments.create({
+        data: {
+          reelId,
+          authorId: userId,
+          content: content.trim(),
+          parentId: parentId || null,
+          mentions: normalizedMentions,
+        },
+        include: {
+          users: { select: reelCommentAuthorSelect },
+          reel_comments: parentId ? {
+            select: {
+              authorId: true,
+              users: {
+                select: { name: true, username: true },
+              },
             },
-          },
-        } : false,
-      },
-    });
-
-    if (parentId) {
-      await prisma.reel_comments.update({
-        where: { id: parentId },
-        data: { repliesCount: { increment: 1 } },
+          } : false,
+        },
       });
-    }
 
-    const commentsCount = await prisma.reel_comments.count({
-      where: { reelId, parentId: null },
-    });
-    await prisma.reels.update({
-      where: { id: reelId },
-      data: { commentsCount },
+      if (parentId) {
+        await tx.reel_comments.update({
+          where: { id: parentId },
+          data: { repliesCount: { increment: 1 } },
+        });
+        const current = await tx.reels.findUnique({
+          where: { id: reelId },
+          select: { commentsCount: true },
+        });
+        return { comment: createdComment, commentsCount: current?.commentsCount || 0 };
+      }
+
+      const updatedReel = await tx.reels.update({
+        where: { id: reelId },
+        data: { commentsCount: { increment: 1 } },
+        select: { commentsCount: true },
+      });
+      return { comment: createdComment, commentsCount: updatedReel.commentsCount };
     });
 
     const commentAuthor = mapReelCommentAuthor(comment.users);
@@ -2133,16 +2362,18 @@ export const getReelsByHashtag = async (req: AuthRequest, res: Response): Promis
     const cursor = ensureString(req.query.cursor);
     const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
 
-    const reels = await prisma.reels.findMany({
-      where: {
+    const whereClause: any = {
         status: 'ready',
         visibility: 'public',
         hashtags: { has: hashtag },
-      },
+    };
+    const scope = `reels.hashtag:${hashtag}`;
+    applyDateCursor(whereClause, cursor, scope);
+    const reels = await prisma.reels.findMany({
+      where: whereClause,
       include: reelInclude(currentUserId),
-      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = reels.length > limit;
@@ -2151,7 +2382,7 @@ export const getReelsByHashtag = async (req: AuthRequest, res: Response): Promis
     res.json({
       hashtag,
       reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2165,18 +2396,20 @@ export const getReelsByAudio = async (req: AuthRequest, res: Response): Promise<
     const currentUserId = req.user?.userId;
     const audioId = ensureString(req.params.audioId);
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
 
-    const reels = await prisma.reels.findMany({
-      where: {
+    const whereClause: any = {
         status: 'ready',
         visibility: 'public',
         audioId,
-      },
+    };
+    const scope = `reels.audio:${audioId}`;
+    applyDateCursor(whereClause, cursor, scope);
+    const reels = await prisma.reels.findMany({
+      where: whereClause,
       include: reelInclude(currentUserId),
-      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = reels.length > limit;
@@ -2185,7 +2418,7 @@ export const getReelsByAudio = async (req: AuthRequest, res: Response): Promise<
     res.json({
       audioId,
       reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2199,7 +2432,7 @@ export const getUserReels = async (req: AuthRequest, res: Response): Promise<voi
     const currentUserId = req.user?.userId;
     const userId = ensureString(req.params.userId);
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
 
     const whereClause: any = {
       authorId: userId,
@@ -2209,13 +2442,14 @@ export const getUserReels = async (req: AuthRequest, res: Response): Promise<voi
     if (currentUserId !== userId) {
       whereClause.visibility = 'public';
     }
+    const scope = `reels.user:${userId}:${currentUserId === userId ? 'self' : 'public'}`;
+    applyDateCursor(whereClause, cursor, scope);
 
     const reels = await prisma.reels.findMany({
       where: whereClause,
       include: reelInclude(currentUserId),
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = reels.length > limit;
@@ -2223,7 +2457,7 @@ export const getUserReels = async (req: AuthRequest, res: Response): Promise<voi
 
     res.json({
       reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2248,18 +2482,22 @@ export const getUserLikedReels = async (req: AuthRequest, res: Response): Promis
     }
 
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
+    const scope = `reels.liked:${userId}`;
+    const cursorWhere = dateDescKeysetWhere(decodeKeysetCursor(cursor, scope), 'createdAt');
 
     const likes = await prisma.reel_likes.findMany({
-      where: { userId },
+      where: {
+        userId,
+        ...(cursorWhere ? { AND: [cursorWhere] } : {}),
+      },
       include: {
         reels: {
           include: reelInclude(currentUserId),
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = likes.length > limit;
@@ -2274,7 +2512,7 @@ export const getUserLikedReels = async (req: AuthRequest, res: Response): Promis
     res.json({
       reels: visibleItems
         .map((l) => mapReelResponse(l.reels, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2299,18 +2537,22 @@ export const getUserSavedReels = async (req: AuthRequest, res: Response): Promis
     }
 
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
+    const scope = `reels.saved:${userId}`;
+    const cursorWhere = dateDescKeysetWhere(decodeKeysetCursor(cursor, scope), 'createdAt');
 
     const saves = await prisma.reel_saves.findMany({
-      where: { userId },
+      where: {
+        userId,
+        ...(cursorWhere ? { AND: [cursorWhere] } : {}),
+      },
       include: {
         reels: {
           include: reelInclude(currentUserId),
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = saves.length > limit;
@@ -2325,7 +2567,7 @@ export const getUserSavedReels = async (req: AuthRequest, res: Response): Promis
     res.json({
       reels: visibleItems
         .map((s) => mapReelResponse(s.reels, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2343,14 +2585,19 @@ export const getDrafts = async (req: AuthRequest, res: Response): Promise<void> 
 
     const userId = req.user.userId;
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
+    const scope = `reels.drafts:${userId}`;
+    const cursorWhere = dateDescKeysetWhere(decodeKeysetCursor(cursor, scope), 'updatedAt');
 
     const drafts = await prisma.reels.findMany({
-      where: { authorId: userId, status: 'draft' },
+      where: {
+        authorId: userId,
+        status: 'draft',
+        ...(cursorWhere ? { AND: [cursorWhere] } : {}),
+      },
       include: reelInclude(userId),
-      orderBy: { updatedAt: 'desc' },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = drafts.length > limit;
@@ -2358,7 +2605,7 @@ export const getDrafts = async (req: AuthRequest, res: Response): Promise<void> 
 
     res.json({
       reels: results.map((r) => mapReelResponse(r, userId)),
-      nextCursor: hasMore ? results[results.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, results[results.length - 1], 'updatedAt') : null,
       hasMore,
     });
   } catch (error) {
@@ -2372,7 +2619,7 @@ export const getReelResponses = async (req: AuthRequest, res: Response): Promise
     const currentUserId = req.user?.userId;
     const reelId = ensureString(req.params.reelId);
     const cursor = ensureString(req.query.cursor);
-    const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
+    const limit = clampPageSize(req.query.limit, 20, 50);
 
     const original = await prisma.reels.findUnique({
       where: { id: reelId },
@@ -2383,16 +2630,18 @@ export const getReelResponses = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const reels = await prisma.reels.findMany({
-      where: {
+    const scope = `reels.responses:${reelId}`;
+    const whereClause: any = {
         originalReelId: reelId,
         status: 'ready',
         visibility: 'public',
-      },
+    };
+    applyDateCursor(whereClause, cursor, scope);
+    const reels = await prisma.reels.findMany({
+      where: whereClause,
       include: reelInclude(currentUserId),
-      orderBy: [{ viewsCount: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = reels.length > limit;
@@ -2400,7 +2649,7 @@ export const getReelResponses = async (req: AuthRequest, res: Response): Promise
 
     res.json({
       reels: pageItems.map((reel) => mapReelResponse(reel, currentUserId)),
-      nextCursor: hasMore ? pageItems[pageItems.length - 1].id : null,
+      nextCursor: hasMore ? encodeDateCursor(scope, pageItems[pageItems.length - 1]) : null,
       hasMore,
     });
   } catch (error) {
@@ -2614,14 +2863,20 @@ export const reportReel = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    await prisma.reel_reports.create({
-      data: {
-        reelId,
-        reporterId: userId,
-        reason,
-        description,
-      },
-    });
+    try {
+      await prisma.reel_reports.create({
+        data: {
+          reelId,
+          reporterId: userId,
+          reason,
+          description,
+        },
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -2683,6 +2938,7 @@ export const transcodingWebhook = async (req: Request, res: Response): Promise<v
           hlsUrl: bunnyStreamService.getHlsUrl(VideoGuid),
         });
       }
+      invalidateReelCacheTags(reelRecord);
     } else if (statusString === 'failed') {
       await prisma.reels.update({
         where: { id: reelRecord.id },
@@ -2699,6 +2955,7 @@ export const transcodingWebhook = async (req: Request, res: Response): Promise<v
           error: 'Transcoding failed',
         });
       }
+      invalidateReelCacheTags(reelRecord);
     }
 
     res.json({ success: true });

@@ -1,12 +1,18 @@
 import { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
+import { assertUsersCanInteract, safetyErrorResponse } from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
 
 export const followUser = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -37,40 +43,41 @@ export const followUser = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const existingFollow = await prisma.follows.findUnique({
-      where: {
-        followerId_followingId: {
-          followerId: req.user.userId,
-          followingId: userId,
-        },
-      },
-    });
+    await assertUsersCanInteract(req.user.userId, userId, 'follow');
 
-    if (existingFollow) {
-      res.status(400).json({ error: 'Already following this user' });
-      return;
+    let follow;
+    try {
+      follow = await prisma.$transaction(async (tx) => {
+        const created = await tx.follows.create({
+          data: {
+            id: randomUUID(),
+            followerId: req.user!.userId,
+            followingId: userId,
+          },
+        });
+
+        await Promise.all([
+          tx.userStats.upsert({
+            where: { userId: req.user!.userId },
+            update: { followingCount: { increment: 1 } },
+            create: { userId: req.user!.userId, followingCount: 1 },
+          }),
+          tx.userStats.upsert({
+            where: { userId },
+            update: { followersCount: { increment: 1 } },
+            create: { userId, followersCount: 1 },
+          }),
+        ]);
+
+        return created;
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        res.status(400).json({ error: 'Already following this user' });
+        return;
+      }
+      throw error;
     }
-
-    const follow = await prisma.follows.create({
-      data: {
-        id: randomUUID(),
-        followerId: req.user.userId,
-        followingId: userId,
-      },
-    });
-
-    await Promise.all([
-      prisma.userStats.upsert({
-        where: { userId: req.user.userId },
-        update: { followingCount: { increment: 1 } },
-        create: { userId: req.user.userId, followingCount: 1 },
-      }),
-      prisma.userStats.upsert({
-        where: { userId },
-        update: { followersCount: { increment: 1 } },
-        create: { userId, followersCount: 1 },
-      }),
-    ]);
 
     // Get follower info for notification
     const follower = await prisma.user.findUnique({
@@ -106,6 +113,11 @@ export const followUser = async (req: AuthRequest, res: Response): Promise<void>
       },
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('followUser error:', error);
     res.status(500).json({ error: 'Failed to follow user' });
   }
@@ -124,39 +136,36 @@ export const unfollowUser = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    const existingFollow = await prisma.follows.findUnique({
-      where: {
-        followerId_followingId: {
-          followerId: req.user.userId,
+    const deleted = await prisma.$transaction(async (tx) => {
+      const result = await tx.follows.deleteMany({
+        where: {
+          followerId: req.user!.userId,
           followingId: userId,
         },
-      },
+      });
+
+      if (result.count !== 1) {
+        return false;
+      }
+
+      await Promise.all([
+        tx.userStats.update({
+          where: { userId: req.user!.userId },
+          data: { followingCount: { decrement: 1 } },
+        }),
+        tx.userStats.update({
+          where: { userId },
+          data: { followersCount: { decrement: 1 } },
+        }),
+      ]);
+
+      return true;
     });
 
-    if (!existingFollow) {
+    if (!deleted) {
       res.status(400).json({ error: 'Not following this user' });
       return;
     }
-
-    await prisma.follows.delete({
-      where: {
-        followerId_followingId: {
-          followerId: req.user.userId,
-          followingId: userId,
-        },
-      },
-    });
-
-    await Promise.all([
-      prisma.userStats.update({
-        where: { userId: req.user.userId },
-        data: { followingCount: { decrement: 1 } },
-      }).catch(() => {}),
-      prisma.userStats.update({
-        where: { userId },
-        data: { followersCount: { decrement: 1 } },
-      }).catch(() => {}),
-    ]);
 
     res.status(200).json({ message: 'Successfully unfollowed user' });
   } catch (error) {

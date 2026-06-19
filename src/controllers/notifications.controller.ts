@@ -3,6 +3,13 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { collapseInboxNotifications, notificationService } from '../services/notification.service';
+import {
+  clampPageSize,
+  createdAtDescKeysetWhere,
+  decodeKeysetCursor,
+  decodeLegacyDateCursor,
+  encodeKeysetCursor,
+} from '../utils/keyset-pagination.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -16,6 +23,7 @@ const notificationInclude = {
       name: true,
       profileImage: true,
       isVerified: true,
+      profileBadgeStyle: true,
     },
   },
   posts: {
@@ -57,8 +65,10 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const cursor = ensureString(req.query.cursor);
-    const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
+    const cursorValue = ensureString(req.query.cursor);
+    const cursor = decodeKeysetCursor(cursorValue, 'notifications');
+    const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
+    const limit = clampPageSize(req.query.limit, 20, 50);
     const unreadOnly = req.query.unreadOnly === 'true';
 
     const whereClause: any = { userId };
@@ -67,15 +77,18 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
       whereClause.isRead = false;
     }
     
-    if (cursor) {
-      whereClause.createdAt = { lt: new Date(cursor) };
+    const cursorWhere = createdAtDescKeysetWhere(cursor);
+    if (cursorWhere) {
+      whereClause.AND = [cursorWhere];
+    } else if (legacyCursorDate) {
+      whereClause.createdAt = { lt: legacyCursorDate };
     }
 
-    const rawTake = Math.min(limit * 3, 120) + 1;
+    const rawTake = Math.min(limit * 3, 150) + 1;
     const notifications = await prisma.notifications.findMany({
       where: whereClause,
       include: notificationInclude,
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: rawTake,
     });
 
@@ -87,7 +100,11 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
     res.json({
       notifications: formatted,
       nextCursor: hasMore && results.length > 0
-        ? results[results.length - 1].createdAt.toISOString()
+        ? encodeKeysetCursor({
+            scope: 'notifications',
+            t: results[results.length - 1].createdAt.toISOString(),
+            id: results[results.length - 1].id,
+          })
         : null,
       hasMore,
     });

@@ -1,3 +1,5 @@
+import type { CoarseLocationDTO } from '../utils/location-dto.util';
+
 /**
  * Profile API types for unified profile responses
  */
@@ -63,10 +65,11 @@ export interface FullProfileResponse {
     name: string;
     email?: string; // Only if viewing own profile
     avatar: string | null;
+    profileImage?: string | null;
     bannerImageUrl: string | null;
     headline: string | null;
     bio: string | null;
-    location: string | null;
+    location: CoarseLocationDTO | null;
     college: string;
     degree: string | null;
     branch: string;
@@ -80,9 +83,14 @@ export interface FullProfileResponse {
     isOnline?: boolean;
     lastActiveAt?: Date | null;
     verified: boolean;
+    isVerified?: boolean;
+    profileBadgeStyle?: string | null;
+    isPremium?: boolean;
+    canAccessProfileCustomization?: boolean;
     interests: string[];
     profileRing?: string | null;
     visitLoaderGiftId?: string | null;
+    profileTheme?: string;
     createdAt: Date;
   };
   stats: {
@@ -137,4 +145,7 @@ export interface FullProfileResponse {
   projects: any[];
   certificates: any[];
   achievements: any[];
+  viewerContext?: {
+    isProfileSaved: boolean;
+  };
 }

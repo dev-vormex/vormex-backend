@@ -17,12 +17,36 @@ import {
 } from '../utils/auth-cookie.util';
 
 function requiresSessionBoundAccessTokens(): boolean {
+  if (process.env.AUTH_REQUIRE_SESSION_ID === 'true') {
+    return true;
+  }
+
+  if (process.env.AUTH_REQUIRE_SESSION_ID === 'false') {
+    return false;
+  }
+
+  const apiRedisMode = (process.env.API_REDIS_MODE || 'auto').toLowerCase();
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    (
+      ['0', 'false', 'no', 'disabled'].includes(apiRedisMode) ||
+      (!['1', 'true', 'yes', 'enabled'].includes(apiRedisMode) &&
+        /upstash\.io/i.test(process.env.REDIS_URL || ''))
+    )
+  ) {
+    return false;
+  }
+
   return process.env.AUTH_REQUIRE_SESSION_ID !== 'false';
 }
 
 async function isTokenSessionActive(decoded: JWTPayload): Promise<boolean> {
+  if (!requiresSessionBoundAccessTokens()) {
+    return true;
+  }
+
   if (!decoded.sessionId) {
-    return !requiresSessionBoundAccessTokens();
+    return false;
   }
 
   const session = await getAuthSession(decoded.sessionId);
@@ -46,6 +70,7 @@ async function assertUserCanAuthenticate(decoded: JWTPayload): Promise<void> {
       authProvider: true,
       isBanned: true,
       isVerified: true,
+      safetySuspendedUntil: true,
     },
   });
 
@@ -57,6 +82,11 @@ async function assertUserCanAuthenticate(decoded: JWTPayload): Promise<void> {
   if (user.isBanned) {
     await setCachedAuthUserStatus(userId, false);
     throw new Error('User account is disabled');
+  }
+
+  if (user.safetySuspendedUntil && user.safetySuspendedUntil > new Date()) {
+    await setCachedAuthUserStatus(userId, false);
+    throw new Error('User account is suspended');
   }
 
   if (user.authProvider === 'email' && !user.isVerified) {
@@ -180,6 +210,15 @@ export const authenticate = async (
         res.status(401).json({
           error: 'Token has expired. Please login again.',
           code: 'token_expired',
+          requestId,
+        });
+        return;
+      }
+
+      if (errorMessage.includes('suspended')) {
+        res.status(403).json({
+          error: 'User account is temporarily suspended',
+          code: 'account_suspended',
           requestId,
         });
         return;

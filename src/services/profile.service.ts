@@ -1,5 +1,6 @@
 import { prisma } from '../config/prisma';
 import { cacheService } from './cache.service';
+import { requestWithBreaker } from '../utils/http-client-with-breaker.util';
 import { isUUID } from '../utils/username.util';
 import { decryptToken } from '../utils/encryption.util';
 import type {
@@ -11,6 +12,10 @@ import { getActivityHeatmap } from './activity.service';
 import { getGitHubContributionCalendar } from './github.service';
 import { socialProofService } from './social-proof.service';
 import { calculateLevelProgress } from './progress.service';
+import { getPremiumAccessSnapshot } from './premium-access.service';
+import { buildProfileCustomizationResponseFields } from './user-response.service';
+import { bunnyStorageService } from './bunny-storage.service';
+import { imageProcessingService } from './image-processing.service';
 import {
   extractDomain,
   getPostMetadata,
@@ -19,8 +24,57 @@ import {
   normalizeUrl,
 } from '../utils/post.util';
 import { buildPostVisibilityWhere } from '../utils/access-control.util';
+import { serializeCoarseLocation } from '../utils/location-dto.util';
 
 const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
+const LEGACY_PROFILE_AVIF_PATTERN = /\/profiles\/avatars\/[^?#]+\.avif(?:$|[?#])/i;
+
+function isLegacyProfileAvifUrl(url: string | null | undefined): url is string {
+  return Boolean(url && LEGACY_PROFILE_AVIF_PATTERN.test(url));
+}
+
+async function migrateLegacyProfileAvatarToWebp(
+  userId: string,
+  profileImage: string | null
+): Promise<string | null> {
+  if (!isLegacyProfileAvifUrl(profileImage)) {
+    return profileImage;
+  }
+
+  try {
+    const response = await requestWithBreaker<ArrayBuffer>('profile_image', 'fetch_legacy_avatar', {
+      method: 'GET',
+      url: profileImage,
+      responseType: 'arraybuffer',
+      timeout: 8_000,
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 8_000 });
+    const sourceBuffer = Buffer.from(response.data);
+    const webpBuffer = await imageProcessingService.processProfileAvatarWebp(sourceBuffer);
+    const webpUrl = await bunnyStorageService.uploadProfilePicture(webpBuffer, userId);
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: { profileImage: webpUrl },
+      select: { id: true },
+    });
+    await cacheService.invalidateTags(`user:${userId}`);
+
+    void bunnyStorageService.deleteFile(profileImage).catch((error) => {
+      console.warn(
+        `Failed to delete legacy AVIF avatar for ${userId}:`,
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+    });
+
+    return webpUrl;
+  } catch (error) {
+    console.warn(
+      `Failed to migrate legacy AVIF avatar for ${userId}:`,
+      error instanceof Error ? error.message : 'Unknown error'
+    );
+    return profileImage;
+  }
+}
 
 function isProfileUserOnline(user: { isOnline?: boolean | null; lastActiveAt?: Date | null }): boolean {
   if (user.isOnline) return true;
@@ -469,7 +523,7 @@ export async function getFullProfile(
 
     const cacheKey = `profile:bundle:${requestingUserId || 'anon'}:${targetUserId}`;
     const cached = await cacheService.get<FullProfileResponse>(cacheKey);
-    if (cached) {
+    if (cached && !isLegacyProfileAvifUrl(cached.user.avatar)) {
       return cached;
     }
 
@@ -487,6 +541,8 @@ export async function getFullProfile(
       projects,
       certificates,
       achievements,
+      premiumSnapshot,
+      isProfileSaved,
     ] = await Promise.all([
       // UserStats
       prisma.userStats.findUnique({
@@ -568,6 +624,14 @@ export async function getFullProfile(
         where: { userId: targetUserId },
         orderBy: { date: 'desc' },
       }).catch(() => []),
+
+      getPremiumAccessSnapshot(targetUserId).catch(() => ({
+        isPremium: false,
+      })),
+
+      requestingUserId && !isOwner
+        ? socialProofService.isProfileSaved(requestingUserId, targetUserId).catch(() => false)
+        : Promise.resolve(false),
     ]);
 
     // Build stats object with real-time post count
@@ -685,17 +749,32 @@ export async function getFullProfile(
       lastSyncedAt: user.githubLastSyncedAt,
     };
 
+    const canAccessProfileCustomization = Boolean(
+      (premiumSnapshot as any).canAccessProfileCustomization
+    );
+    const customizationFields = buildProfileCustomizationResponseFields(
+      user,
+      canAccessProfileCustomization
+    );
+    const profileImageForResponse = await migrateLegacyProfileAvatarToWebp(
+      targetUserId,
+      user.profileImage
+    );
+    const canShowLocation = isOwner || user.shareLocationPublic === true;
+    const location = canShowLocation ? serializeCoarseLocation(user) : null;
+
     // Build user object (exclude sensitive fields)
     const userResponse = {
       id: user.id,
       username: user.username, // Username is required
       name: user.name,
       ...(isOwner && { email: user.email }), // Only include email if owner
-      avatar: user.profileImage,
+      avatar: profileImageForResponse,
+      profileImage: profileImageForResponse,
       bannerImageUrl: user.bannerImageUrl,
       headline: user.headline,
       bio: user.bio,
-      location: user.location,
+      location,
       college: user.college || '',
       degree: user.degree,
       branch: user.branch || '',
@@ -709,8 +788,13 @@ export async function getFullProfile(
       isOnline: isProfileUserOnline(user),
       lastActiveAt: user.lastActiveAt,
       verified: user.isVerified,
-      profileRing: user.profileRing,
-      visitLoaderGiftId: user.visitLoaderGiftId,
+      isVerified: user.isVerified,
+      profileBadgeStyle: customizationFields.profileBadgeStyle,
+      isPremium: Boolean((premiumSnapshot as any).isPremium),
+      canAccessProfileCustomization,
+      profileRing: customizationFields.profileRing,
+      visitLoaderGiftId: customizationFields.visitLoaderGiftId,
+      profileTheme: customizationFields.profileTheme,
       createdAt: user.createdAt,
     };
 
@@ -749,6 +833,9 @@ export async function getFullProfile(
       projects,
       certificates,
       achievements,
+      viewerContext: {
+        isProfileSaved: Boolean(isProfileSaved),
+      },
     };
     await cacheService.set(cacheKey, response, 120, [`user:${targetUserId}`]);
     return response;

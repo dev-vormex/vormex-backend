@@ -10,6 +10,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: AUTH_REQUIRE_SESSION_ID
+        value: "true"
   # These background processes must use the same secret env vars as the web service
   # (DATABASE_URL, REDIS_URL, Firebase creds, etc.) for re-engagement notifications to run.
   - type: worker
@@ -21,6 +23,12 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: AUTH_REQUIRE_SESSION_ID
+        value: "true"
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: WORKER_ERROR_LOG_THROTTLE_MS
+        value: "30000"
   - type: worker
     runtime: node
     name: vormex-backend-scheduler
@@ -30,3 +38,7 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: AUTH_REQUIRE_SESSION_ID
+        value: "true"
+      - key: OUTBOX_DISPATCH_INTERVAL_MS
+        value: "5000"

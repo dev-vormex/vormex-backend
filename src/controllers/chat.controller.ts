@@ -1,14 +1,36 @@
 import { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { prisma, prismaRead } from '../config/prisma';
-import { queueNames } from '../infrastructure/queue/queue-names';
-import { enqueueOutboxEvent } from '../outbox/service';
 import { enqueueCacheInvalidation, enqueueRealtimeFanout } from '../outbox/helpers';
 import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
 import { emitRealtimeEnvelopes } from '../infrastructure/realtime/emitter';
 import { cacheService } from '../services/cache.service';
 import { ensureString } from '../utils/request.util';
 import { isPrismaConnectionError } from '../utils/prisma-error.util';
+import {
+  maskReadReceiptForViewer,
+  shouldNotifySenderAboutReadReceipt,
+} from '../services/chat-read-receipts.service';
+import { canUserUsePremiumFeature } from '../services/premium-feature-gates.service';
+import { sendChatMessage } from '../services/chat-message.service';
+import {
+  getPremiumVisibilityByUserIds,
+  type PremiumVisibilityState,
+} from '../services/premium-visibility.service';
+import {
+  assertUsersCanInteract,
+  enforceTrustTierLimit,
+  publicTrustFields,
+  safetyErrorResponse,
+  trustLevelRank,
+} from '../services/trust-safety.service';
+import {
+  clampPageSize,
+  createdAtDescKeysetWhere,
+  decodeKeysetCursor,
+  decodeLegacyDateCursor,
+  encodeKeysetCursor,
+} from '../utils/keyset-pagination.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -22,6 +44,8 @@ const userSelect = {
   isOnline: true,
   lastActiveAt: true,
   isVerified: true,
+  profileBadgeStyle: true,
+  identityTrustLevel: true,
 };
 
 const uniqueTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
@@ -69,49 +93,105 @@ const buildFallbackChatUser = (userId: string) => ({
   isOnline: false,
   lastActiveAt: null,
   isVerified: false,
+  profileBadgeStyle: null,
+  identityTrustLevel: 'BASIC',
+  verificationBadges: [],
+  isPremium: false,
 });
 
-const normalizeClientMessageId = (clientMessageId: unknown): string | null => {
-  if (typeof clientMessageId !== 'string') {
-    return null;
-  }
+export function buildChatUserIdentity<T extends { id?: string | null; profileBadgeStyle?: string | null; identityTrustLevel?: string | null }>(
+  user: T,
+  premiumVisibilityByUser: Map<string, Pick<PremiumVisibilityState, 'isPremium'>>
+): T & { profileBadgeStyle: string | null; isPremium: boolean; identityTrustLevel: string; verificationBadges: string[] } {
+  const userId = String(user?.id || '');
+  const isPremium = Boolean(userId && premiumVisibilityByUser.get(userId)?.isPremium);
+  const earnedStudentBadge =
+    user.profileBadgeStyle?.toLowerCase() === 'student' &&
+    trustLevelRank(user.identityTrustLevel) >= trustLevelRank('STUDENT_VERIFIED');
+  return {
+    ...user,
+    profileBadgeStyle: isPremium || earnedStudentBadge ? user.profileBadgeStyle ?? null : null,
+    isPremium,
+    ...publicTrustFields(user.identityTrustLevel),
+  };
+}
 
-  const normalized = clientMessageId.trim();
-  return normalized ? normalized.slice(0, 128) : null;
+const getChatPremiumVisibilityByUserIds = async (
+  userIds: string[]
+): Promise<Map<string, PremiumVisibilityState>> => {
+  try {
+    return await getPremiumVisibilityByUserIds(userIds);
+  } catch (error) {
+    console.error('chat premium visibility lookup failed:', error);
+    return new Map();
+  }
+};
+
+const toIsoString = (value: unknown): string | undefined => {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string' && value.trim()) return value;
+  return undefined;
+};
+
+const getReadReceiptVisibility = async (userId: string): Promise<boolean> => {
+  try {
+    return await canUserUsePremiumFeature(userId, 'read_receipts');
+  } catch (error) {
+    console.error('read receipt premium check failed:', error);
+    return false;
+  }
+};
+
+const maskLastMessagePayload = (
+  message: any,
+  viewerUserId: string,
+  viewerCanUseReadReceipts: boolean
+) => {
+  if (!message) return null;
+  return maskReadReceiptForViewer(message, viewerUserId, viewerCanUseReadReceipts);
 };
 
 const mapMessagePayload = (
   message: any,
   sender: any,
-  reactions: { id: string; userId: string; emoji: string }[] = []
-) => ({
-  id: message.id,
-  clientMessageId: message.clientMessageId || undefined,
-  conversationId: message.conversationId,
-  senderId: message.senderId,
-  receiverId: message.receiverId,
-  content: message.content,
-  contentType: message.contentType,
-  mediaUrl: message.mediaUrl,
-  mediaType: message.mediaType,
-  fileName: message.fileName,
-  fileSize: message.fileSize,
-  status: message.status,
-  deliveredAt: message.deliveredAt?.toISOString(),
-  readAt: message.readAt?.toISOString(),
-  isDeleted: message.isDeleted,
-  replyToId: message.replyToId,
-  replyTo: (message as typeof message & { messages: unknown }).messages,
-  sender: sender || buildFallbackChatUser(message.senderId),
-  reactions: reactions.map((reaction) => ({
-    id: reaction.id,
-    userId: reaction.userId,
-    emoji: reaction.emoji,
-    user: { id: reaction.userId, username: '', name: '' },
-  })),
-  createdAt: message.createdAt.toISOString(),
-  updatedAt: message.updatedAt.toISOString(),
-});
+  reactions: { id: string; userId: string; emoji: string }[] = [],
+  options: { viewerUserId?: string; viewerCanUseReadReceipts?: boolean } = {}
+) => {
+  const visibleMessage = maskReadReceiptForViewer(
+    message,
+    options.viewerUserId,
+    Boolean(options.viewerCanUseReadReceipts)
+  );
+
+  return {
+    id: visibleMessage.id,
+    clientMessageId: visibleMessage.clientMessageId || undefined,
+    conversationId: visibleMessage.conversationId,
+    senderId: visibleMessage.senderId,
+    receiverId: visibleMessage.receiverId,
+    content: visibleMessage.content,
+    contentType: visibleMessage.contentType,
+    mediaUrl: visibleMessage.mediaUrl,
+    mediaType: visibleMessage.mediaType,
+    fileName: visibleMessage.fileName,
+    fileSize: visibleMessage.fileSize,
+    status: visibleMessage.status,
+    deliveredAt: toIsoString(visibleMessage.deliveredAt),
+    readAt: toIsoString(visibleMessage.readAt),
+    isDeleted: visibleMessage.isDeleted,
+    replyToId: visibleMessage.replyToId,
+    replyTo: (visibleMessage as typeof visibleMessage & { messages: unknown }).messages,
+    sender: sender || buildFallbackChatUser(visibleMessage.senderId),
+    reactions: reactions.map((reaction) => ({
+      id: reaction.id,
+      userId: reaction.userId,
+      emoji: reaction.emoji,
+      user: { id: reaction.userId, username: '', name: '' },
+    })),
+    createdAt: visibleMessage.createdAt.toISOString(),
+    updatedAt: visibleMessage.updatedAt.toISOString(),
+  };
+};
 
 const getChatUserLookup = async (userIds: string[]): Promise<Map<string, any>> => {
   const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
@@ -123,8 +203,14 @@ const getChatUserLookup = async (userIds: string[]): Promise<Map<string, any>> =
     where: { id: { in: uniqueUserIds } },
     select: userSelect,
   });
+  const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds(uniqueUserIds);
 
-  return new Map(users.map((user) => [user.id, user]));
+  return new Map(
+    users.map((user) => [
+      user.id,
+      buildChatUserIdentity(user, premiumVisibilityByUser),
+    ])
+  );
 };
 
 export const getConversations = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -134,8 +220,10 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const limit = parseInt(req.query.limit as string) || 20;
-    const cursor = req.query.cursor as string | undefined;
+    const limit = clampPageSize(req.query.limit, 20, 50);
+    const cursorValue = req.query.cursor as string | undefined;
+    const cursor = decodeKeysetCursor(cursorValue, 'chat.conversations');
+    const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
 
     const whereClause: any = {
       OR: [
@@ -144,8 +232,16 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
       ],
     };
 
-    if (cursor) {
-      whereClause.lastMessageAt = { lt: new Date(cursor) };
+    if (cursor?.t) {
+      const cursorDate = new Date(cursor.t);
+      whereClause.AND = [{
+        OR: [
+          { lastMessageAt: { lt: cursorDate } },
+          { lastMessageAt: cursorDate, id: { lt: cursor.id } },
+        ],
+      }];
+    } else if (legacyCursorDate) {
+      whereClause.lastMessageAt = { lt: legacyCursorDate };
     }
 
     const conversations = await prismaRead.conversations.findMany({
@@ -166,12 +262,16 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
           },
         },
       },
-      orderBy: { lastMessageAt: 'desc' },
+      orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'last' } }, { id: 'desc' }],
       take: limit + 1,
     });
 
     const hasMore = conversations.length > limit;
     const results = hasMore ? conversations.slice(0, -1) : conversations;
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds(
+      results.flatMap((conv) => [conv.participant1Id, conv.participant2Id])
+    );
 
     const conversationIds = results.map((conv) => conv.id);
     const unreadCounts = conversationIds.length
@@ -193,18 +293,30 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
     const formatted = await Promise.all(
       results.map(async (conv) => {
         const convWithRelations = conv as typeof conv & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown; messages: unknown[] };
+        const participant1 = buildChatUserIdentity(
+          convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+          premiumVisibilityByUser
+        );
+        const participant2 = buildChatUserIdentity(
+          convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+          premiumVisibilityByUser
+        );
         const otherParticipant =
-          conv.participant1Id === req.user!.userId ? convWithRelations.users_conversations_participant2IdTousers : convWithRelations.users_conversations_participant1IdTousers;
+          conv.participant1Id === req.user!.userId ? participant2 : participant1;
         const unreadCount = unreadCountMap.get(conv.id) || 0;
 
         return {
           id: conv.id,
           participant1Id: conv.participant1Id,
           participant2Id: conv.participant2Id,
-          participant1: convWithRelations.users_conversations_participant1IdTousers,
-          participant2: convWithRelations.users_conversations_participant2IdTousers,
+          participant1,
+          participant2,
           otherParticipant,
-          lastMessage: convWithRelations.messages[0] || null,
+          lastMessage: maskLastMessagePayload(
+            convWithRelations.messages[0],
+            req.user!.userId,
+            viewerCanUseReadReceipts
+          ),
           lastMessageAt: conv.lastMessageAt?.toISOString() || null,
           unreadCount,
           createdAt: conv.createdAt.toISOString(),
@@ -217,7 +329,11 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
       conversations: formatted,
       hasMore,
       nextCursor: hasMore && results.length > 0
-        ? results[results.length - 1].lastMessageAt?.toISOString()
+        ? encodeKeysetCursor({
+            scope: 'chat.conversations',
+            t: results[results.length - 1].lastMessageAt?.toISOString() || null,
+            id: results[results.length - 1].id,
+          })
         : undefined,
     });
   } catch (error) {
@@ -258,6 +374,8 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
       res.status(404).json({ error: 'User not found' });
       return;
     }
+
+    await assertUsersCanInteract(req.user.userId, participantId, 'conversation');
 
     let createdConversation = false;
     let conversation = await prisma.conversations.findFirst({
@@ -314,10 +432,22 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
     }
 
     const convWithRelations = conversation as typeof conversation & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown; messages: unknown[] };
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
+      conversation.participant1Id,
+      conversation.participant2Id,
+    ]);
+    const participant1 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
+    const participant2 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
     const otherParticipant =
       conversation.participant1Id === req.user.userId
-        ? convWithRelations.users_conversations_participant2IdTousers
-        : convWithRelations.users_conversations_participant1IdTousers;
+        ? participant2
+        : participant1;
 
     if (createdConversation) {
       await invalidateChatCaches(
@@ -333,8 +463,8 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
       id: conversation.id,
       participant1Id: conversation.participant1Id,
       participant2Id: conversation.participant2Id,
-      participant1: convWithRelations.users_conversations_participant1IdTousers,
-      participant2: convWithRelations.users_conversations_participant2IdTousers,
+      participant1,
+      participant2,
       otherParticipant,
       lastMessage: convWithRelations.messages[0] || null,
       lastMessageAt: conversation.lastMessageAt?.toISOString() || null,
@@ -343,6 +473,11 @@ export const getOrCreateConversation = async (req: AuthRequest, res: Response): 
       updatedAt: conversation.updatedAt.toISOString(),
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('getOrCreateConversation error:', error);
     res.status(500).json({ error: 'Failed to get or create conversation' });
   }
@@ -416,10 +551,22 @@ export const getConversationStatusWithUser = async (req: AuthRequest, res: Respo
       users_conversations_participant2IdTousers: unknown;
       messages: unknown[];
     };
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
+      conversation.participant1Id,
+      conversation.participant2Id,
+    ]);
+    const participant1 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
+    const participant2 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
     const otherParticipant =
       conversation.participant1Id === req.user.userId
-        ? convWithRelations.users_conversations_participant2IdTousers
-        : convWithRelations.users_conversations_participant1IdTousers;
+        ? participant2
+        : participant1;
 
     const unreadCount = await prismaRead.messages.count({
       where: {
@@ -429,6 +576,7 @@ export const getConversationStatusWithUser = async (req: AuthRequest, res: Respo
       },
     });
     const lastMessage = convWithRelations.messages[0] || null;
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
 
     res.status(200).json({
       hasConversation: true,
@@ -437,10 +585,14 @@ export const getConversationStatusWithUser = async (req: AuthRequest, res: Respo
         id: conversation.id,
         participant1Id: conversation.participant1Id,
         participant2Id: conversation.participant2Id,
-        participant1: convWithRelations.users_conversations_participant1IdTousers,
-        participant2: convWithRelations.users_conversations_participant2IdTousers,
+        participant1,
+        participant2,
         otherParticipant,
-        lastMessage,
+        lastMessage: maskLastMessagePayload(
+          lastMessage,
+          req.user.userId,
+          viewerCanUseReadReceipts
+        ),
         lastMessageAt: conversation.lastMessageAt?.toISOString() || null,
         unreadCount,
         createdAt: conversation.createdAt.toISOString(),
@@ -502,10 +654,23 @@ export const getConversation = async (req: AuthRequest, res: Response): Promise<
     }
 
     const convWithRelations = conversation as typeof conversation & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown; messages: unknown[] };
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
+      conversation.participant1Id,
+      conversation.participant2Id,
+    ]);
+    const participant1 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
+    const participant2 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
     const otherParticipant =
       conversation.participant1Id === req.user.userId
-        ? convWithRelations.users_conversations_participant2IdTousers
-        : convWithRelations.users_conversations_participant1IdTousers;
+        ? participant2
+        : participant1;
 
     const unreadCount = await prismaRead.messages.count({
       where: {
@@ -519,10 +684,14 @@ export const getConversation = async (req: AuthRequest, res: Response): Promise<
       id: conversation.id,
       participant1Id: conversation.participant1Id,
       participant2Id: conversation.participant2Id,
-      participant1: convWithRelations.users_conversations_participant1IdTousers,
-      participant2: convWithRelations.users_conversations_participant2IdTousers,
+      participant1,
+      participant2,
       otherParticipant,
-      lastMessage: convWithRelations.messages[0] || null,
+      lastMessage: maskLastMessagePayload(
+        convWithRelations.messages[0],
+        req.user.userId,
+        viewerCanUseReadReceipts
+      ),
       lastMessageAt: conversation.lastMessageAt?.toISOString() || null,
       unreadCount,
       createdAt: conversation.createdAt.toISOString(),
@@ -546,8 +715,10 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
       res.status(400).json({ error: 'Conversation ID is required' });
       return;
     }
-    const limit = parseInt(ensureString(req.query.limit) || '50') || 50;
-    const cursor = ensureString(req.query.cursor);
+    const limit = clampPageSize(req.query.limit, 50, 50);
+    const cursorValue = ensureString(req.query.cursor);
+    const cursor = decodeKeysetCursor(cursorValue, `chat.messages:${conversationId}`);
+    const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
 
     const conversation = await prismaRead.conversations.findFirst({
       where: {
@@ -565,8 +736,11 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const whereClause: any = { conversationId };
-    if (cursor) {
-      whereClause.createdAt = { lt: new Date(cursor) };
+    const cursorWhere = createdAtDescKeysetWhere(cursor);
+    if (cursorWhere) {
+      whereClause.AND = [cursorWhere];
+    } else if (legacyCursorDate) {
+      whereClause.createdAt = { lt: legacyCursorDate };
     }
 
     const messages = await prismaRead.messages.findMany({
@@ -582,7 +756,7 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
     });
 
@@ -590,12 +764,17 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
     const results = hasMore ? messages.slice(0, -1) : messages;
 
     const senderLookup = await getChatUserLookup(results.map((message) => message.senderId));
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
 
     const formatted = results.map((msg) =>
       mapMessagePayload(
         msg,
         senderLookup.get(msg.senderId),
-        (msg as typeof msg & { message_reactions: { id: string; userId: string; emoji: string }[] }).message_reactions
+        (msg as typeof msg & { message_reactions: { id: string; userId: string; emoji: string }[] }).message_reactions,
+        {
+          viewerUserId: req.user!.userId,
+          viewerCanUseReadReceipts,
+        }
       )
     );
 
@@ -603,7 +782,11 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
       messages: formatted.reverse(),
       hasMore,
       nextCursor: hasMore && results.length > 0
-        ? results[results.length - 1].createdAt.toISOString()
+        ? encodeKeysetCursor({
+            scope: `chat.messages:${conversationId}`,
+            t: results[results.length - 1].createdAt.toISOString(),
+            id: results[results.length - 1].id,
+          })
         : undefined,
     });
   } catch (error) {
@@ -624,251 +807,42 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       res.status(400).json({ error: 'Conversation ID is required' });
       return;
     }
-    const { content, contentType, mediaUrl, mediaType, fileName, fileSize, replyToId } = req.body;
-    const clientMessageId = normalizeClientMessageId(req.body.clientMessageId);
-
-    if (!content && !mediaUrl) {
-      res.status(400).json({ error: 'Content or media is required' });
-      return;
-    }
-
-    const conversation = await prisma.conversations.findFirst({
-      where: {
-        id: conversationId,
-        OR: [
-          { participant1Id: req.user.userId },
-          { participant2Id: req.user.userId },
-        ],
-      },
-    });
-
-    if (!conversation) {
-      res.status(404).json({ error: 'Conversation not found' });
-      return;
-    }
-
-    const receiverId =
-      conversation.participant1Id === req.user.userId
-        ? conversation.participant2Id
-        : conversation.participant1Id;
-
-    const sender = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: userSelect,
-    });
-
-    if (clientMessageId) {
-      const existingMessage = await prismaRead.messages.findFirst({
-        where: {
-          conversationId,
-          senderId: req.user.userId,
-          clientMessageId,
-        },
-        include: {
-          message_reactions: true,
-          messages: {
-            select: {
-              id: true,
-              content: true,
-              contentType: true,
-              senderId: true,
-            },
-          },
-        },
-      });
-
-      if (existingMessage) {
-        const existingPayload = mapMessagePayload(
-          existingMessage,
-          sender,
-          (existingMessage as typeof existingMessage & { message_reactions: { id: string; userId: string; emoji: string }[] }).message_reactions
-        );
-
-        emitRealtimeEnvelopes([
-          {
-            event: 'chat:new_message',
-            users: [String(req.user.userId), receiverId],
-            payload: {
-              conversationId,
-              message: existingPayload,
-            },
-          },
-        ]);
-        res.status(200).json(existingPayload);
-        return;
-      }
-    }
-
-    const replyToMessageId = replyToId ? ensureString(replyToId) : null;
-    const replyToMessage = replyToMessageId
-      ? await prisma.messages.findFirst({
-          where: {
-            id: replyToMessageId,
-            conversationId,
-          },
-          select: {
-            id: true,
-            content: true,
-            contentType: true,
-            senderId: true,
-          },
-        })
-      : null;
-
-    if (replyToMessageId && !replyToMessage) {
-      res.status(400).json({ error: 'Reply target is invalid for this conversation' });
-      return;
-    }
-
-    const now = new Date();
-    const messageId = randomUUID();
-    const normalizedContent = content || '';
-    const normalizedContentType = contentType || 'text';
-    const normalizedFileSize =
-      typeof fileSize === 'number' ? fileSize : fileSize ? Number(fileSize) : null;
-    const preview = normalizedContent
-      ? normalizedContent.length > 100
-        ? normalizedContent.substring(0, 97) + '...'
-        : normalizedContent
-      : 'Sent you a message';
-
-    const messagePayload = mapMessagePayload(
-      {
-        id: messageId,
-        conversationId,
-        senderId: req.user.userId,
-        receiverId,
-        content: normalizedContent,
-        contentType: normalizedContentType,
-        mediaUrl: mediaUrl || null,
-        mediaType: mediaType || null,
-        fileName: fileName || null,
-        fileSize: normalizedFileSize,
-        status: 'SENT',
-        deliveredAt: null,
-        readAt: null,
-        isDeleted: false,
-        replyToId: replyToMessageId,
-        messages: replyToMessage,
-        createdAt: now,
-        updatedAt: now,
-        clientMessageId,
-      },
-      sender,
-      []
-    );
-
-    const realtimeEnvelopes: RealtimeEnvelope[] = [
-      {
-        event: 'chat:new_message',
-        users: [String(req.user.userId), receiverId],
-        payload: {
-          conversationId,
-          message: messagePayload,
-        },
-      },
-      {
-        event: 'chat:notification',
-        users: [receiverId],
-        payload: {
-          type: 'new_message',
-          conversationId,
-          message: messagePayload,
-          sender,
-        },
-      },
-    ];
-    const cacheTags = conversationCacheTags(
+    const result = await sendChatMessage({
+      senderId: req.user.userId,
       conversationId,
-      String(req.user.userId),
-      receiverId
-    );
-
-    await prisma.$transaction(async (tx) => {
-      await tx.messages.create({
-        data: {
-          id: messageId,
-          clientMessageId,
-          conversationId,
-          senderId: req.user.userId,
-          receiverId,
-          content: normalizedContent,
-          contentType: normalizedContentType,
-          mediaUrl,
-          mediaType,
-          fileName,
-          fileSize: normalizedFileSize,
-          replyToId: replyToMessageId,
-          status: 'SENT',
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
-
-      await tx.conversations.update({
-        where: { id: conversationId },
-        data: { lastMessageAt: now, updatedAt: now },
-      });
-
-      await enqueueOutboxEvent(tx as any, {
-        aggregateType: 'message',
-        aggregateId: messageId,
-        eventType: 'chat.message.created',
-        queueName: queueNames.realtimeFanout,
-        payload: {
-          envelopes: realtimeEnvelopes,
-        },
-      });
-
-      await enqueueOutboxEvent(tx as any, {
-        aggregateType: 'message',
-        aggregateId: messageId,
-        eventType: 'chat.message.push',
-        queueName: queueNames.notificationDelivery,
-        payload: {
-          kind: 'new_message',
-          userId: receiverId,
-          title: sender?.name || sender?.username || 'Someone',
-          body: preview,
-          conversationId,
-          senderId: String(req.user!.userId),
-          senderName: sender?.name || sender?.username || 'Someone',
-          senderImage: sender?.profileImage || undefined,
-          messageId,
-          clientMessageId: clientMessageId || undefined,
-          messageContent: normalizedContent,
-          contentType: normalizedContentType,
-          mediaUrl: mediaUrl || undefined,
-          mediaType: mediaType || undefined,
-          fileName: fileName || undefined,
-          fileSize: normalizedFileSize || undefined,
-          messageCreatedAt: now.toISOString(),
-          messageUpdatedAt: now.toISOString(),
-        },
-      });
-
-      await enqueueOutboxEvent(tx as any, {
-        aggregateType: 'conversation',
-        aggregateId: conversationId,
-        eventType: 'chat.cache.invalidate',
-        queueName: queueNames.cacheInvalidation,
-        payload: {
-          tags: cacheTags,
-        },
-      });
-
-    }, {
-      maxWait: 15_000,
-      timeout: 15_000,
+      content: req.body.content,
+      contentType: req.body.contentType,
+      mediaUrl: req.body.mediaUrl,
+      mediaType: req.body.mediaType,
+      fileName: req.body.fileName,
+      fileSize: req.body.fileSize,
+      replyToId: req.body.replyToId,
+      clientMessageId: req.body.clientMessageId,
     });
 
-    emitRealtimeEnvelopes(realtimeEnvelopes);
-    res.status(201).json(messagePayload);
-
-    void invalidateChatCaches(cacheTags).catch((cacheError) => {
-      console.error('sendMessage cache invalidation failed:', cacheError);
-    });
+    if (!result.wasDuplicate) {
+      emitRealtimeEnvelopes(result.realtimeEnvelopes);
+    }
+    res.status(result.wasDuplicate ? 200 : 201).json(result.message);
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
+    const message = error instanceof Error ? error.message : '';
+    if (message === 'Content or media is required') {
+      res.status(400).json({ error: message });
+      return;
+    }
+    if (message === 'Conversation not found') {
+      res.status(404).json({ error: message });
+      return;
+    }
+    if (message === 'Reply target is invalid for this conversation') {
+      res.status(400).json({ error: message });
+      return;
+    }
     console.error('sendMessage error:', error);
     res.status(500).json({ error: 'Failed to send message' });
   }
@@ -921,12 +895,31 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
         conversation.participant1Id === req.user!.userId
           ? conversation.participant2Id
           : conversation.participant1Id;
-      cacheTags = conversationCacheTags(
-        conversationId,
-        conversation.participant1Id,
-        conversation.participant2Id
-      );
 
+      return {
+        updatedCount: updated.count,
+        senderId,
+        participant1Id: conversation.participant1Id,
+        participant2Id: conversation.participant2Id,
+      };
+    });
+
+    if (!result) {
+      res.status(404).json({ error: 'Conversation not found' });
+      return;
+    }
+
+    cacheTags = conversationCacheTags(
+      conversationId,
+      result.participant1Id,
+      result.participant2Id
+    );
+
+    const senderCanUseReadReceipts = await getReadReceiptVisibility(result.senderId);
+    if (shouldNotifySenderAboutReadReceipt({
+      updatedCount: result.updatedCount,
+      senderCanUseReadReceipts,
+    })) {
       const payload = {
         conversationId,
         readBy: req.user!.userId,
@@ -936,33 +929,23 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       realtimeEnvelopes = [
         {
           event: 'chat:messages_read',
-          rooms: [`chat:${conversationId}`],
-          payload,
-        },
-        {
-          event: 'chat:messages_read',
-          users: [senderId],
+          users: [result.senderId],
           payload,
         },
       ];
-
-      return {
-        updatedCount: updated.count,
-      };
-    });
-
-    if (!result) {
-      res.status(404).json({ error: 'Conversation not found' });
-      return;
     }
 
     const outboxResults = await Promise.allSettled([
-      enqueueRealtimeFanout(prisma as any, {
-        aggregateType: 'conversation',
-        aggregateId: conversationId,
-        eventType: 'chat.messages.read',
-        envelopes: realtimeEnvelopes,
-      }),
+      ...(realtimeEnvelopes.length > 0
+        ? [
+            enqueueRealtimeFanout(prisma as any, {
+              aggregateType: 'conversation',
+              aggregateId: conversationId,
+              eventType: 'chat.messages.read',
+              envelopes: realtimeEnvelopes,
+            }),
+          ]
+        : []),
       enqueueCacheInvalidation(prisma as any, {
         aggregateType: 'conversation',
         aggregateId: conversationId,
@@ -1161,10 +1144,14 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const sender = await prismaRead.user.findUnique({
+    const senderRecord = await prismaRead.user.findUnique({
       where: { id: req.user.userId },
       select: userSelect,
     });
+    const senderPremiumVisibility = await getChatPremiumVisibilityByUserIds([req.user.userId]);
+    const sender = senderRecord
+      ? buildChatUserIdentity(senderRecord, senderPremiumVisibility)
+      : null;
     let realtimeEnvelopes: RealtimeEnvelope[] = [];
     const cacheTags = messageCacheTags(message);
     const updated = await prisma.$transaction(async (tx) => {
@@ -1215,7 +1202,11 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
 
     await invalidateChatCaches(cacheTags);
     emitRealtimeEnvelopes(realtimeEnvelopes);
-    res.status(200).json(mapMessagePayload(updated, sender, []));
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
+    res.status(200).json(mapMessagePayload(updated, sender, [], {
+      viewerUserId: req.user.userId,
+      viewerCanUseReadReceipts,
+    }));
   } catch (error) {
     console.error('editMessage error:', error);
     res.status(500).json({ error: 'Failed to edit message' });
@@ -1426,7 +1417,12 @@ export const searchMessages = async (req: AuthRequest, res: Response): Promise<v
       take: limit,
     });
 
-    res.status(200).json({ messages });
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
+    res.status(200).json({
+      messages: messages.map((message) =>
+        maskReadReceiptForViewer(message, req.user!.userId, viewerCanUseReadReceipts)
+      ),
+    });
   } catch (error) {
     console.error('searchMessages error:', error);
     res.status(500).json({ error: 'Failed to search messages' });
@@ -1551,20 +1547,31 @@ export const getMessageRequests = async (req: AuthRequest, res: Response): Promi
 
     const hasMore = messageRequests.length > limit;
     const results = hasMore ? messageRequests.slice(0, -1) : messageRequests;
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds(
+      results.flatMap((conv) => [conv.participant1Id, conv.participant2Id])
+    );
 
     const formatted = results.map((conv) => {
       const convWithRelations = conv as typeof conv & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown; messages: unknown[] };
+      const participant1 = buildChatUserIdentity(
+        convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+        premiumVisibilityByUser
+      );
+      const participant2 = buildChatUserIdentity(
+        convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+        premiumVisibilityByUser
+      );
       const otherParticipant =
         conv.participant1Id === req.user!.userId
-          ? convWithRelations.users_conversations_participant2IdTousers
-          : convWithRelations.users_conversations_participant1IdTousers;
+          ? participant2
+          : participant1;
 
       return {
         id: conv.id,
         participant1Id: conv.participant1Id,
         participant2Id: conv.participant2Id,
-        participant1: convWithRelations.users_conversations_participant1IdTousers,
-        participant2: convWithRelations.users_conversations_participant2IdTousers,
+        participant1,
+        participant2,
         otherParticipant,
         lastMessage: convWithRelations.messages[0] || null,
         lastMessageAt: conv.lastMessageAt?.toISOString() || null,
@@ -1670,10 +1677,22 @@ export const acceptMessageRequest = async (req: AuthRequest, res: Response): Pro
     }
 
     const convWithRelations = conversation as typeof conversation & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown };
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
+      conversation.participant1Id,
+      conversation.participant2Id,
+    ]);
+    const participant1 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant1IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
+    const participant2 = buildChatUserIdentity(
+      convWithRelations.users_conversations_participant2IdTousers as { id?: string | null; profileBadgeStyle?: string | null },
+      premiumVisibilityByUser
+    );
     const otherParticipant =
       conversation.participant1Id === req.user.userId
-        ? convWithRelations.users_conversations_participant2IdTousers
-        : convWithRelations.users_conversations_participant1IdTousers;
+        ? participant2
+        : participant1;
 
     res.status(200).json({
       message: 'Message request accepted',
@@ -1681,8 +1700,8 @@ export const acceptMessageRequest = async (req: AuthRequest, res: Response): Pro
         id: conversation.id,
         participant1Id: conversation.participant1Id,
         participant2Id: conversation.participant2Id,
-        participant1: convWithRelations.users_conversations_participant1IdTousers,
-        participant2: convWithRelations.users_conversations_participant2IdTousers,
+        participant1,
+        participant2,
         otherParticipant,
         lastMessage: null,
         lastMessageAt: conversation.lastMessageAt?.toISOString() || null,

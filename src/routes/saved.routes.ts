@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
 import {
   getSaved,
+  getSavedProfiles,
   toggleSave,
   savePost,
   unsavePost,
@@ -12,6 +13,7 @@ const router = Router();
 router.use(authenticate);
 
 router.get('/', getSaved);
+router.get('/profiles', getSavedProfiles);
 router.get('/:postId/check', checkSaved);
 router.post('/:postId/toggle', toggleSave);
 router.post('/:postId', savePost);

@@ -112,6 +112,48 @@ export function hashOpaqueToken(token: string): string {
   return `sha256:${digest}`;
 }
 
+function getOtpSecret(): string {
+  const secret = process.env.AUTH_OTP_PEPPER?.trim() || process.env.JWT_SECRET?.trim();
+  if (!secret) {
+    throw new Error('AUTH_OTP_PEPPER or JWT_SECRET is required for email OTP verification');
+  }
+  if (process.env.NODE_ENV === 'production' && secret.length < 32) {
+    throw new Error('AUTH_OTP_PEPPER must be at least 32 characters in production');
+  }
+  return secret;
+}
+
+export function generateEmailOtpCode(): string {
+  return crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+}
+
+export function normalizeEmailOtpCode(code: string | null | undefined): string {
+  return String(code || '').replace(/\s+/g, '').trim();
+}
+
+export function hashEmailOtp(email: string, code: string): string {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const normalizedCode = normalizeEmailOtpCode(code);
+  const digest = crypto
+    .createHmac('sha256', getOtpSecret())
+    .update(`${normalizedEmail}:${normalizedCode}`, 'utf8')
+    .digest('hex');
+  return `otp:v1:${digest}`;
+}
+
+export function verifyEmailOtp(email: string, code: string, storedHash: string | null): boolean {
+  if (!storedHash?.startsWith('otp:v1:')) {
+    return false;
+  }
+  const expected = hashEmailOtp(email, code);
+  const expectedBuffer = Buffer.from(expected);
+  const storedBuffer = Buffer.from(storedHash);
+  return (
+    expectedBuffer.length === storedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, storedBuffer)
+  );
+}
+
 export function verifyOpaqueToken(token: string, storedHash: string): boolean {
   const expected = hashOpaqueToken(token);
   const expectedBuffer = Buffer.from(expected);

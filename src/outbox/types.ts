@@ -8,6 +8,7 @@ export interface OutboxEventInput {
   queueName: QueueName;
   payload: Record<string, unknown>;
   availableAt?: Date;
+  idempotencyKey?: string;
 }
 
 export type CacheInvalidationPayload =

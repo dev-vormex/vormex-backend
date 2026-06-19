@@ -149,7 +149,55 @@ export const getMentorships = async (
       return;
     }
 
-    res.json({ mentorships: [] });
+    const matches = await prisma.mentorship_matches.findMany({
+      where: {
+        OR: [{ mentorId: userId }, { menteeId: userId }],
+      },
+      orderBy: [{ startedAt: 'desc' }],
+      include: {
+        users_mentorship_matches_mentorIdTousers: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            profileImage: true,
+            headline: true,
+            college: true,
+          },
+        },
+        users_mentorship_matches_menteeIdTousers: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            profileImage: true,
+            headline: true,
+            college: true,
+          },
+        },
+      },
+    });
+
+    res.json({
+      mentorships: matches.map((match) => {
+        const isMentor = match.mentorId === userId;
+        const otherUser = isMentor
+          ? match.users_mentorship_matches_menteeIdTousers
+          : match.users_mentorship_matches_mentorIdTousers;
+
+        return {
+          id: match.id,
+          skill: match.skill,
+          status: match.status,
+          sessionsCompleted: match.sessionsCompleted,
+          rating: match.rating,
+          role: isMentor ? 'mentor' : 'mentee',
+          startedAt: match.startedAt.toISOString(),
+          completedAt: match.completedAt?.toISOString() ?? null,
+          partner: otherUser,
+        };
+      }),
+    });
   } catch (error) {
     console.error('Error fetching mentorships:', error);
     res.status(500).json({ error: 'Failed to fetch mentorships' });

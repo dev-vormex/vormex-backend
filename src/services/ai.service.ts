@@ -5,6 +5,10 @@ import {
   AI_UNTRUSTED_INPUT_POLICY,
   wrapUntrustedPromptContent,
 } from '../utils/input-security.util';
+import {
+  executeWithCircuitBreaker,
+  isThirdPartyHttpError,
+} from '../utils/http-client-with-breaker.util';
 
 type ChatRole = 'system' | 'user' | 'assistant';
 type AIReasoningEffort = 'none' | 'low' | 'medium' | 'high';
@@ -225,9 +229,17 @@ class AIService {
         requestBody.temperature = options.temperature ?? 0.7;
       }
 
-      const response = await this.client.responses.create(requestBody, {
-        timeout: timeoutMs,
-      });
+      const response = await executeWithCircuitBreaker(
+        'openai',
+        'responses_create',
+        () => this.client!.responses.create(requestBody, {
+          timeout: timeoutMs,
+        }),
+        {
+          connectTimeoutMs: 5_000,
+          requestTimeoutMs: timeoutMs,
+        }
+      );
       const text = extractOutputText(response);
 
       if (!text) {
@@ -305,6 +317,27 @@ class AIService {
         });
 
         throw mappedError;
+      }
+
+      if (isThirdPartyHttpError(error)) {
+        logger.warn({
+          event: 'ai.provider.degraded',
+          requestId: options.metadata.requestId,
+          route: options.metadata.route,
+          userId: options.metadata.userId,
+          model: this.modelName,
+          latencyMs,
+          provider: error.provider,
+          operation: error.operation,
+          code: error.code,
+          message: error.message,
+        });
+
+        throw new AIServiceError(error.message, {
+          code: 'ai_provider_unavailable',
+          statusCode: 503,
+          userMessage: 'AI is temporarily busy. Please try again shortly.',
+        });
       }
 
       const genericError = error as Error;

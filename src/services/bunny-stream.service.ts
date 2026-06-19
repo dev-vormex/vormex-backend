@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { requestWithBreaker } from '../utils/http-client-with-breaker.util';
 
 const BUNNY_API_KEY = process.env.BUNNY_STREAM_API_KEY!;
 const BUNNY_LIBRARY_ID = process.env.BUNNY_STREAM_LIBRARY_ID!;
@@ -49,11 +49,12 @@ class BunnyStreamService {
 
   async createVideo(title: string): Promise<CreateVideoResponse> {
     try {
-      const response = await axios.post(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos`,
-        { title },
-        { headers: this.getHeaders() }
-      );
+      const response = await requestWithBreaker<any>('bunny_stream', 'create_video', {
+        method: 'POST',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos`,
+        data: { title },
+        headers: this.getHeaders(),
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
       return {
         videoId: response.data.guid,
@@ -68,16 +69,17 @@ class BunnyStreamService {
   async getTusUploadUrl(videoId: string): Promise<string> {
     try {
       const expirationTime = Math.floor(Date.now() / 1000) + 3600;
-      const response = await axios.post(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
-        {
+      await requestWithBreaker('bunny_stream', 'get_tus_upload_url', {
+        method: 'POST',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
+        data: {
           AuthorizationSignature: '', // Will be generated
           AuthorizationExpire: expirationTime,
           VideoId: videoId,
           LibraryId: BUNNY_LIBRARY_ID,
         },
-        { headers: this.getHeaders() }
-      );
+        headers: this.getHeaders(),
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
       return `https://video.bunnycdn.com/tusupload?libraryId=${BUNNY_LIBRARY_ID}&videoId=${videoId}&expirationTime=${expirationTime}`;
     } catch (error: any) {
@@ -88,10 +90,11 @@ class BunnyStreamService {
 
   async getVideo(videoId: string): Promise<BunnyVideoInfo> {
     try {
-      const response = await axios.get(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
-        { headers: this.getHeaders() }
-      );
+      const response = await requestWithBreaker<BunnyVideoInfo>('bunny_stream', 'get_video', {
+        method: 'GET',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
+        headers: this.getHeaders(),
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 8_000 });
       return response.data;
     } catch (error: any) {
       console.error('Bunny Stream get video error:', error.response?.data || error.message);
@@ -101,18 +104,17 @@ class BunnyStreamService {
 
   async uploadVideo(videoId: string, buffer: Buffer): Promise<void> {
     try {
-      await axios.put(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
-        buffer,
-        {
-          headers: {
-            AccessKey: BUNNY_API_KEY,
-            'Content-Type': 'application/octet-stream',
-          },
-          maxBodyLength: Infinity,
-          maxContentLength: Infinity,
-        }
-      );
+      await requestWithBreaker('bunny_stream', 'upload_video', {
+        method: 'PUT',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
+        data: buffer,
+        headers: {
+          AccessKey: BUNNY_API_KEY,
+          'Content-Type': 'application/octet-stream',
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 20_000 });
     } catch (error: any) {
       console.error('Bunny Stream upload error:', error.response?.data || error.message);
       throw new Error('Failed to upload video to Bunny Stream');
@@ -121,10 +123,11 @@ class BunnyStreamService {
 
   async deleteVideo(videoId: string): Promise<void> {
     try {
-      await axios.delete(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
-        { headers: this.getHeaders() }
-      );
+      await requestWithBreaker('bunny_stream', 'delete_video', {
+        method: 'DELETE',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
+        headers: this.getHeaders(),
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 8_000 });
     } catch (error: any) {
       console.error('Bunny Stream delete error:', error.response?.data || error.message);
       if (error.response?.status !== 404) {
@@ -135,11 +138,12 @@ class BunnyStreamService {
 
   async setThumbnail(videoId: string, thumbnailUrl: string): Promise<void> {
     try {
-      await axios.post(
-        `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}/thumbnail?thumbnailUrl=${encodeURIComponent(thumbnailUrl)}`,
-        {},
-        { headers: this.getHeaders() }
-      );
+      await requestWithBreaker('bunny_stream', 'set_thumbnail', {
+        method: 'POST',
+        url: `${this.apiBaseUrl}/${BUNNY_LIBRARY_ID}/videos/${videoId}/thumbnail?thumbnailUrl=${encodeURIComponent(thumbnailUrl)}`,
+        data: {},
+        headers: this.getHeaders(),
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 8_000 });
     } catch (error: any) {
       console.error('Bunny Stream set thumbnail error:', error.response?.data || error.message);
     }

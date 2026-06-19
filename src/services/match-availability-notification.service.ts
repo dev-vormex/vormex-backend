@@ -1,43 +1,29 @@
 import { prisma } from '../config/prisma';
 import { notificationService } from './notification.service';
 import { pushNotificationService } from './push-notification.service';
+import { getPremiumVisibilityByUserIds } from './premium-visibility.service';
+import {
+  MATCHING_ENGINE_USER_SELECT,
+  buildMatchingCandidateWhere,
+  buildRecommendedMatchCopy,
+  collectGoals,
+  collectInterests,
+  collectSkillNames,
+  collectSkillsToLearn,
+  getConnectedOrPendingUserIds,
+  getMatchNotificationCooldownHours,
+  getMatchNotificationLookbackDays,
+  getMatchNotificationMaxRecipients,
+  isStrongMatch,
+  rankUserMatches,
+  scoreUserMatch,
+  type MatchNotificationSource,
+  type MatchReasonKey,
+  type MatchingScore,
+  type MatchingSignalUser,
+} from './matching-engine.service';
 
-const DEFAULT_COOLDOWN_HOURS = 24;
-const DEFAULT_LOOKBACK_DAYS = 45;
-const DEFAULT_MAX_RECIPIENTS = 150;
-const RECENT_ACTIVITY_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-type MatchNotificationSource =
-  | 'signup'
-  | 'google_signup'
-  | 'profile_update'
-  | 'onboarding_update'
-  | 'onboarding_complete'
-  | 'skill_add'
-  | 'interest_add'
-  | 'interest_update';
-
-type MatchReasonKey = 'same_college' | 'same_goal' | 'shared_interests' | 'shared_skills';
-
-type MatchSignalUser = {
-  college: string | null;
-  createdAt: Date;
-  id: string;
-  interests: string[];
-  isBanned: boolean;
-  lastActiveAt: Date | null;
-  name: string;
-  skills: Array<{
-    skill: {
-      name: string;
-    };
-  }>;
-  user_onboarding: {
-    primaryGoal: string | null;
-  } | null;
-};
-
-type RecipientSignalUser = MatchSignalUser;
+export type { MatchNotificationSource };
 
 export type MatchRecommendationScore = {
   primaryReason: MatchReasonKey;
@@ -45,12 +31,10 @@ export type MatchRecommendationScore = {
   sameCollege: boolean;
   sameGoal: boolean;
   score: number;
+  matchPercentage: number;
   sharedInterests: string[];
   sharedSkills: string[];
-};
-
-type MatchRecommendationCandidate = MatchRecommendationScore & {
-  userId: string;
+  whySummary: string;
 };
 
 export type MatchAvailabilityCopy = {
@@ -64,14 +48,11 @@ export type MatchAvailabilityNotificationResult = {
   subjectUserId: string;
 };
 
-function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
-  }
-
-  return Math.floor(parsed);
-}
+export type HighQualityMatchDigestResult = {
+  notified: number;
+  processed: number;
+  skipped: number;
+};
 
 function isMatchAvailabilityEnabled(): boolean {
   const raw = process.env.MATCH_AVAILABILITY_NOTIFICATIONS_ENABLED;
@@ -79,308 +60,81 @@ function isMatchAvailabilityEnabled(): boolean {
   return !['0', 'false', 'off', 'no'].includes(raw.trim().toLowerCase());
 }
 
-function normalizeText(value: string | null | undefined): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function uniqueNormalized(values: Array<string | null | undefined>): string[] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-
-  for (const value of values) {
-    const normalized = normalizeText(value)?.toLowerCase();
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-
-    seen.add(normalized);
-    unique.push(normalized);
-  }
-
-  return unique;
-}
-
-function collectSkillNames(user: Pick<MatchSignalUser, 'skills'>): string[] {
-  return uniqueNormalized(user.skills.map((entry) => entry.skill?.name));
-}
-
-function collectInterestNames(user: Pick<MatchSignalUser, 'interests'>): string[] {
-  return uniqueNormalized(user.interests || []);
-}
-
-function intersectValues(primary: string[], secondary: string[]): string[] {
-  const secondarySet = new Set(uniqueNormalized(secondary));
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const value of primary) {
-    const normalized = normalizeText(value);
-    const key = normalized?.toLowerCase();
-    if (!normalized || !key || !secondarySet.has(key) || seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    result.push(normalized);
-  }
-
-  return result;
-}
-
-function formatListPreview(items: string[]): string {
-  if (items.length <= 0) {
-    return 'something valuable';
-  }
-
-  if (items.length === 1) {
-    return items[0];
-  }
-
-  if (items.length === 2) {
-    return `${items[0]} and ${items[1]}`;
-  }
-
-  return `${items[0]}, ${items[1]}, and ${items.length - 2} more`;
-}
-
-function isFreshJoin(subjectUser: Pick<MatchSignalUser, 'createdAt'>, source: MatchNotificationSource, now: Date): boolean {
-  if (source === 'signup' || source === 'google_signup') {
-    return true;
-  }
-
-  return now.getTime() - subjectUser.createdAt.getTime() <= RECENT_ACTIVITY_WINDOW_MS;
-}
-
-export function scoreMatchRecommendation(
-  subjectUser: MatchSignalUser,
-  recipientUser: RecipientSignalUser,
-  now: Date = new Date()
-): MatchRecommendationScore {
-  const subjectCollege = normalizeText(subjectUser.college)?.toLowerCase();
-  const recipientCollege = normalizeText(recipientUser.college)?.toLowerCase();
-  const subjectGoal = normalizeText(subjectUser.user_onboarding?.primaryGoal)?.toLowerCase();
-  const recipientGoal = normalizeText(recipientUser.user_onboarding?.primaryGoal)?.toLowerCase();
-  const sharedInterests = intersectValues(subjectUser.interests || [], recipientUser.interests || []);
-  const sharedSkills = intersectValues(
-    subjectUser.skills.map((entry) => entry.skill?.name || ''),
-    recipientUser.skills.map((entry) => entry.skill?.name || '')
+function hasMatchingSignals(user: MatchingSignalUser): boolean {
+  return (
+    Boolean(user.college || user.currentCity || user.location) ||
+    collectSkillNames(user).length > 0 ||
+    collectSkillsToLearn(user).length > 0 ||
+    collectInterests(user).length > 0 ||
+    collectGoals(user).length > 0
   );
+}
 
-  const sameCollege = Boolean(subjectCollege && recipientCollege && subjectCollege === recipientCollege);
-  const sameGoal = Boolean(subjectGoal && recipientGoal && subjectGoal === recipientGoal);
-
-  let score = 0;
-  const reasonKeys: MatchReasonKey[] = [];
-
-  if (sameCollege) {
-    score += 25;
-    reasonKeys.push('same_college');
-  }
-
-  if (sharedSkills.length > 0) {
-    score += Math.min(3, sharedSkills.length) * 18;
-    reasonKeys.push('shared_skills');
-  }
-
-  if (sharedInterests.length > 0) {
-    score += Math.min(3, sharedInterests.length) * 12;
-    reasonKeys.push('shared_interests');
-  }
-
-  if (sameGoal) {
-    score += 20;
-    reasonKeys.push('same_goal');
-  }
-
-  if (
-    recipientUser.lastActiveAt &&
-    now.getTime() - recipientUser.lastActiveAt.getTime() <= RECENT_ACTIVITY_WINDOW_MS
-  ) {
-    score += 5;
-  }
-
-  const primaryReason = reasonKeys[0] || 'shared_interests';
-
+function toMatchRecommendationScore(match: MatchingScore): MatchRecommendationScore {
   return {
-    primaryReason,
-    reasonKeys,
-    sameCollege,
-    sameGoal,
-    score,
-    sharedInterests,
-    sharedSkills,
+    primaryReason: match.primaryReason,
+    reasonKeys: match.reasonKeys,
+    sameCollege: match.reasonKeys.includes('same_college'),
+    sameGoal: match.reasonKeys.includes('same_goal'),
+    score: match.score,
+    matchPercentage: match.matchPercentage,
+    sharedInterests: match.sharedSignals.interests,
+    sharedSkills: match.sharedSignals.skills,
+    whySummary: match.whyMatched.summary,
   };
 }
 
+export function scoreMatchRecommendation(
+  subjectUser: MatchingSignalUser,
+  recipientUser: MatchingSignalUser,
+  now: Date = new Date()
+): MatchRecommendationScore {
+  const match = scoreUserMatch(recipientUser, subjectUser, { now });
+  return toMatchRecommendationScore(match);
+}
+
+function formatListPreview(items: string[]): string {
+  if (items.length <= 0) return 'matching signals';
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items[0]}, ${items[1]}, and ${items.length - 2} more`;
+}
+
 export function buildMatchAvailabilityCopy(
-  subjectUser: MatchSignalUser,
+  subjectUser: MatchingSignalUser,
   recommendation: MatchRecommendationScore,
   source: MatchNotificationSource,
   now: Date = new Date()
 ): MatchAvailabilityCopy {
-  const freshJoin = isFreshJoin(subjectUser, source, now);
-  const subjectName = normalizeText(subjectUser.name) || 'A new builder';
-  const college = normalizeText(subjectUser.college);
-  const goal = normalizeText(subjectUser.user_onboarding?.primaryGoal);
+  const pseudoMatch = {
+    candidate: subjectUser,
+    matchPercentage: recommendation.matchPercentage ?? Math.round(recommendation.score),
+    primaryReason: recommendation.primaryReason,
+    sharedSignals: {
+      skills: recommendation.sharedSkills,
+      interests: recommendation.sharedInterests,
+      goals: recommendation.sameGoal ? collectGoals(subjectUser).slice(0, 2) : [],
+      locationLabel: recommendation.sameCollege ? subjectUser.college : null,
+    },
+    whyMatched: {
+      summary: recommendation.whySummary || (
+        recommendation.sharedSkills.length > 0
+          ? `${subjectUser.name} shares ${formatListPreview(recommendation.sharedSkills)} with you.`
+          : `${subjectUser.name} is a strong match for you.`
+      ),
+      bullets: [],
+      scorecard: [],
+    },
+  } as MatchingScore;
 
-  if (recommendation.sameCollege && college) {
-    return {
-      title: freshJoin ? `Someone from ${college} just joined` : `A strong match from ${college} is ready`,
-      body: freshJoin
-        ? `${subjectName} just joined Vormex from ${college}. Open Find People and connect early.`
-        : `${subjectName} now matches you through ${college}. Open Find People and start the conversation.`,
-    };
-  }
-
-  if (recommendation.sharedSkills.length > 0) {
-    const skillsPreview = formatListPreview(recommendation.sharedSkills.slice(0, 3));
-    return {
-      title: `${skillsPreview} match on Vormex`,
-      body: freshJoin
-        ? `${subjectName} just joined and shares ${skillsPreview} with you. This is a strong match worth opening.`
-        : `${subjectName} now lines up with you on ${skillsPreview}. Open Find People before this goes cold.`,
-    };
-  }
-
-  if (recommendation.sharedInterests.length > 0) {
-    const interestsPreview = formatListPreview(recommendation.sharedInterests.slice(0, 3));
-    return {
-      title: `${interestsPreview} people are here`,
-      body: freshJoin
-        ? `${subjectName} just joined and shares interests like ${interestsPreview}. Go say hi while the timing is perfect.`
-        : `${subjectName} is now a better match for you through ${interestsPreview}. Open Find People and connect.`,
-    };
-  }
-
-  if (recommendation.sameGoal && goal) {
-    return {
-      title: `${goal} match available`,
-      body: freshJoin
-        ? `${subjectName} just joined and is chasing ${goal} too. Open Find People and build together.`
-        : `${subjectName} now shares your goal: ${goal}. Open Find People and turn it into a real connection.`,
-    };
-  }
-
-  return {
-    title: 'New recommended match on Vormex',
-    body: freshJoin
-      ? `${subjectName} just joined and looks like a useful match for you. Open Find People and connect early.`
-      : `${subjectName} is now showing up as a stronger match for you. Open Find People and check it out.`,
-  };
+  return buildRecommendedMatchCopy(subjectUser, pseudoMatch, source, now);
 }
 
-async function loadSubjectUser(userId: string): Promise<MatchSignalUser | null> {
+async function loadMatchingUser(userId: string): Promise<MatchingSignalUser | null> {
   return prisma.user.findUnique({
     where: { id: userId },
-    select: {
-      college: true,
-      createdAt: true,
-      id: true,
-      interests: true,
-      isBanned: true,
-      lastActiveAt: true,
-      name: true,
-      skills: {
-        select: {
-          skill: {
-            select: {
-              name: true,
-            },
-          },
-        },
-      },
-      user_onboarding: {
-        select: {
-          primaryGoal: true,
-        },
-      },
-    },
-  });
-}
-
-async function loadConnectedIds(userId: string): Promise<string[]> {
-  const connections = await prisma.connections.findMany({
-    where: {
-      OR: [{ requesterId: userId }, { addresseeId: userId }],
-    },
-    select: {
-      addresseeId: true,
-      requesterId: true,
-    },
-  });
-
-  const excluded = new Set<string>([userId]);
-  for (const connection of connections) {
-    excluded.add(connection.requesterId);
-    excluded.add(connection.addresseeId);
-  }
-
-  return Array.from(excluded);
-}
-
-function buildCandidateWhere(subjectUser: MatchSignalUser, excludedIds: string[], lookbackBoundary: Date) {
-  const matchClauses: Array<Record<string, unknown>> = [];
-  const subjectCollege = normalizeText(subjectUser.college);
-  const subjectGoal = normalizeText(subjectUser.user_onboarding?.primaryGoal);
-  const subjectInterests = collectInterestNames(subjectUser);
-  const subjectSkills = collectSkillNames(subjectUser);
-
-  if (subjectCollege) {
-    matchClauses.push({ college: subjectCollege });
-  }
-
-  if (subjectInterests.length > 0) {
-    matchClauses.push({ interests: { hasSome: subjectUser.interests } });
-  }
-
-  if (subjectGoal) {
-    matchClauses.push({
-      user_onboarding: {
-        is: {
-          primaryGoal: subjectGoal,
-        },
-      },
-    });
-  }
-
-  if (subjectSkills.length > 0) {
-    matchClauses.push({
-      OR: subjectSkills.map((skill) => ({
-        skills: {
-          some: {
-            skill: {
-              name: {
-                equals: skill,
-                mode: 'insensitive',
-              },
-            },
-          },
-        },
-      })),
-    });
-  }
-
-  if (matchClauses.length === 0) {
-    return null;
-  }
-
-  return {
-    AND: [
-      {
-        OR: matchClauses,
-      },
-      {
-        OR: [
-          { lastActiveAt: { gte: lookbackBoundary } },
-          { createdAt: { gte: lookbackBoundary } },
-        ],
-      },
-    ],
-    id: { notIn: excludedIds },
-    isBanned: false,
-  };
+    select: MATCHING_ENGINE_USER_SELECT,
+  }) as Promise<MatchingSignalUser | null>;
 }
 
 async function loadRecentlyNotifiedRecipients(
@@ -388,9 +142,7 @@ async function loadRecentlyNotifiedRecipients(
   actorId: string,
   cooldownBoundary: Date
 ): Promise<Set<string>> {
-  if (recipientIds.length === 0) {
-    return new Set<string>();
-  }
+  if (recipientIds.length === 0) return new Set<string>();
 
   const recent = await prisma.notifications.findMany({
     where: {
@@ -399,30 +151,43 @@ async function loadRecentlyNotifiedRecipients(
       type: 'recommended_match',
       userId: { in: recipientIds },
     },
-    select: {
-      userId: true,
-    },
+    select: { userId: true },
     distinct: ['userId'],
   });
 
   return new Set(recent.map((entry) => entry.userId));
 }
 
+async function hasRecentRecommendedMatchForUser(userId: string, boundary: Date): Promise<boolean> {
+  const recent = await prisma.notifications.findFirst({
+    where: {
+      userId,
+      type: 'recommended_match',
+      createdAt: { gte: boundary },
+    },
+    select: { id: true },
+  });
+  return Boolean(recent);
+}
+
 async function notifyRecipientAboutMatch(
   recipientUserId: string,
-  subjectUser: MatchSignalUser,
-  recommendation: MatchRecommendationCandidate,
+  subjectUser: MatchingSignalUser,
+  match: MatchingScore,
   source: MatchNotificationSource,
   now: Date
 ): Promise<void> {
-  const copy = buildMatchAvailabilityCopy(subjectUser, recommendation, source, now);
+  const copy = buildRecommendedMatchCopy(subjectUser, match, source, now);
   const notificationData = {
-    matchReasons: recommendation.reasonKeys,
-    matchScore: recommendation.score,
+    matchReasons: match.reasonKeys,
+    matchScore: match.matchPercentage,
+    matchPercentage: match.matchPercentage,
     matchUserId: subjectUser.id,
     screen: 'find_people',
     source,
     tab: 'smart_matches',
+    whySummary: match.whyMatched.summary,
+    sharedSignals: match.sharedSignals,
   };
 
   await Promise.all([
@@ -435,12 +200,13 @@ async function notifyRecipientAboutMatch(
     ),
     pushNotificationService.pushRecommendedMatch(recipientUserId, copy.title, copy.body, {
       actorId: subjectUser.id,
-      matchReason: recommendation.primaryReason,
-      matchScore: String(recommendation.score),
+      matchReason: match.primaryReason,
+      matchScore: String(match.matchPercentage),
       matchUserId: subjectUser.id,
       screen: 'find_people',
       source,
       tab: 'smart_matches',
+      whySummary: match.whyMatched.summary,
     }),
   ]);
 }
@@ -451,134 +217,158 @@ export async function notifyUsersAboutMatchAvailability(
   now: Date = new Date()
 ): Promise<MatchAvailabilityNotificationResult> {
   if (!isMatchAvailabilityEnabled()) {
-    return {
-      notified: 0,
-      skipped: 0,
-      subjectUserId,
-    };
+    return { notified: 0, skipped: 0, subjectUserId };
   }
 
-  const subjectUser = await loadSubjectUser(subjectUserId);
-  if (!subjectUser || subjectUser.isBanned) {
-    return {
-      notified: 0,
-      skipped: 0,
-      subjectUserId,
-    };
+  const subjectUser = await loadMatchingUser(subjectUserId);
+  if (!subjectUser || subjectUser.isBanned || !hasMatchingSignals(subjectUser)) {
+    return { notified: 0, skipped: 0, subjectUserId };
   }
 
-  const subjectCollege = normalizeText(subjectUser.college);
-  const subjectGoal = normalizeText(subjectUser.user_onboarding?.primaryGoal);
-  const subjectInterests = collectInterestNames(subjectUser);
-  const subjectSkills = collectSkillNames(subjectUser);
-
-  if (!subjectCollege && !subjectGoal && subjectInterests.length === 0 && subjectSkills.length === 0) {
-    return {
-      notified: 0,
-      skipped: 0,
-      subjectUserId,
-    };
-  }
-
-  const maxRecipients = parsePositiveInt(
-    process.env.MATCH_AVAILABILITY_NOTIFICATIONS_MAX_RECIPIENTS,
-    DEFAULT_MAX_RECIPIENTS
-  );
-  const lookbackDays = parsePositiveInt(
-    process.env.MATCH_AVAILABILITY_NOTIFICATIONS_LOOKBACK_DAYS,
-    DEFAULT_LOOKBACK_DAYS
-  );
-  const cooldownHours = parsePositiveInt(
-    process.env.MATCH_AVAILABILITY_NOTIFICATIONS_COOLDOWN_HOURS,
-    DEFAULT_COOLDOWN_HOURS
-  );
+  const maxRecipients = getMatchNotificationMaxRecipients();
+  const lookbackDays = getMatchNotificationLookbackDays();
+  const cooldownHours = getMatchNotificationCooldownHours();
   const lookbackBoundary = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
   const cooldownBoundary = new Date(now.getTime() - cooldownHours * 60 * 60 * 1000);
-  const excludedIds = await loadConnectedIds(subjectUserId);
-  const candidateWhere = buildCandidateWhere(subjectUser, excludedIds, lookbackBoundary);
-
-  if (!candidateWhere) {
-    return {
-      notified: 0,
-      skipped: 0,
-      subjectUserId,
-    };
-  }
+  const excludedIds = await getConnectedOrPendingUserIds(subjectUserId);
+  const candidateWhere = buildMatchingCandidateWhere(subjectUser, {
+    excludedIds,
+    lookbackBoundary,
+  });
 
   const recipients = await prisma.user.findMany({
     where: candidateWhere as any,
     orderBy: [{ lastActiveAt: 'desc' }, { createdAt: 'desc' }],
-    select: {
-      college: true,
-      createdAt: true,
-      id: true,
-      interests: true,
-      isBanned: true,
-      lastActiveAt: true,
-      name: true,
-      skills: {
-        select: {
-          skill: {
-            select: {
-              name: true,
-            },
-          },
-        },
-      },
-      user_onboarding: {
-        select: {
-          primaryGoal: true,
-        },
-      },
-    },
+    select: MATCHING_ENGINE_USER_SELECT,
     take: Math.max(maxRecipients * 4, maxRecipients),
-  });
+  }) as MatchingSignalUser[];
 
+  if (recipients.length === 0) {
+    return { notified: 0, skipped: 0, subjectUserId };
+  }
+
+  const visibilityByUser = await getPremiumVisibilityByUserIds([subjectUser.id]);
+  const subjectVisibility = visibilityByUser.get(subjectUser.id);
   const scoredCandidates = recipients
     .map((recipient) => ({
-      userId: recipient.id,
-      ...scoreMatchRecommendation(subjectUser, recipient as RecipientSignalUser, now),
+      recipient,
+      match: scoreUserMatch(recipient, subjectUser, {
+        candidateVisibility: subjectVisibility,
+        now,
+      }),
     }))
-    .filter((candidate) => candidate.score > 0)
-    .sort((left, right) => right.score - left.score)
+    .filter(({ match }) => isStrongMatch(match))
+    .sort((left, right) =>
+      right.match.matchPercentage - left.match.matchPercentage ||
+      right.match.score - left.match.score
+    )
     .slice(0, maxRecipients);
 
   const recentlyNotified = await loadRecentlyNotifiedRecipients(
-    scoredCandidates.map((candidate) => candidate.userId),
+    scoredCandidates.map((candidate) => candidate.recipient.id),
     subjectUser.id,
     cooldownBoundary
   );
 
   let notified = 0;
   let skipped = 0;
-
   const batchSize = 10;
+
   for (let index = 0; index < scoredCandidates.length; index += batchSize) {
     const batch = scoredCandidates.slice(index, index + batchSize);
     const results = await Promise.allSettled(
-      batch.map(async (candidate) => {
-        if (recentlyNotified.has(candidate.userId)) {
+      batch.map(async ({ recipient, match }) => {
+        const recipientUserId = recipient.id;
+        if (recentlyNotified.has(recipientUserId)) {
           skipped += 1;
           return;
         }
 
-        await notifyRecipientAboutMatch(candidate.userId, subjectUser, candidate, source, now);
+        await notifyRecipientAboutMatch(recipientUserId, subjectUser, match, source, now);
         notified += 1;
       })
     );
 
     results.forEach((result) => {
-      if (result.status === 'rejected') {
-        skipped += 1;
-      }
+      if (result.status === 'rejected') skipped += 1;
     });
   }
 
-  return {
-    notified,
-    skipped,
-    subjectUserId,
-  };
+  return { notified, skipped, subjectUserId };
+}
+
+export async function runHighQualityMatchDigest(now: Date = new Date()): Promise<HighQualityMatchDigestResult> {
+  if (!isMatchAvailabilityEnabled()) {
+    return { processed: 0, notified: 0, skipped: 0 };
+  }
+
+  const usersWithTokens = await prisma.device_tokens.findMany({
+    where: { isActive: true },
+    select: { userId: true },
+    distinct: ['userId'],
+  });
+
+  let processed = 0;
+  let notified = 0;
+  let skipped = 0;
+  const oneDayBoundary = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+
+  for (const tokenOwner of usersWithTokens) {
+    processed += 1;
+    try {
+      const currentUser = await loadMatchingUser(tokenOwner.userId);
+      if (!currentUser || currentUser.isBanned || !hasMatchingSignals(currentUser)) {
+        skipped += 1;
+        continue;
+      }
+      if (await hasRecentRecommendedMatchForUser(currentUser.id, oneDayBoundary)) {
+        skipped += 1;
+        continue;
+      }
+
+      const excludedIds = await getConnectedOrPendingUserIds(currentUser.id);
+      const where = buildMatchingCandidateWhere(currentUser, { excludedIds });
+      const candidates = await prisma.user.findMany({
+        where: where as any,
+        orderBy: [{ lastActiveAt: 'desc' }, { createdAt: 'desc' }],
+        select: MATCHING_ENGINE_USER_SELECT,
+        take: 80,
+      }) as MatchingSignalUser[];
+
+      if (candidates.length === 0) {
+        skipped += 1;
+        continue;
+      }
+
+      const visibilityByUser = await getPremiumVisibilityByUserIds(candidates.map((candidate) => candidate.id));
+      const topMatch = rankUserMatches(currentUser, candidates, { visibilityByUser, now })
+        .find(isStrongMatch);
+
+      if (!topMatch) {
+        skipped += 1;
+        continue;
+      }
+
+      const cooldownBoundary = new Date(now.getTime() - getMatchNotificationCooldownHours() * 60 * 60 * 1000);
+      const alreadyNotified = await loadRecentlyNotifiedRecipients(
+        [currentUser.id],
+        topMatch.candidate.id,
+        cooldownBoundary
+      );
+      if (alreadyNotified.has(currentUser.id)) {
+        skipped += 1;
+        continue;
+      }
+
+      await notifyRecipientAboutMatch(currentUser.id, topMatch.candidate, topMatch, 'daily_digest', now);
+      notified += 1;
+    } catch (error) {
+      skipped += 1;
+      console.error(`Failed to send high-quality match digest to ${tokenOwner.userId}:`, error);
+    }
+  }
+
+  return { processed, notified, skipped };
 }
 
 export function queueMatchAvailabilityNotifications(

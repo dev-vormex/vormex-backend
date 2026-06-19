@@ -6,6 +6,8 @@ import { runHackathonWeeklyDigest } from './hackathon-digest.service';
 import { runReengagementCampaign } from './reengagement-notification.service';
 import { socialProofService } from './social-proof.service';
 import { storyService } from './story.service';
+import { runSavedDiscoverySearchDigest } from './discovery-power.service';
+import { runHighQualityMatchDigest } from './match-availability-notification.service';
 
 export const maintenanceSchedules = [
   {
@@ -32,6 +34,16 @@ export const maintenanceSchedules = [
     schedulerId: 'hackathon_external_import',
     jobName: 'hackathon_external_import',
     pattern: '15 */6 * * *',
+  },
+  {
+    schedulerId: 'saved_discovery_search_digest',
+    jobName: 'saved_discovery_search_digest',
+    pattern: '45 18 * * *',
+  },
+  {
+    schedulerId: 'daily_high_quality_match_digest',
+    jobName: 'daily_high_quality_match_digest',
+    pattern: '15 18 * * *',
   },
   {
     schedulerId: 'social_proof_leaderboard',
@@ -167,6 +179,10 @@ export async function runMaintenanceJob(jobName: MaintenanceJobName): Promise<un
       return runHackathonWeeklyDigest();
     case 'hackathon_external_import':
       return importExternalHackathons();
+    case 'saved_discovery_search_digest':
+      return runSavedDiscoverySearchDigest();
+    case 'daily_high_quality_match_digest':
+      return runHighQualityMatchDigest();
     case 'social_proof_leaderboard':
       return socialProofService.runLeaderboardCron();
     case 'social_proof_trending':

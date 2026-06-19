@@ -2,6 +2,11 @@ import { createHash } from 'crypto';
 import { Request, Response } from 'express';
 import { prisma, prismaRead } from '../config/prisma';
 import { cacheService } from '../services/cache.service';
+import {
+  assertUsersCanInteract,
+  getBlockedUserIds,
+  safetyErrorResponse,
+} from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -16,8 +21,11 @@ const normalizeMentionSearch = (value: unknown): string => {
   return value.trim().replace(/\s+/g, ' ').slice(0, 50);
 };
 
-const mentionSearchCacheKey = (query: string, limit: number): string =>
-  `mentions:search:v1:${createHash('sha256').update(query.toLowerCase()).digest('hex').slice(0, 24)}:${limit}`;
+const mentionSearchCacheKey = (query: string, limit: number, userId: string): string =>
+  `mentions:search:v2:user:${createHash('sha256').update(userId).digest('hex').slice(0, 16)}:${createHash('sha256').update(query.toLowerCase()).digest('hex').slice(0, 24)}:${limit}`;
+
+const filterBlockedMentionUsers = <T extends { id?: unknown }>(users: T[], blockedUserIds: Set<string>): T[] =>
+  users.filter((user) => !user.id || !blockedUserIds.has(String(user.id)));
 
 /**
  * Search users for @mention autocomplete
@@ -30,6 +38,7 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const currentUserId = req.user.userId;
     const query = normalizeMentionSearch((req.query.q as string) || (req.query.query as string) || '');
     const parsedLimit = parseInt((req.query.limit as string) || '10', 10);
     const limit = Math.min(MENTION_SEARCH_MAX_LIMIT, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 10));
@@ -39,16 +48,19 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const cacheKey = mentionSearchCacheKey(query, limit);
+    const blockedUserIds = await getBlockedUserIds(currentUserId);
+    const blockedUserIdSet = new Set(blockedUserIds);
+    const cacheKey = mentionSearchCacheKey(query, limit, currentUserId);
     const cached = await cacheService.get<{ users: any[] }>(cacheKey);
     if (cached) {
       res.setHeader('X-Vormex-Cache', 'HIT');
-      res.json(cached);
+      res.json({ ...cached, users: filterBlockedMentionUsers(cached.users, blockedUserIdSet) });
       return;
     }
 
     const users = await prismaRead.user.findMany({
       where: {
+        id: { notIn: [currentUserId, ...blockedUserIds] },
         isBanned: false,
         OR: [
           { username: { startsWith: query, mode: 'insensitive' } },
@@ -64,6 +76,7 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
         profileImage: true,
         headline: true,
         isVerified: true,
+        profileBadgeStyle: true,
       },
       orderBy: [{ lastActiveAt: { sort: 'desc', nulls: 'last' } }, { id: 'asc' }],
       take: limit,
@@ -77,9 +90,10 @@ export const searchMentions = async (req: AuthRequest, res: Response): Promise<v
         avatar: u.profileImage,
         profileImage: u.profileImage,
         headline: u.headline,
-        verified: Boolean(u.isVerified),
-        isVerified: Boolean(u.isVerified),
-      })),
+      verified: Boolean(u.isVerified),
+      isVerified: Boolean(u.isVerified),
+      profileBadgeStyle: u.profileBadgeStyle ?? null,
+    })),
     };
 
     await cacheService.set(cacheKey, response, MENTION_SEARCH_CACHE_TTL_SECONDS, ['people:global']);
@@ -127,12 +141,27 @@ export const createMentions = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const uniqueUserIds = Array.from(
+      new Set(userIds.map((id) => String(id || '').trim()).filter(Boolean))
+    ).filter((id) => id !== req.user?.userId);
+
+    await Promise.all(
+      uniqueUserIds.map((targetUserId) =>
+        assertUsersCanInteract(req.user!.userId, targetUserId, 'mention')
+      )
+    );
+
     res.status(201).json({
       message: 'Mentions created (feature pending full implementation)',
-      count: userIds.length,
+      count: uniqueUserIds.length,
       mentions: [],
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('createMentions error:', error);
     res.status(500).json({ error: 'Failed to create mentions' });
   }

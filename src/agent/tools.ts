@@ -1,6 +1,9 @@
 import { randomUUID } from 'crypto';
 import { prisma } from '../config/prisma';
-import { getConnectionRequestLimitState } from '../services/tier-limits.service';
+import {
+  FREE_CONNECTION_REQUESTS_PER_DAY,
+  getConnectionRequestLimitState,
+} from '../services/tier-limits.service';
 import { AgentActionRecord, AgentToolExecutionContext, AgentToolResult, AgentUiIntent } from './types';
 import { evaluateToolExecutionPolicy, getAgentToolPolicy } from './action-policy.service';
 
@@ -1523,7 +1526,7 @@ export async function executeAgentTool(
       const limitState = await getConnectionRequestLimitState(ctx.userId);
       if (!limitState.allowed) {
         return {
-          summary: 'Free accounts can send up to 10 connection requests per month. Premium unlocks unlimited requests.',
+          summary: `Free accounts can send up to ${FREE_CONNECTION_REQUESTS_PER_DAY} connection requests per day. Premium unlocks unlimited requests.`,
           output: {
             status: 'blocked',
             reason: 'connection_request_limit_reached',
@@ -1536,7 +1539,7 @@ export async function executeAgentTool(
             toolName,
             status: 'blocked',
             title: 'Connection request limit reached',
-            summary: 'The monthly free connection request limit has been reached.',
+            summary: 'The daily free connection request limit has been reached.',
           }),
         };
       }

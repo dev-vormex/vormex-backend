@@ -3,6 +3,19 @@ import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
 import { cacheService } from '../services/cache.service';
+import {
+  applyPremiumVisibilityToUser,
+  getPremiumVisibilityByUserIds,
+  sortByPremiumVisibility,
+} from '../services/premium-visibility.service';
+import {
+  MATCHING_ENGINE_USER_SELECT,
+  buildMatchingCandidateWhere,
+  getConnectedOrPendingUserIds,
+  rankUserMatches,
+  serializeMatchedUser,
+} from '../services/matching-engine.service';
+import { getBlockedUserIds } from '../services/trust-safety.service';
 
 const SMART_MATCH_CACHE_VERSION = 'v1';
 const SMART_MATCH_CACHE_TTL_SECONDS = 60;
@@ -63,15 +76,7 @@ export const getSmartMatches = async (
 
     const currentUser = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        college: true,
-        branch: true,
-        interests: true,
-        graduationYear: true,
-        user_onboarding: {
-          select: { primaryGoal: true, wantToLearn: true, canTeach: true, lookingFor: true },
-        },
-      },
+      select: MATCHING_ENGINE_USER_SELECT,
     });
 
     if (!currentUser) {
@@ -79,143 +84,41 @@ export const getSmartMatches = async (
       return;
     }
 
-    const uo = currentUser.user_onboarding;
-    const myPrimaryGoal = uo?.primaryGoal ?? undefined;
-    const myLookingFor = Array.isArray(uo?.lookingFor) ? uo.lookingFor : [];
-    const myWantToLearn = Array.isArray(uo?.wantToLearn) ? uo.wantToLearn : [];
-    const myCanTeach = Array.isArray(uo?.canTeach) ? uo.canTeach : [];
-
-    const existingConnections = await prisma.connections.findMany({
-      where: {
-        OR: [{ requesterId: userId }, { addresseeId: userId }],
-      },
-      select: { requesterId: true, addresseeId: true },
+    const [excludeIds, blockedUserIds] = await Promise.all([
+      getConnectedOrPendingUserIds(userId),
+      getBlockedUserIds(userId),
+    ]);
+    const where = buildMatchingCandidateWhere(currentUser, {
+      type,
+      excludedIds: [...excludeIds, ...blockedUserIds],
     });
 
-    const excludeIds = new Set([userId]);
-    existingConnections.forEach((c) => {
-      excludeIds.add(c.requesterId);
-      excludeIds.add(c.addresseeId);
-    });
-
-    const where: any = {
-      id: { notIn: Array.from(excludeIds) },
-      isBanned: false,
-    };
-
-    if (type === 'same_campus' && currentUser.college) {
-      where.college = currentUser.college;
-    } else if (type === 'same_goal' && myPrimaryGoal) {
-      where.user_onboarding = { is: { primaryGoal: myPrimaryGoal } };
-    } else if (type === 'mentor' && myWantToLearn.length > 0) {
-      where.OR = [
-        { user_onboarding: { is: { canTeach: { hasSome: myWantToLearn } } } },
-        ...myWantToLearn.slice(0, 8).map((skill: string) => ({
-          skills: { some: { skill: { name: { contains: skill, mode: 'insensitive' } } } },
-        })),
-      ];
-    } else if (type === 'mentee' && myCanTeach.length > 0) {
-      where.user_onboarding = { is: { wantToLearn: { hasSome: myCanTeach } } };
-    }
-
-    const [users, total] = await Promise.all([
+    const candidateTake = Math.min(Math.max(skip + limit * 3, limit), 150);
+    const [candidateUsers, total] = await Promise.all([
       prisma.user.findMany({
         where,
-        skip,
-        take: limit,
+        skip: 0,
+        take: candidateTake,
         orderBy: [{ lastActiveAt: 'desc' }, { id: 'asc' }],
-        select: {
-          id: true,
-          username: true,
-          name: true,
-          profileImage: true,
-          headline: true,
-          isVerified: true,
-          college: true,
-          branch: true,
-          graduationYear: true,
-          interests: true,
-          bio: true,
-          githubConnected: true,
-          user_onboarding: {
-            select: { primaryGoal: true, wantToLearn: true, canTeach: true, lookingFor: true },
-          },
-          lastActiveAt: true,
-          skills: { select: { skill: { select: { name: true } }, proficiency: true } },
-          userStats: {
-            select: { connectionsCount: true, xp: true, level: true },
-          },
-        },
+        select: MATCHING_ENGINE_USER_SELECT,
       }),
       prisma.user.count({ where }),
     ]);
 
-    const matches = users.map((user) => {
-      const od = user.user_onboarding || {};
-      let score = 0;
-      const reasons: string[] = [];
-
-      if (currentUser.college && user.college === currentUser.college) {
-        score += 25;
-        reasons.push('Same college');
-      }
-      if (currentUser.branch && user.branch === currentUser.branch) {
-        score += 15;
-        reasons.push('Same branch');
-      }
-      if (currentUser.interests && user.interests) {
-        const overlap = user.interests.filter((i) => currentUser.interests?.includes(i)).length;
-        score += overlap * 10;
-        if (overlap > 0) reasons.push(`${overlap} shared interest${overlap > 1 ? 's' : ''}`);
-      }
-      if (myPrimaryGoal && od.primaryGoal === myPrimaryGoal) {
-        score += 20;
-        reasons.push('Same goal');
-      }
-      if (user.lastActiveAt && new Date(user.lastActiveAt) > new Date(Date.now() - 24 * 60 * 60 * 1000)) {
-        score += 5;
-        reasons.push('Recently active');
-      }
-
-      const matchPercentage = Math.min(100, score);
-      const tags = [...reasons];
-
-      return {
-        user: {
-          id: user.id,
-          name: user.name,
-          username: user.username,
-          profileImage: user.profileImage,
-          headline: user.headline,
-          verified: Boolean(user.isVerified),
-          isVerified: Boolean(user.isVerified),
-          college: user.college,
-          branch: user.branch,
-          graduationYear: user.graduationYear,
-          interests: user.interests || [],
-          bio: user.bio,
-          githubConnected: user.githubConnected,
-          skills: user.skills.map((s) => s.skill.name),
-          onboarding: myPrimaryGoal || od.primaryGoal
-            ? {
-                primaryGoal: od.primaryGoal || null,
-                lookingFor: Array.isArray(od.lookingFor) ? od.lookingFor : [],
-              }
-            : null,
-          stats: user.userStats
-            ? {
-                connectionsCount: user.userStats.connectionsCount,
-                xp: user.userStats.xp,
-                level: user.userStats.level,
-              }
-            : null,
-        },
-        score,
-        matchPercentage,
-        reasons,
-        tags,
-      };
-    });
+    const visibilityByUser = await getPremiumVisibilityByUserIds(
+      candidateUsers.map((user) => user.id)
+    );
+    const matches = rankUserMatches(currentUser, candidateUsers, { visibilityByUser })
+      .slice(skip, skip + limit)
+      .map((match) => ({
+        user: serializeMatchedUser(match.candidate, visibilityByUser.get(match.candidate.id)),
+        score: match.score,
+        matchPercentage: match.matchPercentage,
+        reasons: match.reasons,
+        tags: match.tags,
+        whyMatched: match.whyMatched,
+        sharedSignals: match.sharedSignals,
+      }));
 
     const response = {
       matches,
@@ -261,11 +164,18 @@ export const getMentorMatches = async (
       ? currentUser.user_onboarding.wantToLearn
       : [];
 
-    const existingConnections = await prisma.connections.findMany({
-      where: { OR: [{ requesterId: userId }, { addresseeId: userId }] },
-      select: { requesterId: true, addresseeId: true },
-    });
-    const excludeIds = new Set<string>([userId, ...existingConnections.flatMap((c) => [c.requesterId, c.addresseeId])]);
+    const [existingConnections, blockedUserIds] = await Promise.all([
+      prisma.connections.findMany({
+        where: { OR: [{ requesterId: userId }, { addresseeId: userId }] },
+        select: { requesterId: true, addresseeId: true },
+      }),
+      getBlockedUserIds(userId),
+    ]);
+    const excludeIds = new Set<string>([
+      userId,
+      ...existingConnections.flatMap((c) => [c.requesterId, c.addresseeId]),
+      ...blockedUserIds,
+    ]);
 
     const users = await prisma.user.findMany({
       where: {
@@ -288,6 +198,7 @@ export const getMentorMatches = async (
         profileImage: true,
         headline: true,
         isVerified: true,
+        profileBadgeStyle: true,
         college: true,
         graduationYear: true,
         user_onboarding: { select: { canTeach: true } },
@@ -296,7 +207,9 @@ export const getMentorMatches = async (
       },
     });
 
-    const mentors = users.map((u) => {
+    const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
+    const mentors = sortByPremiumVisibility(users, visibilityByUser).map((rawUser) => {
+      const u = applyPremiumVisibilityToUser(rawUser, visibilityByUser);
       const uo = u.user_onboarding;
       const userSkills = u.skills?.map((s: { skill: { name: string } }) => s.skill.name) ?? [];
       const teachableSkills = Array.isArray(uo?.canTeach) ? uo.canTeach : userSkills;
@@ -309,6 +222,12 @@ export const getMentorMatches = async (
           headline: u.headline,
           verified: Boolean(u.isVerified),
           isVerified: Boolean(u.isVerified),
+          profileBadgeStyle: u.profileBadgeStyle ?? null,
+          isPremium: u.isPremium,
+          profileBoostActive: u.profileBoostActive,
+          profileBoostEndsAt: u.profileBoostEndsAt,
+          profileBoostPriority: u.profileBoostPriority,
+          discoveryPriority: u.discoveryPriority,
           college: u.college,
           graduationYear: u.graduationYear,
         },
@@ -346,11 +265,18 @@ export const getAccountabilityMatches = async (
     });
     const myGoal = currentUser?.user_onboarding?.primaryGoal ?? undefined;
 
-    const existingConnections = await prisma.connections.findMany({
-      where: { OR: [{ requesterId: userId }, { addresseeId: userId }] },
-      select: { requesterId: true, addresseeId: true },
-    });
-    const excludeIds = new Set<string>([userId, ...existingConnections.flatMap((c) => [c.requesterId, c.addresseeId])]);
+    const [existingConnections, blockedUserIds] = await Promise.all([
+      prisma.connections.findMany({
+        where: { OR: [{ requesterId: userId }, { addresseeId: userId }] },
+        select: { requesterId: true, addresseeId: true },
+      }),
+      getBlockedUserIds(userId),
+    ]);
+    const excludeIds = new Set<string>([
+      userId,
+      ...existingConnections.flatMap((c) => [c.requesterId, c.addresseeId]),
+      ...blockedUserIds,
+    ]);
 
     const users = await prisma.user.findMany({
       where: {
@@ -369,12 +295,15 @@ export const getAccountabilityMatches = async (
         profileImage: true,
         headline: true,
         isVerified: true,
+        profileBadgeStyle: true,
         college: true,
         user_onboarding: { select: { primaryGoal: true } },
       },
     });
 
-    const matches = users.map((u) => {
+    const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
+    const matches = sortByPremiumVisibility(users, visibilityByUser).map((rawUser) => {
+      const u = applyPremiumVisibilityToUser(rawUser, visibilityByUser);
       const uo = u.user_onboarding;
       return {
         user: {
@@ -385,6 +314,12 @@ export const getAccountabilityMatches = async (
           headline: u.headline,
           verified: Boolean(u.isVerified),
           isVerified: Boolean(u.isVerified),
+          profileBadgeStyle: u.profileBadgeStyle ?? null,
+          isPremium: u.isPremium,
+          profileBoostActive: u.profileBoostActive,
+          profileBoostEndsAt: u.profileBoostEndsAt,
+          profileBoostPriority: u.profileBoostPriority,
+          discoveryPriority: u.discoveryPriority,
           college: u.college,
         },
         sharedGoal: (uo?.primaryGoal as string) || null,

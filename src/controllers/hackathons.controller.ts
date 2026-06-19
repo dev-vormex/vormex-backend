@@ -6,9 +6,15 @@ import { AuthenticatedRequest } from '../types/auth.types';
 import { ensureString } from '../utils/request.util';
 import { notificationService } from '../services/notification.service';
 import { getHackathonTeamApplicationLimitState } from '../services/tier-limits.service';
-import { importExternalHackathons } from '../services/hackathon-import.service';
+import {
+  EXTERNAL_HACKATHON_SOURCES,
+  ensureExternalHackathonsAvailable,
+  importExternalHackathons,
+  notifyMatchedUsersAboutNewHackathon,
+} from '../services/hackathon-import.service';
 
-const HACKATHON_SOURCES = new Set(['devfolio', 'mlh', 'college_fest', 'custom']);
+const EXTERNAL_HACKATHON_SOURCE_SET = new Set(EXTERNAL_HACKATHON_SOURCES);
+const HACKATHON_SOURCES = new Set([...EXTERNAL_HACKATHON_SOURCES, 'college_fest', 'custom']);
 const TEAM_STATUS_OPEN = 'open';
 const TEAM_STATUS_FULL = 'full';
 
@@ -277,8 +283,14 @@ export const listHackathons = async (req: AuthenticatedRequest, res: Response): 
     const tag = cleanText(req.query.tag, 80);
     const savedOnly = req.query.saved === 'true';
 
+    if (!savedOnly && page === 1 && !search && !college && !skill && !tag) {
+      await ensureExternalHackathonsAvailable({ source, status, now });
+    }
+
     const where: any = { isActive: true };
-    if (status === 'active') {
+    if (!status || status === 'open') {
+      where.endsAt = { gte: now };
+    } else if (status === 'active') {
       where.startsAt = { lte: now };
       where.endsAt = { gte: now };
     } else if (status === 'upcoming') {
@@ -348,11 +360,11 @@ export const listHackathons = async (req: AuthenticatedRequest, res: Response): 
 
 export const importExternalHackathonSources = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const sources = cleanList(req.body?.sources, 4, 24)
+    const sources = cleanList(req.body?.sources, EXTERNAL_HACKATHON_SOURCES.length, 24)
       .map((source) => source.toLowerCase())
-      .filter((source) => source === 'devfolio' || source === 'mlh');
+      .filter((source) => EXTERNAL_HACKATHON_SOURCE_SET.has(source));
     const result = await importExternalHackathons({
-      sources: sources.length ? sources as Array<'devfolio' | 'mlh'> : undefined,
+      sources: sources.length ? sources as any : undefined,
     });
 
     res.json(result);
@@ -414,6 +426,10 @@ export const createHackathon = async (req: AuthenticatedRequest, res: Response):
         createdById: userId,
       },
       include: { _count: { select: { teams: true, saves: true } } },
+    });
+
+    notifyMatchedUsersAboutNewHackathon(hackathon, { actorId: userId }).catch((notificationError) => {
+      console.error('notifyMatchedUsersAboutNewHackathon error:', notificationError);
     });
 
     res.status(201).json({ hackathon: formatHackathon(hackathon) });

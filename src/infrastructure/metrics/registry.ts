@@ -24,3 +24,45 @@ export const queueBacklogGauge = new client.Gauge({
   labelNames: ['queue'],
   registers: [register],
 });
+
+export const emergencyRateLimitCounter = new client.Counter({
+  name: 'vormex_rate_limit_emergency_total',
+  help: 'Emergency in-process rate limiter decisions while Redis rate limiting is unavailable',
+  labelNames: ['action', 'key_prefix'],
+  registers: [register],
+});
+
+export const thirdPartyHttpCounter = new client.Counter({
+  name: 'vormex_third_party_http_total',
+  help: 'Outbound third-party HTTP call outcomes by provider and operation',
+  labelNames: ['provider', 'operation', 'outcome'],
+  registers: [register],
+});
+
+export const processErrorCounter = new client.Counter({
+  name: 'vormex_process_error_total',
+  help: 'Fatal process-level error events handled by the API process',
+  labelNames: ['type'],
+  registers: [register],
+});
+
+export const pushNotificationConfigCounter = new client.Counter({
+  name: 'vormex_push_notification_config_total',
+  help: 'Push notification startup/configuration states',
+  labelNames: ['state'],
+  registers: [register],
+});
+
+export const cacheOutcomeCounter = new client.Counter({
+  name: 'vormex_cache_outcome_total',
+  help: 'Application cache outcomes by operation',
+  labelNames: ['operation', 'outcome'],
+  registers: [register],
+});
+
+export const dbConnectionGauge = new client.Gauge({
+  name: 'vormex_db_connections',
+  help: 'Postgres connections visible to the current database, grouped by connection state',
+  labelNames: ['state'],
+  registers: [register],
+});

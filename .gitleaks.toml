@@ -1,0 +1,23 @@
+title = "Vormex Backend Gitleaks Config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Repository-specific false positives"
+paths = [
+  '''(^|/)\.env$''',
+  '''package-lock\.json$''',
+  '''dist/''',
+  '''node_modules/''',
+]
+
+regexes = [
+  '''__REPLACE_ME__''',
+  '''__REPLACE_WITH_64_HEX_CHARS__''',
+  '''__EXAMPLE_[A-Z0-9_]+__''',
+  '''your-[a-z0-9-]+''',
+  '''replace-with-[a-z0-9-]+''',
+  '''linkedinUrl''',
+  '''githubProfileUrl''',
+]
