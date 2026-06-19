@@ -28,7 +28,7 @@ The API uses **JSON Web Tokens (JWT)** for authentication. After successful logi
 
 ```bash
 curl -X GET https://api.vormex.in/api/user/profile \
-  -H "X-Example-Auth: supply-at-runtime"
+  -H "Authorization: Bearer __EXAMPLE_JWT__"
 ```
 
 ### Authentication Flow
@@ -165,7 +165,7 @@ curl -X POST http://localhost:3000/api/auth/register \
     "authProvider": "email",
     "createdAt": "2024-01-01T00:00:00.000Z"
   },
-  "token": "REMOVED_SECRET"
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -253,7 +253,7 @@ curl -X POST http://localhost:3000/api/auth/login \
     "authProvider": "email",
     "createdAt": "2024-01-01T00:00:00.000Z"
   },
-  "token": "REMOVED_SECRET"
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -378,7 +378,7 @@ token: string  // Required, reset token from email
 
 **Example Request:**
 ```bash
-curl -X POST "http://localhost:3000/api/auth/reset-password?token=REMOVED_SECRET" \
+curl -X POST "http://localhost:3000/api/auth/reset-password?token=__EXAMPLE_RESET_TOKEN__" \
   -H "Content-Type: application/json" \
   -d '{
     "newPassword": "newpassword123"
@@ -469,7 +469,7 @@ token: string  // Required, verification token from email
 
 **Example Request:**
 ```bash
-curl -X GET "http://localhost:3000/api/auth/verify-email?token=REMOVED_SECRET"
+curl -X GET "http://localhost:3000/api/auth/verify-email?token=__EXAMPLE_VERIFY_TOKEN__"
 ```
 
 **Success Response (200):**
@@ -611,7 +611,7 @@ Content-Type: application/json
 curl -X POST http://localhost:3000/api/auth/google \
   -H "Content-Type: application/json" \
   -d '{
-    "idToken": "REMOVED_SECRET"
+    "idToken": "__EXAMPLE_GOOGLE_ID_TOKEN__"
   }'
 ```
 
@@ -633,7 +633,7 @@ curl -X POST http://localhost:3000/api/auth/google \
     "authProvider": "google",
     "createdAt": "2024-01-01T00:00:00.000Z"
   },
-  "token": "REMOVED_SECRET"
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 
@@ -653,7 +653,7 @@ curl -X POST http://localhost:3000/api/auth/google \
     "authProvider": "google",
     "createdAt": "2024-01-01T00:00:00.000Z"
   },
-  "token": "REMOVED_SECRET"
+  "token": "__EXAMPLE_JWT__"
 }
 ```
 

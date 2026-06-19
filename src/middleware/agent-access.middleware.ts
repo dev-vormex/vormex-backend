@@ -21,7 +21,8 @@ export async function requireAgentAccess(
     if (!snapshot.canUseAgent) {
       res.status(403).json({
         error: getAgentAccessDeniedMessage(snapshot),
-        code: snapshot.agentLimitReached ? 'agent_limit_reached' : 'agent_access_disabled',
+        code: snapshot.agentLimitReached ? 'agent_limit_reached' : 'premium_required',
+        feature: 'ai_agent',
       });
       return;
     }

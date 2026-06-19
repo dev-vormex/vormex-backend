@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { recordActivity } from '../services/activity.service';
@@ -7,27 +8,45 @@ import { updateEngagementStreak } from './engagement.controller';
 import { getIO } from '../sockets';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
-import { getConnectionRequestLimitState } from '../services/tier-limits.service';
+import {
+  FREE_CONNECTION_REQUESTS_PER_DAY,
+  getConnectionRequestLimitState,
+} from '../services/tier-limits.service';
 import { cacheService } from '../services/cache.service';
+import {
+  applyPremiumVisibilityToUser,
+  getPremiumVisibilityByUserIds,
+} from '../services/premium-visibility.service';
+import { getPremiumPlan } from '../services/premium-access.service';
+import {
+  assertUsersCanInteract,
+  enforceTrustTierLimit,
+  safetyErrorResponse,
+} from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
 
+const TOP_NETWORKERS_CACHE_TAG = 'engagement:leaderboard';
+
 const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
 
 const discoveryCacheTags = (...userIds: Array<string | null | undefined>): string[] =>
   uniqueCacheTags(
-    userIds.flatMap((userId) =>
-      userId
-        ? [
-            `people:user:${userId}`,
-            `people:connections:${userId}`,
-            `matching:user:${userId}`,
-            `user:${userId}`,
-          ]
-        : []
-    )
+    [
+      TOP_NETWORKERS_CACHE_TAG,
+      ...userIds.flatMap((userId) =>
+        userId
+          ? [
+              `people:user:${userId}`,
+              `people:connections:${userId}`,
+              `matching:user:${userId}`,
+              `user:${userId}`,
+            ]
+          : []
+      ),
+    ]
   );
 
 const invalidateDiscoveryCaches = async (
@@ -64,13 +83,15 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
 
     const receiver = await prisma.user.findUnique({
       where: { id: receiverId },
-      select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+      select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
     });
 
     if (!receiver) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
+
+    await assertUsersCanInteract(req.user.userId, receiverId, 'connection request');
 
     const existingConnection = await prisma.connections.findFirst({
       where: {
@@ -95,7 +116,7 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
     const limitState = await getConnectionRequestLimitState(req.user.userId);
     if (!limitState.allowed) {
       res.status(403).json({
-        error: 'Free accounts can send up to 10 connection requests per month. Upgrade to Premium for unlimited requests.',
+        error: `Free accounts can send up to ${FREE_CONNECTION_REQUESTS_PER_DAY} connection requests per day. Upgrade to Premium for unlimited requests.`,
         code: 'connection_request_limit_reached',
         limit: limitState.limit,
         used: limitState.used,
@@ -103,6 +124,8 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       });
       return;
     }
+
+    await enforceTrustTierLimit(req.user.userId, 'connection_request');
 
     const connection = await prisma.connections.create({
       data: {
@@ -147,6 +170,11 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       },
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('sendConnectionRequest error:', error);
     res.status(500).json({ error: 'Failed to send connection request' });
   }
@@ -169,7 +197,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       where: { id: connectionId },
       include: {
         users_connections_requesterIdTousers: {
-          select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+          select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
         },
       },
     });
@@ -189,15 +217,38 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       return;
     }
 
-    const updated = await prisma.connections.update({
-      where: { id: connectionId },
-      data: { status: 'accepted' },
+    const updated = await prisma.$transaction(async (tx) => {
+      const acceptResult = await tx.connections.updateMany({
+        where: { id: connectionId, addresseeId: req.user!.userId, status: 'pending' },
+        data: { status: 'accepted' },
+      });
+
+      if (acceptResult.count !== 1) {
+        return null;
+      }
+
+      await Promise.all([
+        tx.userStats.upsert({
+          where: { userId: connection.requesterId },
+          update: { connectionsCount: { increment: 1 } },
+          create: { userId: connection.requesterId, connectionsCount: 1 },
+        }),
+        tx.userStats.upsert({
+          where: { userId: connection.addresseeId },
+          update: { connectionsCount: { increment: 1 } },
+          create: { userId: connection.addresseeId, connectionsCount: 1 },
+        }),
+      ]);
+
+      return tx.connections.findUniqueOrThrow({
+        where: { id: connectionId },
+      });
     });
 
-    await prisma.userStats.updateMany({
-      where: { userId: { in: [connection.requesterId, connection.addresseeId] } },
-      data: { connectionsCount: { increment: 1 } },
-    });
+    if (!updated) {
+      res.status(400).json({ error: 'Connection request is no longer pending' });
+      return;
+    }
 
     // Record activity for both users (non-blocking)
     recordActivity(req.user.userId, 'connection', 1, { sourceId: connectionId }).catch(console.error);
@@ -219,7 +270,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       // Get addressee info for the requester's celebration
       const addressee = await prisma.user.findUnique({
         where: { id: req.user.userId },
-        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
       });
       
       io.to(`user:${connection.requesterId}`).emit('connection:accepted', {
@@ -437,10 +488,10 @@ export const getConnections = async (req: AuthRequest, res: Response): Promise<v
         },
         include: {
           users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
           },
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -505,10 +556,10 @@ export const getUserConnections = async (req: AuthRequest, res: Response): Promi
         },
         include: {
           users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
           },
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -561,22 +612,35 @@ export const getPendingRequests = async (req: AuthRequest, res: Response): Promi
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
     const skip = (page - 1) * limit;
+    const now = new Date();
 
-    const [connections, total] = await Promise.all([
-      prisma.connections.findMany({
-        where: {
-          addresseeId: req.user.userId,
-          status: 'pending',
-        },
-        include: {
-          users_connections_requesterIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
+    const [orderedRows, total] = await Promise.all([
+      prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT c."id"
+        FROM "connections" c
+        LEFT JOIN "subscriptions" s
+          ON s."userId" = c."requesterId"
+          AND s."plan" = ${getPremiumPlan()}
+          AND LOWER(s."status") IN ('active', 'captured', 'authorized')
+          AND (s."cancelledAt" IS NULL OR s."cancelledAt" > ${now})
+          AND (s."currentPeriodEnd" IS NULL OR s."currentPeriodEnd" > ${now})
+        LEFT JOIN LATERAL (
+          SELECT MAX(b."priority") AS "boostPriority"
+          FROM "profile_boosts" b
+          WHERE b."userId" = c."requesterId"
+            AND b."status" = 'active'
+            AND b."startsAt" <= ${now}
+            AND b."endsAt" > ${now}
+        ) boost ON TRUE
+        WHERE c."addresseeId" = ${req.user.userId}
+          AND c."status" = 'pending'
+        ORDER BY
+          COALESCE(boost."boostPriority", 0) DESC,
+          CASE WHEN s."id" IS NULL THEN 0 ELSE 1 END DESC,
+          c."createdAt" DESC
+        OFFSET ${skip}
+        LIMIT ${limit}
+      `),
       prisma.connections.count({
         where: {
           addresseeId: req.user.userId,
@@ -585,14 +649,42 @@ export const getPendingRequests = async (req: AuthRequest, res: Response): Promi
       }),
     ]);
 
+    const orderedIds = orderedRows.map((row) => row.id).filter(Boolean);
+    const unorderedConnections = orderedIds.length > 0
+      ? await prisma.connections.findMany({
+          where: { id: { in: orderedIds } },
+          include: {
+            users_connections_requesterIdTousers: {
+              select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
+            },
+          },
+        })
+      : [];
+    const connectionsById = new Map(unorderedConnections.map((connection) => [connection.id, connection]));
+    const connections = orderedIds
+      .map((id) => connectionsById.get(id))
+      .filter((connection): connection is NonNullable<typeof connection> => Boolean(connection));
+    const visibilityByUser = await getPremiumVisibilityByUserIds(
+      connections.map((connection) => connection.requesterId)
+    );
     const formatted = connections.map((conn) => {
       const connWithRequester = conn as typeof conn & { users_connections_requesterIdTousers: { id: string; username: string; name: string | null; profileImage: string | null; headline: string | null; college: string | null } };
+      const user = applyPremiumVisibilityToUser(
+        connWithRequester.users_connections_requesterIdTousers,
+        visibilityByUser
+      );
       return {
         id: conn.id,
         status: 'PENDING',
         message: null,
         createdAt: conn.createdAt.toISOString(),
-        user: connWithRequester.users_connections_requesterIdTousers,
+        priority: visibilityByUser.get(conn.requesterId)?.requestQueuePriority || 0,
+        priorityLabel: user.profileBoostActive
+          ? 'Boosted'
+          : user.isPremium
+            ? 'Premium'
+            : null,
+        user,
       };
     });
 
@@ -628,7 +720,7 @@ export const getSentRequests = async (req: AuthRequest, res: Response): Promise<
         },
         include: {
           users_connections_addresseeIdTousers: {
-            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true },
+            select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
           },
         },
         orderBy: { createdAt: 'desc' },

@@ -1,11 +1,37 @@
 import type { NextFunction, Response } from 'express';
 import type { AuthenticatedRequest } from '../types/auth.types';
 import {
+  evaluateEmergencyRateLimit,
   evaluateRateLimit,
   type RateLimitResult,
   type RateLimitRule,
 } from '../services/rate-limit.service';
 import { getRequestId, getRequestLogger } from '../lib/logger';
+import { emergencyRateLimitCounter } from '../infrastructure/metrics/registry';
+
+interface RateLimitMiddlewareOptions {
+  evaluate?: (identifier: string, rule: RateLimitRule) => Promise<RateLimitResult>;
+}
+
+const SENSITIVE_KEY_PATTERN = /(^|:)(auth|login|register|verification|password|oauth|payment|premium|message|chat|media|upload|ai|search|matching)(:|$)/i;
+const SENSITIVE_PATH_PATTERNS = [
+  /^\/api\/auth(?:\/|$)/,
+  /^\/api\/oauth(?:\/|$)/,
+  /^\/api\/password(?:\/|$)/,
+  /^\/api\/verification(?:\/|$)/,
+  /^\/api\/premium(?:\/|$)/,
+  /^\/api\/payments?(?:\/|$)/,
+  /^\/api\/chat(?:\/|$)/,
+  /^\/api\/messages?(?:\/|$)/,
+  /^\/api\/conversations?(?:\/|$)/,
+  /^\/api\/uploads?(?:\/|$)/,
+  /^\/api\/ai(?:\/|$)/,
+  /^\/api\/agent(?:\/|$)/,
+  /^\/api\/search(?:\/|$)/,
+  /^\/api\/people(?:\/|$)/,
+  /^\/api\/matching(?:\/|$)/,
+  /^\/api\/mentions\/search(?:\/|$)/,
+];
 
 function setHeaders(res: Response, result: Pick<RateLimitResult, 'limit' | 'remaining' | 'resetAt'>) {
   res.setHeader('x-ratelimit-limit', String(result.limit));
@@ -32,8 +58,27 @@ function isMoreConstrained(current: RateLimitResult | null, next: RateLimitResul
   return next.resetAt < current.resetAt;
 }
 
+function normalizedPath(req: AuthenticatedRequest): string {
+  const rawPath = (req.originalUrl || req.url || '').split('?')[0] || '/';
+  return rawPath.replace(/\/+$/, '') || '/';
+}
+
+function isSensitiveRateLimit(req: AuthenticatedRequest, rule: RateLimitRule): boolean {
+  if (SENSITIVE_KEY_PATTERN.test(rule.keyPrefix)) {
+    return true;
+  }
+
+  const path = normalizedPath(req);
+  return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(path));
+}
+
+function metricKeyPrefix(keyPrefix: string): string {
+  return keyPrefix.replace(/[^a-z0-9:_-]/gi, '_').slice(0, 96) || 'unknown';
+}
+
 export function createRateLimitMiddleware(
-  resolveRules: (req: AuthenticatedRequest) => RateLimitRule[]
+  resolveRules: (req: AuthenticatedRequest) => RateLimitRule[],
+  options: RateLimitMiddlewareOptions = {}
 ) {
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
     try {
@@ -42,6 +87,7 @@ export function createRateLimitMiddleware(
       const userId = req.user?.userId ? String(req.user.userId) : null;
       const ip = req.ip || req.socket.remoteAddress || 'unknown';
       const rules = resolveRules(req);
+      const evaluate = options.evaluate || evaluateRateLimit;
       let effective: RateLimitResult | null = null;
 
       for (const rule of rules) {
@@ -49,20 +95,42 @@ export function createRateLimitMiddleware(
         const identifier = customIdentifier || (rule.keyPrefix.includes(':user:') && userId ? userId : ip);
         let result: RateLimitResult;
         try {
-          result = await evaluateRateLimit(identifier, rule);
+          result = await evaluate(identifier, rule);
         } catch (error) {
-          log.warn({
-            event: 'rate_limit.fail_open',
-            requestId,
-            path: req.originalUrl,
-            method: req.method,
-            keyPrefix: rule.keyPrefix,
-            userId,
-            ip,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          next();
-          return;
+          if (isSensitiveRateLimit(req, rule)) {
+            result = evaluateEmergencyRateLimit(identifier, rule);
+            emergencyRateLimitCounter.inc({
+              action: result.allowed ? 'allowed' : 'blocked',
+              key_prefix: metricKeyPrefix(rule.keyPrefix),
+            });
+            log.warn({
+              event: 'rate_limit.emergency',
+              requestId,
+              path: req.originalUrl,
+              method: req.method,
+              keyPrefix: rule.keyPrefix,
+              userId,
+              ip,
+              backend: result.backend,
+              allowed: result.allowed,
+              limit: result.limit,
+              retryAfterSeconds: result.retryAfterSeconds,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          } else {
+            log.warn({
+              event: 'rate_limit.fail_open',
+              requestId,
+              path: req.originalUrl,
+              method: req.method,
+              keyPrefix: rule.keyPrefix,
+              userId,
+              ip,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            next();
+            return;
+          }
         }
 
         if (isMoreConstrained(effective, result)) {

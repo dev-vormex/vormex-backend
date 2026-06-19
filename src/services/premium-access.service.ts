@@ -6,11 +6,16 @@ import type { PremiumPlanConfig } from './premium-checkout.service';
 const SETTINGS_ID = 'default';
 const DEFAULT_PREMIUM_TITLE = 'Vormex Premium';
 const DEFAULT_PREMIUM_DESCRIPTION =
-  'Priority discovery, profile reach boosts, unlimited outreach, profile projects, collaboration applications, and AI help for serious student builders.';
+  'Priority discovery, profile boosts, unlimited connection requests, request queue priority, featured placement, profile projects, collaboration applications, and AI help for serious student builders.';
+const DEFAULT_CREATOR_PRO_TITLE = 'Vormex Creator Pro';
+const DEFAULT_CREATOR_PRO_DESCRIPTION =
+  'A higher tier for creators who want audience analytics, collab priority, monetized DMs, paid sessions, and portfolio amplification.';
 const DEFAULT_PREMIUM_FEATURES = [
   'Priority discovery placement',
   'Premium badge for higher trust',
-  'Profile reach boosts',
+  'Profile boosts for higher discovery ranking',
+  'Be seen first in request inboxes',
+  'Featured placement in relevant feeds',
   'Better chances of profile views',
   'Unlimited connection requests',
   'Unlimited teammate post applications',
@@ -23,10 +28,19 @@ const DEFAULT_PREMIUM_FEATURES = [
   'Open to collaborate badge',
   'Profile frames and visitor animations',
 ];
+const DEFAULT_CREATOR_PRO_FEATURES = [
+  'Audience and collab analytics',
+  'Priority in the collab marketplace',
+  'Monetized DMs and paid 1:1 session setup',
+  'Showcase and portfolio amplification',
+  'Premium features included',
+];
 const DEFAULT_PREMIUM_DURATION_DAYS = 31;
 const DEFAULT_SUPPORT_LABEL = '24/7 fast support';
 const DEFAULT_AGENT_PROMPT_LIMIT = 5;
 const DEFAULT_YEARLY_PREMIUM_AMOUNT_MINOR = 99900;
+const DEFAULT_CREATOR_PRO_MONTHLY_AMOUNT_MINOR = 49900;
+const DEFAULT_CREATOR_PRO_YEARLY_AMOUNT_MINOR = 299900;
 const DEVELOPER_PREMIUM_PROVIDER = 'developer_override';
 
 export const ACTIVE_PREMIUM_STATUSES = new Set(['active', 'captured', 'authorized']);
@@ -52,6 +66,7 @@ export interface PremiumAccessSnapshot {
   subscription: SubscriptionRecord;
   user: AccessUserRecord;
   isPremium: boolean;
+  isCreatorPro: boolean;
   canUseAgent: boolean;
   canAccessProfileCustomization: boolean;
   premiumAmountMinor: number;
@@ -97,7 +112,9 @@ export interface PremiumCheckoutEventInput {
     | 'CHECKOUT_VERIFIED'
     | 'SUBSCRIPTION_CANCELLED'
     | 'ADMIN_CANCELLED_SUBSCRIPTION'
-    | 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED';
+    | 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED'
+    | 'DEVELOPER_CREATOR_PRO_OVERRIDE_UPDATED'
+    | 'PROFILE_BOOST_ACTIVATED';
   outcome?: 'info' | 'success' | 'failure';
   message?: string;
   amountMinor?: number | null;
@@ -129,6 +146,21 @@ function getDefaultPremiumCurrency() {
   return (process.env.VORMEX_PREMIUM_CURRENCY || 'INR').toUpperCase();
 }
 
+function getDefaultCreatorProAmountMinor(billingCycle = getPremiumBillingCycle()) {
+  const normalizedBillingCycle = normalizePremiumBillingCycle(billingCycle);
+  if (normalizedBillingCycle === 'yearly') {
+    return readPositiveIntEnv(
+      'VORMEX_CREATOR_PRO_YEARLY_AMOUNT_MINOR',
+      DEFAULT_CREATOR_PRO_YEARLY_AMOUNT_MINOR
+    );
+  }
+
+  return readPositiveIntEnv(
+    'VORMEX_CREATOR_PRO_MONTHLY_AMOUNT_MINOR',
+    DEFAULT_CREATOR_PRO_MONTHLY_AMOUNT_MINOR
+  );
+}
+
 export function getPremiumDurationDays() {
   const durationDays = Number(
     process.env.VORMEX_PREMIUM_DURATION_DAYS || DEFAULT_PREMIUM_DURATION_DAYS
@@ -154,6 +186,29 @@ export function getPremiumPlan() {
   return process.env.VORMEX_PREMIUM_PLAN || 'premium';
 }
 
+export function getCreatorProPlan() {
+  return process.env.VORMEX_CREATOR_PRO_PLAN || 'creator_pro';
+}
+
+export function normalizeSubscriptionPlan(value: string | null | undefined) {
+  return String(value || '').trim().toLowerCase().replace(/-/g, '_');
+}
+
+export function isCreatorProPlan(value: string | null | undefined) {
+  const normalized = normalizeSubscriptionPlan(value);
+  const configured = normalizeSubscriptionPlan(getCreatorProPlan());
+  return normalized === configured || normalized === 'creator_pro' || normalized === 'creatorpro';
+}
+
+export function isPremiumEntitlementPlan(value: string | null | undefined) {
+  const normalized = normalizeSubscriptionPlan(value);
+  return normalized === normalizeSubscriptionPlan(getPremiumPlan()) || isCreatorProPlan(normalized);
+}
+
+export function normalizePremiumCheckoutPlan(value: string | null | undefined) {
+  return isCreatorProPlan(value) ? getCreatorProPlan() : getPremiumPlan();
+}
+
 export function getPremiumBillingCycle() {
   return normalizePremiumBillingCycle(process.env.VORMEX_PREMIUM_BILLING_CYCLE || 'monthly');
 }
@@ -174,8 +229,20 @@ export function getPremiumDescription() {
   return process.env.VORMEX_PREMIUM_DESCRIPTION || DEFAULT_PREMIUM_DESCRIPTION;
 }
 
+export function getCreatorProTitle() {
+  return process.env.VORMEX_CREATOR_PRO_TITLE || DEFAULT_CREATOR_PRO_TITLE;
+}
+
+export function getCreatorProDescription() {
+  return process.env.VORMEX_CREATOR_PRO_DESCRIPTION || DEFAULT_CREATOR_PRO_DESCRIPTION;
+}
+
 export function getPremiumFeatureLabels() {
   return DEFAULT_PREMIUM_FEATURES;
+}
+
+export function getCreatorProFeatureLabels() {
+  return DEFAULT_CREATOR_PRO_FEATURES;
 }
 
 export function getPremiumSupportLabel() {
@@ -272,12 +339,8 @@ export function evaluateAgentAccess(params: {
     params.isAdmin ||
     (!params.agentBlocked &&
       params.agentMode !== 'disabled' &&
-      (params.isPremium ||
-        params.agentMode === 'all' ||
-        (params.agentMode === 'selected' && params.agentEnabled)));
-  const hasUnlimitedAgentAccess = params.isAdmin || params.isPremium;
-  const agentLimitReached =
-    !hasUnlimitedAgentAccess && baseAccess && params.creditsUsed >= agentPromptLimit;
+      params.isPremium);
+  const agentLimitReached = false;
 
   return {
     canUseAgent: baseAccess && !agentLimitReached,
@@ -294,7 +357,7 @@ export function getAgentAccessDeniedMessage(params: Pick<AgentAccessState, 'agen
     return 'AI Agent is temporarily unavailable for this account right now.';
   }
 
-  return 'AI Agent access is not enabled for this account yet.';
+  return 'Vormex AI Agent is a Premium feature. Upgrade to Premium or Creator Pro to use Power Mode.';
 }
 
 export function getPremiumPeriodEnd(startAt: Date, durationDays = getPremiumDurationDays()) {
@@ -325,6 +388,33 @@ export function getPremiumPlanOptions(currency = getDefaultPremiumCurrency()): P
       displayAmount: formatCurrency(yearlyAmount, currency),
       durationDays: getPremiumDurationDaysForBillingCycle('yearly'),
       label: 'Yearly',
+      savingsLabel: yearlySavings > 0 ? `Save ${formatCurrency(yearlySavings, currency)}` : null,
+    },
+  ];
+}
+
+export function getCreatorProPlanOptions(currency = getDefaultPremiumCurrency()): PremiumPlanOption[] {
+  const monthlyAmount = getDefaultCreatorProAmountMinor('monthly');
+  const yearlyAmount = getDefaultCreatorProAmountMinor('yearly');
+  const yearlySavings = Math.max(0, monthlyAmount * 12 - yearlyAmount);
+
+  return [
+    {
+      billingCycle: 'monthly',
+      amountMinor: monthlyAmount,
+      currency,
+      displayAmount: formatCurrency(monthlyAmount, currency),
+      durationDays: getPremiumDurationDaysForBillingCycle('monthly'),
+      label: 'Creator Pro Monthly',
+      savingsLabel: null,
+    },
+    {
+      billingCycle: 'yearly',
+      amountMinor: yearlyAmount,
+      currency,
+      displayAmount: formatCurrency(yearlyAmount, currency),
+      durationDays: getPremiumDurationDaysForBillingCycle('yearly'),
+      label: 'Creator Pro Yearly',
       savingsLabel: yearlySavings > 0 ? `Save ${formatCurrency(yearlySavings, currency)}` : null,
     },
   ];
@@ -382,7 +472,35 @@ export function isPremiumSubscriptionActive(
   }
 
   return (
-    subscription.plan === getPremiumPlan() &&
+    isPremiumEntitlementPlan(subscription.plan) &&
+    ACTIVE_PREMIUM_STATUSES.has(String(subscription.status || '').toLowerCase())
+  );
+}
+
+export function isCreatorProSubscriptionActive(
+  subscription:
+    | Pick<
+        NonNullable<SubscriptionRecord>,
+        'plan' | 'status' | 'currentPeriodEnd' | 'cancelledAt'
+      >
+    | null
+    | undefined,
+  now = new Date()
+) {
+  if (!subscription) {
+    return false;
+  }
+
+  if (subscription.cancelledAt && subscription.cancelledAt.getTime() <= now.getTime()) {
+    return false;
+  }
+
+  if (subscription.currentPeriodEnd && subscription.currentPeriodEnd.getTime() <= now.getTime()) {
+    return false;
+  }
+
+  return (
+    isCreatorProPlan(subscription.plan) &&
     ACTIVE_PREMIUM_STATUSES.has(String(subscription.status || '').toLowerCase())
   );
 }
@@ -430,10 +548,12 @@ export async function cancelPremiumSubscription(
 
 export async function setDeveloperPremiumOverride(
   userId: string,
-  enabled: boolean
+  enabled: boolean,
+  plan = getPremiumPlan()
 ): Promise<SubscriptionRecord | null> {
   const now = new Date();
   const existing = await prisma.subscriptions.findUnique({ where: { userId } });
+  const overridePlan = normalizePremiumCheckoutPlan(plan);
 
   if (enabled) {
     if (
@@ -454,7 +574,7 @@ export async function setDeveloperPremiumOverride(
       create: {
         id: randomUUID(),
         userId,
-        plan: getPremiumPlan(),
+        plan: overridePlan,
         status: 'active',
         amount: 0,
         currency: getDefaultPremiumCurrency(),
@@ -476,7 +596,7 @@ export async function setDeveloperPremiumOverride(
         lastProviderSyncAt: now,
       },
       update: {
-        plan: getPremiumPlan(),
+        plan: overridePlan,
         status: 'active',
         amount: 0,
         currency: getDefaultPremiumCurrency(),
@@ -550,6 +670,7 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     : settings.premiumDefaultAmountMinor || getDefaultPremiumAmountMinor('monthly');
   const now = new Date();
   const isPremium = isPremiumSubscriptionActive(subscription, now);
+  const isCreatorPro = isCreatorProSubscriptionActive(subscription, now);
   const activeBillingCycle = normalizePremiumBillingCycle(
     subscription?.billingCycle || getPremiumBillingCycle()
   );
@@ -557,6 +678,8 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
   const premiumAmountMinor =
     isPremium && typeof subscription?.amount === 'number' && subscription.amount > 0
       ? subscription.amount
+      : isCreatorPro
+        ? getDefaultCreatorProAmountMinor(activeBillingCycle)
       : configuredPremiumAmountMinor;
   const premiumCurrency = (isPremium && subscription?.currency) || settings.premiumCurrency || getDefaultPremiumCurrency();
   const agentMode = normalizeAgentAvailabilityMode(settings.agentAvailabilityMode);
@@ -605,6 +728,7 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
     subscription,
     user,
     isPremium,
+    isCreatorPro,
     canUseAgent: agentAccess.canUseAgent,
     canAccessProfileCustomization,
     premiumAmountMinor,
@@ -628,20 +752,26 @@ export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumA
 
 export function buildPremiumPlanConfig(
   snapshot: Pick<PremiumAccessSnapshot, 'premiumAmountMinor' | 'premiumCurrency'>,
-  billingCycle = getPremiumBillingCycle()
+  billingCycle = getPremiumBillingCycle(),
+  plan = getPremiumPlan()
 ): PremiumPlanConfig & { title: string; description: string; features: string[] } {
   const normalizedBillingCycle = normalizePremiumBillingCycle(billingCycle);
-  const planOption = getPremiumPlanOptions(snapshot.premiumCurrency)
+  const normalizedPlan = normalizePremiumCheckoutPlan(plan);
+  const isCreatorProCheckout = isCreatorProPlan(normalizedPlan);
+  const planOptions = isCreatorProCheckout
+    ? getCreatorProPlanOptions(snapshot.premiumCurrency)
+    : getPremiumPlanOptions(snapshot.premiumCurrency);
+  const planOption = planOptions
     .find((option) => option.billingCycle === normalizedBillingCycle);
 
   return {
     amountMinor: planOption?.amountMinor || snapshot.premiumAmountMinor,
     currency: snapshot.premiumCurrency,
-    plan: getPremiumPlan(),
+    plan: normalizedPlan,
     billingCycle: normalizedBillingCycle,
-    title: getPremiumTitle(),
-    description: getPremiumDescription(),
-    features: getPremiumFeatureLabels(),
+    title: isCreatorProCheckout ? getCreatorProTitle() : getPremiumTitle(),
+    description: isCreatorProCheckout ? getCreatorProDescription() : getPremiumDescription(),
+    features: isCreatorProCheckout ? getCreatorProFeatureLabels() : getPremiumFeatureLabels(),
   };
 }
 
@@ -654,6 +784,7 @@ export function serializePremiumSubscription(
     status: snapshot.subscription?.status || 'inactive',
     provider: snapshot.provider,
     isPremium: snapshot.isPremium,
+    isCreatorPro: snapshot.isCreatorPro,
     title: getPremiumTitle(),
     description: getPremiumDescription(),
     amountMinor: snapshot.premiumAmountMinor,
@@ -685,6 +816,15 @@ export function serializePremiumSubscription(
     developerPremiumOverrideActive:
       snapshot.isPremium && isDeveloperPremiumOverrideSubscription(snapshot.subscription),
     planOptions: getPremiumPlanOptions(snapshot.premiumCurrency),
+    creatorPro: {
+      plan: getCreatorProPlan(),
+      isActive: snapshot.isCreatorPro,
+      title: getCreatorProTitle(),
+      description: getCreatorProDescription(),
+      ctaLabel: snapshot.isCreatorPro ? 'Creator Pro active' : 'Upgrade to Creator Pro',
+      features: getCreatorProFeatureLabels(),
+      planOptions: getCreatorProPlanOptions(snapshot.premiumCurrency),
+    },
   };
 }
 

@@ -17,11 +17,20 @@ import {
   type RewardCardAction,
   type RewardCardType,
 } from '../services/reward-cards.service';
-import { getConnectionRequestLimitState } from '../services/tier-limits.service';
+import {
+  getConnectionRequestLimitState,
+  getDailyUsageWindowStart,
+} from '../services/tier-limits.service';
+import { cacheService } from '../services/cache.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
+
+const TOP_NETWORKERS_CACHE_TAG = 'engagement:leaderboard';
+const TOP_NETWORKERS_CACHE_TTL_SECONDS = 300;
+const TOP_NETWORKERS_DEFAULT_LIMIT = 100;
+const TOP_NETWORKERS_MAX_LIMIT = 100;
 
 // Helper to get today's date at midnight UTC
 function getTodayStart(): Date {
@@ -815,22 +824,30 @@ export const getLiveActivity = async (req: AuthRequest, res: Response): Promise<
 // ======================
 export const getLeaderboard = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const userId = req.user?.userId;
-    const { period = 'week', limit = 10 } = req.query;
-    const limitNum = Math.min(parseInt(limit as string) || 10, 50);
+    const userId = ensureString(req.user?.userId);
+    const requestedPeriod = ensureString(req.query.period);
+    const period = requestedPeriod === 'month' ? 'month' : 'week';
+    const requestedLimit = parseInt(ensureString(req.query.limit), 10);
+    const limitNum = Math.min(
+      Math.max(requestedLimit || TOP_NETWORKERS_DEFAULT_LIMIT, 1),
+      TOP_NETWORKERS_MAX_LIMIT
+    );
+    const cacheKey = `engagement:leaderboard:${period}:limit:${limitNum}:user:${userId || 'anonymous'}`;
+    const cached = await cacheService.get<{ data: any }>(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      res.json(cached);
+      return;
+    }
 
     // Calculate date range based on period
     const now = new Date();
     let startDate: Date;
     
     if (period === 'month') {
-      startDate = new Date(now.getFullYear(), now.getMonth(), 1); // Start of current month
+      startDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     } else {
-      // Default to week
-      const dayOfWeek = now.getDay();
-      startDate = new Date(now);
-      startDate.setDate(now.getDate() - dayOfWeek); // Start of current week (Sunday)
-      startDate.setHours(0, 0, 0, 0);
+      startDate = getWeekStart();
     }
 
     // Scoring Algorithm:
@@ -842,12 +859,12 @@ export const getLeaderboard = async (req: AuthRequest, res: Response): Promise<v
     const connectionsInPeriod = await prisma.connections.findMany({
       where: {
         status: 'accepted',
-        createdAt: { gte: startDate },
+        updatedAt: { gte: startDate },
       },
       select: {
         requesterId: true,
         addresseeId: true,
-        createdAt: true,
+        updatedAt: true,
       },
     });
 
@@ -907,6 +924,7 @@ export const getLeaderboard = async (req: AuthRequest, res: Response): Promise<v
     const users = await prisma.user.findMany({
       where: {
         id: { in: topUserIds },
+        isBanned: false,
       },
       select: {
         id: true,
@@ -920,40 +938,53 @@ export const getLeaderboard = async (req: AuthRequest, res: Response): Promise<v
     // Create user lookup map
     const userMap = new Map(users.map(u => [u.id, u]));
 
-    // Build leaderboard with ranks
-    const leaderboardUsers = topUserIds.map((uId, index) => {
+    type LeaderboardUserEntry = {
+      rank: number;
+      userId: string;
+      username: string | null;
+      name: string;
+      profileImage: string | null;
+      headline: string | null;
+      score: number;
+      connectionsThisPeriod: number;
+      isCurrentUser: boolean;
+    };
+
+    // Build leaderboard with real, visible users only.
+    const leaderboardUsers: LeaderboardUserEntry[] = [];
+    for (const uId of topUserIds) {
       const user = userMap.get(uId);
+      if (!user) continue;
+
       const scoreData = userScores.find(s => s.userId === uId)!;
-      return {
-        rank: index + 1,
+      leaderboardUsers.push({
+        rank: leaderboardUsers.length + 1,
         userId: uId,
-        username: user?.username || null,
-        name: user?.name || 'Vormex User',
-        profileImage: user?.profileImage || null,
-        headline: user?.headline || null,
+        username: user.username,
+        name: user.name || 'Vormex User',
+        profileImage: user.profileImage,
+        headline: user.headline || null,
         score: scoreData.score,
         connectionsThisPeriod: scoreData.connectionsThisPeriod,
         isCurrentUser: uId === userId,
-      };
-    });
-
-    // Find current user's rank if not in top list
-    let currentUserRank: number | null = null;
-    if (userId) {
-      const currentUserIndex = userScores.findIndex(s => s.userId === userId);
-      if (currentUserIndex >= 0) {
-        currentUserRank = currentUserIndex + 1;
-      }
+      });
     }
 
-    // If no activity data, return fallback with top connected users
-    if (leaderboardUsers.length === 0) {
+    // Fill the Top 100 with real users when period activity is still sparse.
+    if (leaderboardUsers.length < limitNum) {
+      const existingIds = new Set(leaderboardUsers.map((user) => user.userId));
+      const topConnectorUserWhere: any = { isBanned: false };
+      if (existingIds.size > 0) {
+        topConnectorUserWhere.id = { notIn: Array.from(existingIds) };
+      }
+
       const topConnectors = await prisma.userStats.findMany({
         where: {
           connectionsCount: { gt: 0 },
+          user: { is: topConnectorUserWhere },
         },
         orderBy: { connectionsCount: 'desc' },
-        take: limitNum,
+        take: limitNum - leaderboardUsers.length,
         include: {
           user: {
             select: {
@@ -967,43 +998,87 @@ export const getLeaderboard = async (req: AuthRequest, res: Response): Promise<v
         },
       });
 
-      const fallbackUsers = topConnectors.map((stats, index) => ({
-        rank: index + 1,
-        userId: stats.user.id,
-        username: stats.user.username,
-        name: stats.user.name || 'Vormex User',
-        profileImage: stats.user.profileImage,
-        headline: stats.user.headline || null,
-        score: stats.connectionsCount * 10, // Base score on total connections
-        connectionsThisPeriod: 0, // No period-specific data
-        isCurrentUser: stats.user.id === userId,
-      }));
-
-      // Find current user in fallback
-      if (userId) {
-        const idx = fallbackUsers.findIndex(u => u.userId === userId);
-        if (idx >= 0) currentUserRank = idx + 1;
-      }
-
-      res.json({
-        data: {
-          users: fallbackUsers,
-          period: period as string,
-          currentUserRank,
-          totalParticipants: fallbackUsers.length,
-        },
+      topConnectors.forEach((stats) => {
+        existingIds.add(stats.user.id);
+        leaderboardUsers.push({
+          rank: leaderboardUsers.length + 1,
+          userId: stats.user.id,
+          username: stats.user.username,
+          name: stats.user.name || 'Vormex User',
+          profileImage: stats.user.profileImage,
+          headline: stats.user.headline || null,
+          score: stats.connectionsCount * 10,
+          connectionsThisPeriod: 0,
+          isCurrentUser: stats.user.id === userId,
+        });
       });
-      return;
     }
 
-    res.json({
+    if (leaderboardUsers.length < limitNum) {
+      const existingIds = new Set(leaderboardUsers.map((user) => user.userId));
+      const additionalUsersWhere: any = { isBanned: false };
+      if (existingIds.size > 0) {
+        additionalUsersWhere.id = { notIn: Array.from(existingIds) };
+      }
+
+      const additionalUsers = await prisma.user.findMany({
+        where: additionalUsersWhere,
+        orderBy: [{ lastActiveAt: 'desc' }, { createdAt: 'desc' }],
+        take: limitNum - leaderboardUsers.length,
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          profileImage: true,
+          headline: true,
+          userStats: {
+            select: {
+              connectionsCount: true,
+            },
+          },
+        },
+      });
+
+      additionalUsers.forEach((user) => {
+        const connectionsCount = user.userStats?.connectionsCount || 0;
+        leaderboardUsers.push({
+          rank: leaderboardUsers.length + 1,
+          userId: user.id,
+          username: user.username,
+          name: user.name || 'Vormex User',
+          profileImage: user.profileImage,
+          headline: user.headline || null,
+          score: connectionsCount * 10,
+          connectionsThisPeriod: 0,
+          isCurrentUser: user.id === userId,
+        });
+      });
+    }
+
+    let currentUserRank: number | null = null;
+    if (userId) {
+      const visibleCurrentUserIndex = leaderboardUsers.findIndex(u => u.userId === userId);
+      if (visibleCurrentUserIndex >= 0) {
+        currentUserRank = visibleCurrentUserIndex + 1;
+      } else {
+        const currentUserIndex = userScores.findIndex(s => s.userId === userId);
+        if (currentUserIndex >= 0) {
+          currentUserRank = currentUserIndex + 1;
+        }
+      }
+    }
+
+    const response = {
       data: {
         users: leaderboardUsers,
-        period: period as string,
+        period,
         currentUserRank,
-        totalParticipants: userScores.length,
+        totalParticipants: Math.max(userScores.length, leaderboardUsers.length),
       },
-    });
+    };
+    await cacheService.set(cacheKey, response, TOP_NETWORKERS_CACHE_TTL_SECONDS, [TOP_NETWORKERS_CACHE_TAG]);
+    res.setHeader('X-Cache', 'MISS');
+    res.json(response);
   } catch (error) {
     console.error('getLeaderboard error:', error);
     res.status(500).json({ error: 'Failed to fetch leaderboard' });
@@ -1165,11 +1240,7 @@ export const getConnectionLimit = async (req: AuthRequest, res: Response): Promi
 
     const limitState = await getConnectionRequestLimitState(userId);
     const resetsAt = limitState.windowStart
-      ? new Date(Date.UTC(
-          limitState.windowStart.getUTCFullYear(),
-          limitState.windowStart.getUTCMonth() + 1,
-          1
-        ))
+      ? new Date(getDailyUsageWindowStart(limitState.windowStart).getTime() + 24 * 60 * 60 * 1000)
       : null;
 
     res.json({
@@ -1180,6 +1251,7 @@ export const getConnectionLimit = async (req: AuthRequest, res: Response): Promi
         used: limitState.used,
         isPremium: limitState.isPremium,
         unlimitedRequests: limitState.limit === null,
+        window: 'day',
         resetsAt: resetsAt?.toISOString() || null,
       },
     });

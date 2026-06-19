@@ -1,5 +1,6 @@
 import { prisma } from '../config/prisma';
 import { pushNotificationService } from './push-notification.service';
+import { runHighQualityMatchDigest } from './match-availability-notification.service';
 
 /**
  * ENGAGEMENT SERVICE
@@ -284,51 +285,8 @@ class EngagementService {
    */
   async sendDailyMatchNotifications(): Promise<void> {
     try {
-      const activeUsers = await prisma.user.findMany({
-        where: {
-          isBanned: false,
-          lastActiveAt: {
-            gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
-          },
-        },
-        select: { id: true },
-      });
-
-      let notificationsSent = 0;
-
-      for (const user of activeUsers) {
-        const existingConnections = await prisma.connections.findMany({
-          where: {
-            OR: [
-              { requesterId: user.id },
-              { addresseeId: user.id },
-            ],
-          },
-          select: { requesterId: true, addresseeId: true },
-        });
-
-        const connectedIds = new Set<string>();
-        existingConnections.forEach(c => {
-          connectedIds.add(c.requesterId);
-          connectedIds.add(c.addresseeId);
-        });
-        connectedIds.add(user.id);
-
-        const matchCount = await prisma.user.count({
-          where: {
-            id: { notIn: Array.from(connectedIds) },
-            isBanned: false,
-          },
-          take: 5,
-        });
-
-        if (matchCount > 0) {
-          await pushNotificationService.pushDailyMatches(user.id, Math.min(matchCount, 5));
-          notificationsSent++;
-        }
-      }
-
-      console.log(`📱 Sent ${notificationsSent} daily match notifications`);
+      const result = await runHighQualityMatchDigest();
+      console.log(`📱 Sent ${result.notified} high-quality daily match notifications`);
     } catch (error) {
       console.error('Error sending daily match notifications:', error);
       throw error;

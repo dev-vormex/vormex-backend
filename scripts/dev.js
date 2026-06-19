@@ -7,9 +7,11 @@ require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const projectRoot = path.join(__dirname, '..');
 const databaseUrl = process.env.DATABASE_URL || '';
+const redisUrl = process.env.REDIS_URL || '';
 const shouldKeepDbAwake =
   process.env.AUTO_KEEP_DB_AWAKE !== 'false' &&
   /neon\.tech/i.test(databaseUrl);
+const backgroundJobsMode = (process.env.DEV_BACKGROUND_JOBS || 'auto').toLowerCase();
 
 const tsNodeDevBin = path.join(
   projectRoot,
@@ -51,6 +53,18 @@ function runBootstrap(command, args, name) {
     console.error(`[dev] ${name} failed with exit code ${result.status || 1}.`);
     process.exit(result.status || 1);
   }
+}
+
+function shouldStartBackgroundJobs() {
+  if (['1', 'true', 'yes'].includes(backgroundJobsMode)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no'].includes(backgroundJobsMode)) {
+    return false;
+  }
+
+  return Boolean(redisUrl) && !/upstash\.io/i.test(redisUrl);
 }
 
 function waitForExit(child) {
@@ -114,24 +128,30 @@ serverProcess = spawnChild(
   'api server'
 );
 
-workerProcess = spawnChild(
-  tsNodeDevBin,
-  ['--respawn', '--transpile-only', 'src/worker.ts'],
-  'worker'
-);
+if (shouldStartBackgroundJobs()) {
+  workerProcess = spawnChild(
+    tsNodeDevBin,
+    ['--respawn', '--transpile-only', 'src/worker.ts'],
+    'worker'
+  );
 
-schedulerProcess = spawnChild(
-  tsNodeDevBin,
-  ['--respawn', '--transpile-only', 'src/scheduler.ts'],
-  'scheduler'
-);
+  schedulerProcess = spawnChild(
+    tsNodeDevBin,
+    ['--respawn', '--transpile-only', 'src/scheduler.ts'],
+    'scheduler'
+  );
+} else {
+  console.log(
+    '[dev] Background workers skipped. Set DEV_BACKGROUND_JOBS=true to run BullMQ workers and schedulers.'
+  );
+}
 
 serverProcess.on('exit', (code, signal) => {
   if (shuttingDown) return;
   shutdown(signal ? 0 : code || 0);
 });
 
-for (const child of [workerProcess, schedulerProcess]) {
+for (const child of [workerProcess, schedulerProcess].filter(Boolean)) {
   child.on('exit', (code, signal) => {
     if (shuttingDown) return;
     shutdown(signal ? 0 : code || 0);

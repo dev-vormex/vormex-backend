@@ -63,6 +63,10 @@ export function getFirebaseMessaging(): admin.messaging.Messaging | null {
   return initializeFirebaseAdmin() ? admin.messaging() : null;
 }
 
+export function getFirebaseAuth(): admin.auth.Auth | null {
+  return initializeFirebaseAdmin() ? admin.auth() : null;
+}
+
 export function getFirebaseAppCheck(): admin.appCheck.AppCheck | null {
   return initializeFirebaseAdmin() ? admin.appCheck() : null;
 }

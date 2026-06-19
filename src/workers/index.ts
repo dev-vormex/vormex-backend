@@ -26,10 +26,15 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 }
 
 const WORKER_CONCURRENCY = parsePositiveInt(process.env.WORKER_CONCURRENCY, 10);
+const WORKER_ERROR_LOG_THROTTLE_MS = parsePositiveInt(
+  process.env.WORKER_ERROR_LOG_THROTTLE_MS,
+  30_000
+);
 const FOLLOWER_FEED_INVALIDATION_BATCH_SIZE = parsePositiveInt(
   process.env.FOLLOWER_FEED_INVALIDATION_BATCH_SIZE,
   5_000
 );
+const workerErrorLastLoggedAt = new Map<string, number>();
 
 type CacheInvalidationJobData =
   | CacheInvalidationPayload
@@ -190,6 +195,24 @@ function createWorker<T>(name: string, processor: (job: Job<any>) => Promise<T>)
   });
 }
 
+function isRedisRateLimitMessage(message: string): boolean {
+  return /rate[- ]?limited|rate limit/i.test(message);
+}
+
+function shouldLogWorkerError(queueName: string, message: string): boolean {
+  const key = isRedisRateLimitMessage(message)
+    ? 'redis_rate_limited'
+    : `${queueName}:${message}`;
+  const now = Date.now();
+  const previous = workerErrorLastLoggedAt.get(key) || 0;
+  if (now - previous < WORKER_ERROR_LOG_THROTTLE_MS) {
+    return false;
+  }
+
+  workerErrorLastLoggedAt.set(key, now);
+  return true;
+}
+
 let workers: Worker[] = [];
 
 function createWorkers(): Worker[] {
@@ -231,10 +254,15 @@ function createWorkers(): Worker[] {
     });
 
     worker.on('error', (error) => {
+      if (!shouldLogWorkerError(worker.name, error.message)) {
+        return;
+      }
+
       logger.error({
         event: 'worker.error',
         queue: worker.name,
         message: error.message,
+        rateLimited: isRedisRateLimitMessage(error.message) || undefined,
       });
     });
   }

@@ -77,6 +77,10 @@ function formatUserCard(user: any) {
   };
 }
 
+function skillSwapDisplayName(user: any, fallback = 'Someone') {
+  return ensureString(user?.name) || ensureString(user?.username) || fallback;
+}
+
 async function resolveUser(identifier: string, requestingUserId: string | null) {
   let userId = ensureString(identifier);
   if (!userId) return null;
@@ -1041,10 +1045,16 @@ export const createSkillSwapRequest = async (
       return;
     }
 
-    const recipient = await prisma.user.findFirst({
-      where: { id: recipientId, isBanned: false },
-      select: { id: true },
-    });
+    const [requester, recipient] = await Promise.all([
+      prisma.user.findFirst({
+        where: { id: requesterId, isBanned: false },
+        select: { id: true, username: true, name: true },
+      }),
+      prisma.user.findFirst({
+        where: { id: recipientId, isBanned: false },
+        select: { id: true, username: true, name: true },
+      }),
+    ]);
     if (!recipient) {
       res.status(404).json({ error: 'Recipient not found' });
       return;
@@ -1077,6 +1087,13 @@ export const createSkillSwapRequest = async (
     });
 
     const [hydrated] = await hydrateSkillSwapRows([request]);
+    notificationService.notifySkillSwapRequest(recipientId, requesterId, {
+      requesterName: skillSwapDisplayName(requester, 'A student'),
+      requestId: request.id,
+      skillName: request.skill,
+      mode: request.mode,
+      sessionLengthMinutes: request.sessionLengthMinutes,
+    }).catch(() => undefined);
     res.status(201).json({ request: hydrated });
   } catch (error) {
     console.error('Error creating skill swap request:', error);
@@ -1141,6 +1158,13 @@ export const respondToSkillSwapRequest = async (
     });
 
     const [hydrated] = await hydrateSkillSwapRows([updated], [session]);
+    notificationService.notifySkillSwapAccepted(request.requesterId, userId, {
+      accepterName: skillSwapDisplayName(hydrated.recipient, 'A student'),
+      requestId: request.id,
+      sessionId: session.id,
+      skillName: request.skill,
+      sessionLengthMinutes: request.sessionLengthMinutes,
+    }).catch(() => undefined);
     res.json({ request: hydrated, session: hydrated.session });
   } catch (error) {
     console.error('Error responding to skill swap request:', error);
@@ -1220,6 +1244,12 @@ export const completeSkillSwapSession = async (
       select: userCardSelect,
     });
     const userById = new Map(users.map((user) => [user.id, user]));
+    notificationService.notifySkillSwapCompleted(endorsedUserId, userId, {
+      actorName: skillSwapDisplayName(userById.get(userId), 'A student'),
+      sessionId: updated.id,
+      requestId: updated.requestId,
+      skillName: updated.skill,
+    }).catch(() => undefined);
     res.json({
       session: formatSession(updated, userById),
       endorsement,

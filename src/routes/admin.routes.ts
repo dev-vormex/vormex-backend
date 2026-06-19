@@ -1,7 +1,14 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { authenticate } from '../middleware/auth.middleware';
 import { requireAdmin } from '../middleware/admin.middleware';
 import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
+import { validateMultipartFields } from '../middleware/input-validation.middleware';
+import {
+  imageUploadRule,
+  validateUploadedFiles,
+  videoUploadRule,
+} from '../middleware/upload-security.middleware';
 import {
   verifyAdmin,
   setup2FA,
@@ -29,6 +36,15 @@ import {
   clearAdminGroupChat,
   getChatStorageSummary,
   clearAllChats,
+  getIdentityReviews,
+  getIdentityReviewById,
+  getIdentityReviewEvidence,
+  approveIdentityReview,
+  rejectIdentityReview,
+  warnUser,
+  restrictUser,
+  suspendUser,
+  clearUserSafetyRestriction,
   getReports,
   getReportStats,
   getReportById,
@@ -49,8 +65,38 @@ import {
   updatePremiumAdminSettings,
   updatePremiumAdminUser,
 } from '../controllers/admin-premium.controller';
+import {
+  createManagedAd,
+  deleteManagedAd,
+  getManagedAdAnalytics,
+  getManagedAdById,
+  getManagedAds,
+  updateManagedAd,
+} from '../controllers/admin-managed-ads.controller';
 
 const router = Router();
+const managedAdUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 150 * 1024 * 1024,
+    files: 3,
+    parts: 30,
+    fieldSize: 2 * 1024 * 1024,
+  },
+}).fields([
+  { name: 'feedImage', maxCount: 1 },
+  { name: 'reelsVideo', maxCount: 1 },
+  { name: 'reelsThumbnail', maxCount: 1 },
+]);
+const validateManagedAdUpload = validateUploadedFiles({
+  fields: {
+    feedImage: imageUploadRule(10 * 1024 * 1024),
+    reelsThumbnail: imageUploadRule(10 * 1024 * 1024),
+    reelsVideo: videoUploadRule(150 * 1024 * 1024),
+  },
+  maxFiles: 3,
+  requireKnownField: true,
+});
 
 const adminTwoFactorSetupRateLimit = createRateLimitMiddleware(() => [
   {
@@ -104,6 +150,14 @@ router.post('/premium/users/:id/cancel', cancelPremiumAdminUser);
 router.post('/premium/users/:id/message', sendPremiumAdminUserMessage);
 router.get('/premium/events', getPremiumAdminEvents);
 
+// Managed ads
+router.get('/ads', getManagedAds);
+router.post('/ads', managedAdUpload, validateManagedAdUpload, validateMultipartFields, createManagedAd);
+router.get('/ads/:id/analytics', getManagedAdAnalytics);
+router.get('/ads/:id', getManagedAdById);
+router.patch('/ads/:id', managedAdUpload, validateManagedAdUpload, validateMultipartFields, updateManagedAd);
+router.delete('/ads/:id', deleteManagedAd);
+
 // Users
 router.get('/users', getUsers);
 router.get('/users/:id', getUserById);
@@ -111,6 +165,10 @@ router.put('/users/:id', updateUser);
 router.post('/users/:id/ban', banUser);
 router.post('/users/:id/unban', unbanUser);
 router.post('/users/:id/verify', verifyUser);
+router.post('/users/:id/warn', warnUser);
+router.post('/users/:id/restrict', restrictUser);
+router.post('/users/:id/suspend', suspendUser);
+router.post('/users/:id/clear-safety-restrictions', clearUserSafetyRestriction);
 router.delete('/users/:id', deleteUser);
 
 // Posts
@@ -132,6 +190,13 @@ router.post('/groups/:id/clear-chat', clearAdminGroupChat);
 // Chat storage
 router.get('/chats/storage', getChatStorageSummary);
 router.post('/chats/clear', clearAllChats);
+
+// Identity reviews
+router.get('/identity-reviews', getIdentityReviews);
+router.get('/identity-reviews/:id/evidence', getIdentityReviewEvidence);
+router.get('/identity-reviews/:id', getIdentityReviewById);
+router.post('/identity-reviews/:id/approve', approveIdentityReview);
+router.post('/identity-reviews/:id/reject', rejectIdentityReview);
 
 // Reports (stats before :id)
 router.get('/reports/stats', getReportStats);

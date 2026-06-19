@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
-process.env.ENCRYPTION_KEY = 'REMOVED_SECRET';
+process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
 
 const {
   decryptToken,

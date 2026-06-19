@@ -10,6 +10,34 @@ import { queueMatchAvailabilityNotifications } from '../services/match-availabil
 import { isUUID } from '../utils/username.util';
 import type { FullProfileResponse, UnifiedFeedResponse } from '../types/profile.types';
 import type { ActivityHeatmapResponse } from '../types/activity.types';
+import {
+  isProfileThemeKey,
+  normalizeProfileThemeForStorage,
+  serializeProfileTheme,
+} from '../constants/profile-themes';
+import {
+  ensurePremiumFeatureAccess,
+  getPremiumProfileCustomizationFields,
+} from '../services/premium-feature-gates.service';
+
+const PROFILE_BADGE_STYLES = new Set(['student', 'professional']);
+
+function normalizeProfileBadgeStyle(value: unknown): string | null {
+  if (value === null || value === '') {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    throw new Error('Profile badge style must be a string');
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (!PROFILE_BADGE_STYLES.has(normalized)) {
+    throw new Error('Profile badge style is not supported');
+  }
+  return normalized;
+}
 
 function normalizeProfileField(value: string | null | undefined): string | null {
   if (typeof value !== 'string') {
@@ -213,6 +241,8 @@ export const updateProfile = async (
       interests,
       profileRing,
       visitLoaderGiftId,
+      profileTheme,
+      profileBadgeStyle,
       college,
       branch,
       username, // Explicitly ignore username updates
@@ -224,6 +254,18 @@ export const updateProfile = async (
         error: 'Username cannot be changed after registration',
       });
       return;
+    }
+
+    const premiumCustomizationFields = getPremiumProfileCustomizationFields(req.body);
+    if (premiumCustomizationFields.length > 0) {
+      const premiumAccess = await ensurePremiumFeatureAccess(userId, 'profile_customization');
+      if (premiumAccess.ok === false) {
+        res.status(premiumAccess.statusCode).json({
+          ...premiumAccess.payload,
+          fields: premiumCustomizationFields,
+        });
+        return;
+      }
     }
 
     // Validate input
@@ -268,6 +310,25 @@ export const updateProfile = async (
       typeof visitLoaderGiftId !== 'string'
     ) {
       errors.push('Visit loader gift id must be a string');
+    }
+
+    if (profileTheme !== undefined && profileTheme !== null) {
+      if (typeof profileTheme !== 'string') {
+        errors.push('Profile theme must be a string');
+      } else {
+        const trimmedTheme = profileTheme.trim();
+        if (trimmedTheme && !isProfileThemeKey(trimmedTheme)) {
+          errors.push('Profile theme is not supported');
+        }
+      }
+    }
+
+    if (profileBadgeStyle !== undefined) {
+      try {
+        normalizeProfileBadgeStyle(profileBadgeStyle);
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : 'Profile badge style is not supported');
+      }
     }
 
     if (currentYear !== undefined && currentYear !== null) {
@@ -392,6 +453,12 @@ export const updateProfile = async (
     if (visitLoaderGiftId !== undefined) {
       updateData.visitLoaderGiftId = visitLoaderGiftId?.trim() || null;
     }
+    if (profileTheme !== undefined) {
+      updateData.profileTheme = normalizeProfileThemeForStorage(profileTheme);
+    }
+    if (profileBadgeStyle !== undefined) {
+      updateData.profileBadgeStyle = normalizeProfileBadgeStyle(profileBadgeStyle);
+    }
     if (college !== undefined) updateData.college = college?.trim() || null;
     if (branch !== undefined) updateData.branch = branch?.trim() || null;
 
@@ -404,7 +471,8 @@ export const updateProfile = async (
       branch !== undefined ||
       graduationYear !== undefined ||
       isOpenToOpportunities !== undefined ||
-      processedInterests !== undefined;
+      processedInterests !== undefined ||
+      profileBadgeStyle !== undefined;
     const affectsMatchRanking =
       college !== undefined ||
       branch !== undefined ||
@@ -449,6 +517,8 @@ export const updateProfile = async (
           interests: true,
           profileRing: true,
           visitLoaderGiftId: true,
+          profileTheme: true,
+          profileBadgeStyle: true,
           college: true,
           branch: true,
           updatedAt: true,
@@ -487,7 +557,10 @@ export const updateProfile = async (
       queueMatchAvailabilityNotifications(userId, 'profile_update');
     }
 
-    res.status(200).json(updatedUser);
+    res.status(200).json({
+      ...updatedUser,
+      profileTheme: serializeProfileTheme(updatedUser.profileTheme),
+    });
   } catch (error) {
     console.error('Error updating profile:', error);
     res.status(500).json({

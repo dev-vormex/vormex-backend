@@ -231,6 +231,7 @@ async function buildPeopleYouKnowResponse(
           interests: true,
           isOnline: true,
           isVerified: true,
+          profileBadgeStyle: true,
           lastActiveAt: true,
           skills: {
             select: { skill: { select: { name: true } } },
@@ -270,6 +271,7 @@ async function buildPeopleYouKnowResponse(
         isOnline: user.isOnline,
         verified: Boolean(user.isVerified),
         isVerified: Boolean(user.isVerified),
+        profileBadgeStyle: user.profileBadgeStyle ?? null,
         connectionStatus,
         mutualConnections: mutualConnectionsMap.get(user.id) ?? 0,
         contactName: entry?.contactName ?? null,

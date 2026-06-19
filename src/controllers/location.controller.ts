@@ -2,6 +2,12 @@ import { Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
+import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
+import { cacheService } from '../services/cache.service';
+import {
+  CoarseLocationDTO,
+  serializeCoarseLocation,
+} from '../utils/location-dto.util';
 
 interface NearbyUser {
   id: string;
@@ -12,17 +18,11 @@ interface NearbyUser {
   headline: string | null;
   skills: string[];
   interests: string[];
-  distance: number;
+  distanceBucket: string | null;
   isOnline: boolean;
   verified: boolean;
   isVerified: boolean;
-  location: {
-    lat: number;
-    lng: number;
-    city: string | null;
-    state: string | null;
-    country: string | null;
-  } | null;
+  location: CoarseLocationDTO | null;
 }
 
 interface NearbyUsersResponse {
@@ -30,32 +30,13 @@ interface NearbyUsersResponse {
   locationRequired?: boolean;
   locationPermissionDenied?: boolean;
   total: number;
-  yourLocation?: {
-    lat: number;
-    lng: number;
-    city: string | null;
-  };
+  yourLocation?: CoarseLocationDTO | null;
 }
 
 type NearbyDistanceRow = {
   id: string;
   distance: number | string;
 };
-
-/**
- * Calculate distance between two coordinates using Haversine formula
- * Returns distance in kilometers
- */
-function calculateDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371; // Earth's radius in km
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
 
 function toRad(deg: number): number {
   return deg * (Math.PI / 180);
@@ -86,6 +67,8 @@ export const getNearbyUsers = async (
         latitude: true, 
         longitude: true, 
         currentCity: true,
+        currentState: true,
+        currentCountry: true,
         locationPermission: true,
       },
     });
@@ -94,6 +77,15 @@ export const getNearbyUsers = async (
       res.status(200).json({
         users: [],
         locationRequired: true,
+        total: 0,
+      });
+      return;
+    }
+
+    if (currentUser.locationPermission === false) {
+      res.status(200).json({
+        users: [],
+        locationPermissionDenied: true,
         total: 0,
       });
       return;
@@ -138,11 +130,7 @@ export const getNearbyUsers = async (
       res.status(200).json({
         users: [],
         total: 0,
-        yourLocation: {
-          lat: userLat,
-          lng: userLng,
-          city: currentUser.currentCity,
-        },
+        yourLocation: serializeCoarseLocation(currentUser),
       });
       return;
     }
@@ -162,13 +150,12 @@ export const getNearbyUsers = async (
         profileImage: true,
         bannerImageUrl: true,
         headline: true,
-        latitude: true,
-        longitude: true,
         currentCity: true,
         currentState: true,
         currentCountry: true,
         isOnline: true,
         isVerified: true,
+        profileBadgeStyle: true,
         interests: true,
         skills: {
           select: { skill: { select: { name: true } } },
@@ -181,7 +168,8 @@ export const getNearbyUsers = async (
       .map((id) => usersById.get(id))
       .filter((user): user is NonNullable<typeof user> => Boolean(user))
       .map((user) => {
-        const distance = distanceByUserId.get(user.id) ?? calculateDistance(userLat, userLng, user.latitude!, user.longitude!);
+        const distance = distanceByUserId.get(user.id) ?? null;
+        const location = serializeCoarseLocation(user, distance);
         return {
           id: user.id,
           username: user.username,
@@ -191,28 +179,19 @@ export const getNearbyUsers = async (
           headline: user.headline,
           skills: user.skills.map((s) => s.skill.name),
           interests: user.interests,
-          distance: Math.round(distance * 10) / 10, // Round to 1 decimal
+          distanceBucket: location?.distanceBucket ?? null,
           isOnline: user.isOnline,
           verified: Boolean(user.isVerified),
           isVerified: Boolean(user.isVerified),
-          location: user.latitude !== null && user.longitude !== null ? {
-            lat: user.latitude,
-            lng: user.longitude,
-            city: user.currentCity,
-            state: user.currentState,
-            country: user.currentCountry,
-          } : null,
+          profileBadgeStyle: user.profileBadgeStyle ?? null,
+          location,
         };
       });
 
     res.status(200).json({
       users: nearbyUsers,
       total: nearbyUsers.length,
-      yourLocation: {
-        lat: userLat,
-        lng: userLng,
-        city: currentUser.currentCity,
-      },
+      yourLocation: serializeCoarseLocation(currentUser),
     });
   } catch (error) {
     console.error('Error fetching nearby users:', error);
@@ -226,7 +205,7 @@ export const getNearbyUsers = async (
  */
 export const updateLocation = async (
   req: AuthenticatedRequest,
-  res: Response<{ message: string; location?: any } | ErrorResponse>
+  res: Response<{ message: string; location?: CoarseLocationDTO | null } | ErrorResponse>
 ): Promise<void> => {
   try {
     if (!req.user?.userId) {
@@ -270,25 +249,20 @@ export const updateLocation = async (
         locationUpdatedAt: new Date(),
         lastLocationUpdate: new Date(),
         currentCoordinates: { lat, lng },
-        shareLocationPublic: true, // Enable by default when user shares location
       },
       select: {
-        latitude: true,
-        longitude: true,
         currentCity: true,
+        currentState: true,
         currentCountry: true,
       },
     });
 
     res.status(200).json({
       message: 'Location updated successfully',
-      location: {
-        lat: updatedUser.latitude,
-        lng: updatedUser.longitude,
-        city: updatedUser.currentCity,
-        country: updatedUser.currentCountry,
-      },
+      location: serializeCoarseLocation(updatedUser),
     });
+
+    queueMatchAvailabilityNotifications(userId, 'location_update');
   } catch (error) {
     console.error('Error updating location:', error);
     res.status(500).json({ error: 'Failed to update location' });
@@ -312,6 +286,16 @@ export const updateLocationSettings = async (
     const userId = String(req.user.userId);
     const { shareLocationPublic, locationPermission } = req.body;
 
+    if (shareLocationPublic !== undefined && typeof shareLocationPublic !== 'boolean') {
+      res.status(400).json({ error: 'shareLocationPublic must be a boolean' });
+      return;
+    }
+
+    if (locationPermission !== undefined && typeof locationPermission !== 'boolean') {
+      res.status(400).json({ error: 'locationPermission must be a boolean' });
+      return;
+    }
+
     await prisma.user.update({
       where: { id: userId },
       data: {
@@ -319,6 +303,8 @@ export const updateLocationSettings = async (
         locationPermission: locationPermission ?? undefined,
       },
     });
+
+    await cacheService.invalidateTags(`user:${userId}`, `people:user:${userId}`, `matching:user:${userId}`);
 
     res.status(200).json({ message: 'Location settings updated' });
   } catch (error) {
@@ -334,13 +320,10 @@ export const updateLocationSettings = async (
 export const getCurrentLocation = async (
   req: AuthenticatedRequest,
   res: Response<{ 
-    lat: number | null; 
-    lng: number | null;
-    city: string | null; 
-    state: string | null;
-    country: string | null;
+    location: CoarseLocationDTO | null;
     updatedAt: string | null;
     shareLocationPublic: boolean;
+    locationPermission: boolean;
   } | ErrorResponse>
 ): Promise<void> => {
   try {
@@ -354,24 +337,20 @@ export const getCurrentLocation = async (
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { 
-        latitude: true,
-        longitude: true,
         currentCity: true,
         currentState: true,
         currentCountry: true,
         locationUpdatedAt: true,
         shareLocationPublic: true,
+        locationPermission: true,
       },
     });
 
     res.status(200).json({
-      lat: user?.latitude || null,
-      lng: user?.longitude || null,
-      city: user?.currentCity || null,
-      state: user?.currentState || null,
-      country: user?.currentCountry || null,
+      location: serializeCoarseLocation(user),
       updatedAt: user?.locationUpdatedAt?.toISOString() || null,
       shareLocationPublic: user?.shareLocationPublic ?? false,
+      locationPermission: user?.locationPermission ?? true,
     });
   } catch (error) {
     console.error('Error getting location:', error);

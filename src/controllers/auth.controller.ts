@@ -11,8 +11,8 @@ import { hashEmail } from '../utils/email-hash.util';
 import {
   compareWithDummyPassword,
   getPasswordMaxLength,
-  generateOpaqueToken,
-  hashOpaqueToken,
+  generateEmailOtpCode,
+  hashEmailOtp,
   hashPassword,
   passwordHashNeedsRehash,
   validatePasswordStrength,
@@ -38,6 +38,7 @@ import {
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { processPeopleYouKnowJoinForUser } from '../services/people-you-know-join.service';
 import { buildUserResponse, safeUserResponseSelect } from '../services/user-response.service';
+import { recordUserDeviceFromRequest } from '../services/trust-safety.service';
 import { updateEngagementStreak } from './engagement.controller';
 import {
   RegisterRequestBody,
@@ -73,6 +74,45 @@ async function generateUniqueUsernameFromName(name: string): Promise<string> {
   }
 
   return `user_${Date.now().toString(36)}_${Math.floor(1000 + Math.random() * 9000)}`.slice(0, 30);
+}
+
+async function resolveRegistrationUsername(params: {
+  username?: string;
+  displayName: string;
+  existingUserId?: string;
+  existingUsername?: string | null;
+}): Promise<{ username?: string; error?: string; status?: number }> {
+  if (!params.username) {
+    return {
+      username: params.existingUsername || await generateUniqueUsernameFromName(params.displayName),
+    };
+  }
+
+  const normalizedUsername = normalizeUsername(params.username);
+  const usernameValidation = validateUsername(normalizedUsername);
+  if (!usernameValidation.valid) {
+    return {
+      status: 400,
+      error: usernameValidation.error || 'Invalid username format',
+    };
+  }
+
+  const existingUserByUsername = await prisma.user.findUnique({
+    where: { username: normalizedUsername },
+    select: { id: true },
+  });
+
+  if (
+    existingUserByUsername &&
+    (!params.existingUserId || existingUserByUsername.id !== params.existingUserId)
+  ) {
+    return {
+      status: 409,
+      error: 'Username already taken',
+    };
+  }
+
+  return { username: normalizedUsername };
 }
 
 /**
@@ -166,45 +206,74 @@ export const register = async (
       where: { email: normalizedEmail },
     });
 
-    if (existingUserByEmail) {
+    if (
+      existingUserByEmail &&
+      (existingUserByEmail.isVerified || existingUserByEmail.authProvider !== 'email')
+    ) {
       res.status(409).json({
         error: 'User with this email already exists',
       });
       return;
     }
 
-    let normalizedUsername: string;
-    if (username) {
-      normalizedUsername = normalizeUsername(username);
-      const usernameValidation = validateUsername(normalizedUsername);
-      if (!usernameValidation.valid) {
-        res.status(400).json({
-          error: usernameValidation.error || 'Invalid username format',
-        });
-        return;
-      }
-
-      const existingUserByUsername = await prisma.user.findUnique({
-        where: { username: normalizedUsername },
+    const usernameResult = await resolveRegistrationUsername({
+      username,
+      displayName,
+      existingUserId: existingUserByEmail?.id,
+      existingUsername: existingUserByEmail?.username,
+    });
+    if (!usernameResult.username) {
+      res.status(usernameResult.status || 400).json({
+        error: usernameResult.error || 'Invalid username format',
       });
-
-      if (existingUserByUsername) {
-        res.status(409).json({
-          error: 'Username already taken',
-        });
-        return;
-      }
-    } else {
-      normalizedUsername = await generateUniqueUsernameFromName(displayName);
+      return;
     }
+    const normalizedUsername = usernameResult.username;
 
     // Hash password
     const hashedPassword = await hashPassword(password);
 
-    // Generate verification token
-    const plainVerificationToken = generateOpaqueToken();
-    const hashedVerificationToken = hashOpaqueToken(plainVerificationToken);
-    const verificationTokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+    // Generate email verification OTP
+    const verificationCode = generateEmailOtpCode();
+    const hashedVerificationToken = hashEmailOtp(normalizedEmail, verificationCode);
+    const verificationTokenExpiry = new Date(Date.now() + 10 * 60 * 1000);
+
+    if (existingUserByEmail) {
+      const user = await prisma.user.update({
+        where: { id: existingUserByEmail.id },
+        data: {
+          username: normalizedUsername,
+          password: hashedPassword,
+          name: displayName,
+          college: college || existingUserByEmail.college || null,
+          branch: branch || existingUserByEmail.branch || null,
+          verificationToken: hashedVerificationToken,
+          verificationTokenExpiry,
+          emailHash: existingUserByEmail.emailHash || hashEmail(normalizedEmail),
+        },
+        select: safeUserResponseSelect,
+      });
+
+      try {
+        await sendVerificationEmail(normalizedEmail, verificationCode, displayName);
+      } catch (emailError) {
+        console.error('Failed to resend verification email:', emailError);
+      }
+
+      const userResponse = await buildUserResponse(user);
+      try {
+        await recordUserDeviceFromRequest(req, user.id, { lastLogin: false });
+      } catch (deviceError) {
+        console.error('Failed to record registration device:', deviceError);
+      }
+
+      res.status(200).json({
+        user: userResponse,
+        message: 'Verification code sent. Enter the 6-digit code sent to your email.',
+        requiresVerification: true,
+      });
+      return;
+    }
 
     // Create user
     const user = await prisma.user.create({
@@ -226,7 +295,7 @@ export const register = async (
 
     // Send verification email (don't block registration if email fails)
     try {
-      await sendVerificationEmail(normalizedEmail, plainVerificationToken, displayName);
+      await sendVerificationEmail(normalizedEmail, verificationCode, displayName);
     } catch (emailError) {
       // Log error but don't fail registration
       console.error('Failed to send verification email:', emailError);
@@ -242,11 +311,16 @@ export const register = async (
     queueMatchAvailabilityNotifications(user.id, 'signup');
 
     const userResponse = await buildUserResponse(user);
+    try {
+      await recordUserDeviceFromRequest(req, user.id, { lastLogin: false });
+    } catch (deviceError) {
+      console.error('Failed to record registration device:', deviceError);
+    }
 
     // Return success response
     res.status(201).json({
       user: userResponse,
-      message: 'Registration successful. Please verify your email before logging in.',
+      message: 'Registration successful. Enter the 6-digit code sent to your email.',
       requiresVerification: true,
     });
   } catch (error) {
@@ -319,6 +393,7 @@ export const login = async (
         password: true,
         emailHash: true,
         isBanned: true,
+        safetySuspendedUntil: true,
       },
     });
 
@@ -358,11 +433,20 @@ export const login = async (
       return;
     }
 
+    if (user.safetySuspendedUntil && user.safetySuspendedUntil > new Date()) {
+      res.status(403).json({
+        error: 'User account is temporarily suspended',
+        code: 'account_suspended',
+        suspendedUntil: user.safetySuspendedUntil.toISOString(),
+      });
+      return;
+    }
+
     // Check if email is verified (only for email/password users)
     // Google OAuth users are automatically verified, so they can login
     if (!user.isVerified) {
       res.status(403).json({
-        error: 'Please verify your email before logging in. Check your inbox for verification link.',
+        error: 'Please verify your email before logging in. Enter the 6-digit code sent to your inbox.',
         requiresVerification: true,
       });
       return;
@@ -439,6 +523,7 @@ export const refreshSession = async (
       select: {
         ...safeUserResponseSelect,
         isBanned: true,
+        safetySuspendedUntil: true,
       },
     });
 
@@ -455,6 +540,17 @@ export const refreshSession = async (
       res.status(403).json({
         error: 'User account is disabled',
         code: 'account_disabled',
+      });
+      return;
+    }
+
+    if (user.safetySuspendedUntil && user.safetySuspendedUntil > new Date()) {
+      await revokeAllAuthSessions(user.id);
+      clearAuthCookies(res);
+      res.status(403).json({
+        error: 'User account is temporarily suspended',
+        code: 'account_suspended',
+        suspendedUntil: user.safetySuspendedUntil.toISOString(),
       });
       return;
     }
@@ -490,6 +586,11 @@ export const refreshSession = async (
         expiresAt: rotated.expiresAt.toISOString(),
       },
     };
+    try {
+      await recordUserDeviceFromRequest(req, rotated.userId);
+    } catch (deviceError) {
+      console.error('Failed to record refresh device:', deviceError);
+    }
 
     res.status(200).json({
       user: userResponse,

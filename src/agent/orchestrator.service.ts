@@ -7,6 +7,10 @@ import {
   AI_UNTRUSTED_INPUT_POLICY,
   wrapUntrustedPromptContent,
 } from '../utils/input-security.util';
+import {
+  executeWithCircuitBreaker,
+  isThirdPartyHttpError,
+} from '../utils/http-client-with-breaker.util';
 import { agentSessionService } from './session.service';
 import { evaluateAgentUserInputSafety } from './safety.service';
 import {
@@ -344,6 +348,27 @@ class AgentOrchestratorService {
       throw mappedError;
     }
 
+    if (isThirdPartyHttpError(error)) {
+      logger.warn({
+        event: 'agent.provider.degraded',
+        requestId: params.requestId,
+        route: params.route,
+        userId: params.userId,
+        sessionId: params.sessionId,
+        model: params.model,
+        provider: error.provider,
+        operation: error.operation,
+        code: error.code,
+        message: error.message,
+      });
+
+      throw new AIServiceError(error.message, {
+        code: 'ai_provider_unavailable',
+        statusCode: 503,
+        userMessage: 'Agent AI is temporarily busy. Please try again shortly.',
+      });
+    }
+
     const rawError: any = error || {};
     const genericError = error instanceof Error ? error : new Error(String(error));
     const status = Number(rawError.status || rawError.statusCode || rawError.code);
@@ -409,7 +434,15 @@ class AgentOrchestratorService {
     }
   ): Promise<T> {
     try {
-      return await operation();
+      return await executeWithCircuitBreaker(
+        params.provider || 'openai',
+        params.route,
+        operation,
+        {
+          connectTimeoutMs: 5_000,
+          requestTimeoutMs: this.geminiTimeoutMs,
+        }
+      );
     } catch (error) {
       this.mapProviderError(error, params);
     }
@@ -1227,7 +1260,7 @@ class AgentOrchestratorService {
         client.audio.speech.create({
           input: text.slice(0, 1500),
           model,
-          voice: process.env.AGENT_TTS_VOICE || 'alloy',
+          voice: process.env.AGENT_TTS_VOICE || 'shimmer',
           response_format: 'mp3',
         } as any),
       {

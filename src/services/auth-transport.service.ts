@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import { createAuthSession } from './auth-session.service';
 import { generateAccessToken, getAccessTokenTtlSeconds } from '../utils/jwt.util';
 import { setAuthCookies } from '../utils/auth-cookie.util';
+import { recordUserDeviceFromRequest } from './trust-safety.service';
 
 export interface IssuedAuthTransport {
   token: string;
@@ -37,6 +38,11 @@ export async function issueAuthTransport(
     userAgent: req.headers['user-agent'],
     ip: req.ip,
   });
+  try {
+    await recordUserDeviceFromRequest(req, userId);
+  } catch (error) {
+    console.error('Failed to record user device:', error);
+  }
   const token = generateAccessToken(userId, session.sessionId);
 
   const csrfToken = setAuthCookies(res, {

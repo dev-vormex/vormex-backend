@@ -1,5 +1,5 @@
-import axios from 'axios';
 import { bunnyConfig } from '../config/bunny.config';
+import { requestWithBreaker } from '../utils/http-client-with-breaker.util';
 
 export class BunnyStorageService {
   private baseUrl: string;
@@ -89,11 +89,17 @@ export class BunnyStorageService {
       const uploadUrl = `${this.baseUrl}/${fullPath}`;
 
       // Upload to Bunny Storage via PUT request
-      await axios.put(uploadUrl, buffer, {
+      await requestWithBreaker('bunny_storage', 'upload_file', {
+        method: 'PUT',
+        url: uploadUrl,
+        data: buffer,
         headers: {
           'AccessKey': this.apiKey,
           'Content-Type': contentType,
         },
+      }, {
+        connectTimeoutMs: 5_000,
+        requestTimeoutMs: 10_000,
       });
 
       // Return CDN URL (not storage URL)
@@ -111,10 +117,15 @@ export class BunnyStorageService {
       const filePath = this.getStoragePath(path);
       const deleteUrl = `${this.baseUrl}/${filePath}`;
 
-      await axios.delete(deleteUrl, {
+      await requestWithBreaker('bunny_storage', 'delete_file', {
+        method: 'DELETE',
+        url: deleteUrl,
         headers: {
           'AccessKey': this.apiKey,
         },
+      }, {
+        connectTimeoutMs: 5_000,
+        requestTimeoutMs: 8_000,
       });
     } catch (error: any) {
       console.error('Bunny delete error:', error.response?.data || error.message);
@@ -127,14 +138,14 @@ export class BunnyStorageService {
 
   // Upload profile picture (pre-cropped by frontend)
   async uploadProfilePicture(buffer: Buffer, userId: string): Promise<string> {
-    const filename = `${userId}-${Date.now()}.avif`;
-    return this.uploadFile(buffer, 'profiles/avatars', filename);
+    const filename = `${userId}-${Date.now()}.webp`;
+    return this.uploadFile(buffer, 'profiles/avatars', filename, 'image/webp');
   }
 
   // Upload banner image (pre-cropped by frontend)
   async uploadBanner(buffer: Buffer, userId: string): Promise<string> {
-    const filename = `${userId}-${Date.now()}.avif`;
-    return this.uploadFile(buffer, 'profiles/banners', filename);
+    const filename = `${userId}-${Date.now()}.webp`;
+    return this.uploadFile(buffer, 'profiles/banners', filename, 'image/webp');
   }
 
   // Upload post image (JPEG/PNG/WebP - keep original format for compatibility)

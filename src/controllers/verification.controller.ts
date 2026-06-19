@@ -2,17 +2,30 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { sendVerificationEmail } from '../utils/email.util';
 import {
-  generateOpaqueToken,
+  generateEmailOtpCode,
   hashOpaqueToken,
+  hashEmailOtp,
   isLikelyOpaqueToken,
+  normalizeEmailOtpCode,
+  verifyEmailOtp,
   verifyLegacyBcryptToken,
 } from '../utils/auth-security.util';
 import {
   ResendVerificationRequestBody,
+  VerifyEmailOtpRequestBody,
+  AuthSuccessResponse,
   ErrorResponse,
   SuccessMessageResponse,
 } from '../types/auth.types';
 import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.service';
+import {
+  authTokensForResponse,
+  issueAuthTransport,
+} from '../services/auth-transport.service';
+import {
+  buildUserResponse,
+  safeUserResponseSelect,
+} from '../services/user-response.service';
 
 /**
  * Email validation regex
@@ -20,9 +33,9 @@ import { invalidateAuthUserStatus } from '../services/auth-user-status-cache.ser
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * Verification token expiry time (24 hours in milliseconds)
+ * Verification OTP expiry time (10 minutes in milliseconds)
  */
-const VERIFICATION_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
+const VERIFICATION_TOKEN_EXPIRY = 10 * 60 * 1000;
 
 async function findUserByVerificationToken(token: string) {
   const now = new Date();
@@ -139,6 +152,88 @@ export const verifyEmail = async (
 };
 
 /**
+ * Verify Email - Verify user's email address with a 6-digit OTP
+ *
+ * POST /api/auth/verify-email
+ * Body: { email, code }
+ */
+export const verifyEmailOtpCode = async (
+  req: Request<{}, AuthSuccessResponse | ErrorResponse, VerifyEmailOtpRequestBody>,
+  res: Response<AuthSuccessResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    const email = req.body?.email?.trim().toLowerCase();
+    const code = normalizeEmailOtpCode(req.body?.code);
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+      res.status(400).json({ error: 'A valid email is required' });
+      return;
+    }
+
+    if (!/^\d{6}$/.test(code)) {
+      res.status(400).json({ error: 'A valid 6-digit verification code is required' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (
+      !user ||
+      user.authProvider !== 'email' ||
+      user.isVerified ||
+      !user.verificationToken ||
+      !user.verificationTokenExpiry ||
+      user.verificationTokenExpiry <= new Date() ||
+      !verifyEmailOtp(email, code, user.verificationToken)
+    ) {
+      res.status(400).json({ error: 'Invalid or expired verification code' });
+      return;
+    }
+
+    const verifiedUser = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        isVerified: true,
+        verificationToken: null,
+        verificationTokenExpiry: null,
+      },
+      select: {
+        ...safeUserResponseSelect,
+        isBanned: true,
+      },
+    });
+    await invalidateAuthUserStatus(user.id);
+
+    console.log('Email verified successfully for user:', user.email);
+
+    if (verifiedUser.isBanned) {
+      res.status(403).json({
+        error: 'User account is disabled',
+        code: 'account_disabled',
+      });
+      return;
+    }
+
+    const authTransport = await issueAuthTransport(req, res, verifiedUser.id);
+    const { isBanned: _isBanned, ...safeUser } = verifiedUser;
+    const userResponse = await buildUserResponse(safeUser);
+
+    res.status(200).json({
+      user: userResponse,
+      message: 'Email verified successfully.',
+      ...authTokensForResponse(req, authTransport),
+    });
+  } catch (error) {
+    console.error('Email OTP verification error:', error);
+    res.status(500).json({
+      error: 'Internal server error during email verification',
+    });
+  }
+};
+
+/**
  * Resend Verification Email - Send new verification email to user
  * 
  * POST /api/auth/resend-verification
@@ -182,7 +277,7 @@ export const resendVerification = async (
       // Do not reveal account state for resend requests.
       if (user.isVerified) {
         res.status(200).json({
-          message: 'Verification email sent. Please check your inbox.',
+          message: 'Verification code sent. Please check your inbox.',
         });
         return;
       }
@@ -190,15 +285,15 @@ export const resendVerification = async (
       // Skip OAuth users (they're already verified)
       if (user.authProvider !== 'email') {
         res.status(200).json({
-          message: 'Verification email sent. Please check your inbox.',
+          message: 'Verification code sent. Please check your inbox.',
         });
         return;
       }
 
       try {
-        // Generate new verification token
-        const plainVerificationToken = generateOpaqueToken();
-        const hashedVerificationToken = hashOpaqueToken(plainVerificationToken);
+        // Generate new verification OTP
+        const verificationCode = generateEmailOtpCode();
+        const hashedVerificationToken = hashEmailOtp(trimmedEmail, verificationCode);
         const verificationTokenExpiry = new Date(Date.now() + VERIFICATION_TOKEN_EXPIRY);
 
         // Update user with new verification token and expiry
@@ -210,10 +305,10 @@ export const resendVerification = async (
           },
         });
 
-        // Send verification email
-        await sendVerificationEmail(trimmedEmail, plainVerificationToken, user.name);
+        // Send verification OTP email
+        await sendVerificationEmail(trimmedEmail, verificationCode, user.name);
 
-        console.log('Verification email resent to:', trimmedEmail);
+        console.log('Verification code resent to:', trimmedEmail);
       } catch (error) {
         // Log error but still return success message (security)
         console.error('Error processing resend verification request:', error);
@@ -223,13 +318,13 @@ export const resendVerification = async (
 
     // Always return success message (even if email doesn't exist)
     res.status(200).json({
-      message: 'Verification email sent. Please check your inbox.',
+      message: 'Verification code sent. Please check your inbox.',
     });
   } catch (error) {
     console.error('Resend verification error:', error);
     // Still return success to prevent email enumeration
     res.status(200).json({
-      message: 'Verification email sent. Please check your inbox.',
+      message: 'Verification code sent. Please check your inbox.',
     });
   }
 };

@@ -92,9 +92,9 @@ export const uploadProfilePicture = async (req: AuthenticatedRequest, res: Respo
       return;
     }
 
-    // Process: resize to 400x400 + convert to AVIF
+    // Process: resize to 400x400 + convert to WebP for broad Android support.
     // Frontend already cropped, so we just resize without cropping
-    const processedBuffer = await imageProcessingService.processProfilePicture(
+    const processedBuffer = await imageProcessingService.processProfileAvatarWebp(
       req.file.buffer
     );
 
@@ -132,7 +132,9 @@ export const uploadProfilePicture = async (req: AuthenticatedRequest, res: Respo
 
     res.json({
       message: 'Profile picture uploaded successfully',
+      avatar: cdnUrl,
       avatarUrl: cdnUrl,
+      url: cdnUrl,
       user,
     });
   } catch (error: any) {
@@ -163,9 +165,9 @@ export const uploadBanner = async (req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    // Process: resize to 1584x396 (4:1 ratio) + convert to AVIF
+    // Process: resize to 1584x396 (4:1 ratio) + convert to WebP for broad Android support.
     // Frontend already cropped, so we just resize without cropping
-    const processedBuffer = await imageProcessingService.processBannerImage(
+    const processedBuffer = await imageProcessingService.processProfileBannerWebp(
       req.file.buffer
     );
 
@@ -203,7 +205,9 @@ export const uploadBanner = async (req: AuthenticatedRequest, res: Response): Pr
 
     res.json({
       message: 'Banner image uploaded successfully',
+      bannerImageUrl: cdnUrl,
       bannerUrl: cdnUrl,
+      url: cdnUrl,
       user,
     });
   } catch (error: any) {

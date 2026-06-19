@@ -9,9 +9,9 @@ datasource db {
 }
 
 model User {
-  id                                                       String                 @id @default(uuid())
-  email                                                    String                 @unique
-  emailHash                                                String?                @unique
+  id                                                       String                                 @id @default(uuid())
+  email                                                    String                                 @unique
+  emailHash                                                String?                                @unique
   name                                                     String
   password                                                 String?
   profileImage                                             String?
@@ -19,12 +19,18 @@ model User {
   college                                                  String?
   branch                                                   String?
   graduationYear                                           Int?
-  isVerified                                               Boolean                @default(false)
-  authProvider                                             String                 @default("email")
-  googleId                                                 String?                @unique
-  appleId                                                  String?                @unique
-  createdAt                                                DateTime               @default(now())
-  updatedAt                                                DateTime               @updatedAt
+  isVerified                                               Boolean                                @default(false)
+  profileBadgeStyle                                        String?
+  authProvider                                             String                                 @default("email")
+  googleId                                                 String?                                @unique
+  appleId                                                  String?                                @unique
+  phoneEncrypted                                           String?
+  phoneHash                                                String?                                @unique
+  phoneLast4                                               String?                                @db.VarChar(8)
+  phoneVerifiedAt                                          DateTime?
+  identityTrustLevel                                       String                                 @default("BASIC")
+  createdAt                                                DateTime                               @default(now())
+  updatedAt                                                DateTime                               @updatedAt
   resetToken                                               String?
   resetTokenExpiry                                         DateTime?
   verificationToken                                        String?
@@ -34,39 +40,44 @@ model User {
   degree                                                   String?
   githubAccessToken                                        String?
   githubAvatarUrl                                          String?
-  githubConnected                                          Boolean                @default(false)
-  githubId                                                 String?                @unique
+  githubConnected                                          Boolean                                @default(false)
+  githubId                                                 String?                                @unique
   githubLastSyncedAt                                       DateTime?
   githubProfileUrl                                         String?
-  githubUsername                                           String?                @unique
-  headline                                                 String?                @db.VarChar(120)
+  githubUsername                                           String?                                @unique
+  headline                                                 String?                                @db.VarChar(120)
   interests                                                String[]
-  isOpenToOpportunities                                    Boolean                @default(false)
+  isOpenToOpportunities                                    Boolean                                @default(false)
   linkedinUrl                                              String?
   location                                                 String?
   otherSocialUrls                                          Json?
   portfolioUrl                                             String?
-  username                                                 String                 @unique
-  adminTwoFactorEnabled                                    Boolean                @default(false)
+  username                                                 String                                 @unique
+  adminTwoFactorEnabled                                    Boolean                                @default(false)
   adminTwoFactorSecret                                     String?
   currentCity                                              String?
-  isAdmin                                                  Boolean                @default(false)
-  isBanned                                                 Boolean                @default(false)
-  isOnline                                                 Boolean                @default(false)
+  isAdmin                                                  Boolean                                @default(false)
+  isBanned                                                 Boolean                                @default(false)
+  bannedReason                                             String?
+  safetyRestrictedUntil                                    DateTime?
+  safetyRestrictionReason                                  String?
+  safetySuspendedUntil                                     DateTime?
+  isOnline                                                 Boolean                                @default(false)
   lastActiveAt                                             DateTime?
   lastActivityAt                                           DateTime?
-  role                                                     String                 @default("user")
-  xpBalance                                                Int                    @default(0)
-  hasClaimedWelcomeGift                                    Boolean                @default(false)
+  role                                                     String                                 @default("user")
+  xpBalance                                                Int                                    @default(0)
+  hasClaimedWelcomeGift                                    Boolean                                @default(false)
   profileRing                                              String?
   visitLoaderGiftId                                        String?
+  profileTheme                                             String?
   latitude                                                 Float?
   locationUpdatedAt                                        DateTime?
   longitude                                                Float?
-  coinsBalance                                             Int                    @default(0)
-  onboardingCompleted                                      Boolean                @default(false)
+  coinsBalance                                             Int                                    @default(0)
+  onboardingCompleted                                      Boolean                                @default(false)
   onboardingCompletedAt                                    DateTime?
-  onboardingCompleteness                                   Int                    @default(0)
+  onboardingCompleteness                                   Int                                    @default(0)
   currentCountry                                           String?
   currentState                                             String?
   lastLocationUpdate                                       DateTime?
@@ -75,70 +86,81 @@ model User {
   deviceInfo                                               Json?
   lastKnownIP                                              String?
   locationAccuracy                                         Float?
-  locationPermission                                       Boolean?               @default(true)
+  locationPermission                                       Boolean?                               @default(true)
   locationSource                                           String?
-  shareLocationPublic                                      Boolean?               @default(false)
+  shareLocationPublic                                      Boolean?                               @default(false)
   contactJoinNotificationWindow                            ContactJoinNotificationWindow?
-  agent_action_logs                                        agent_action_logs[]    @relation("agent_action_logs_user")
-  agent_messages                                           agent_messages[]       @relation("agent_messages_user")
-  agent_preferences                                        agent_user_preferences? @relation("agent_preferences_user")
-  agent_pending_actions                                    agent_pending_actions[] @relation("agent_pending_actions_user")
-  agent_sessions                                           agent_sessions[]       @relation("agent_sessions_user")
-  user_goals                                               user_goals[]          @relation("user_goals_user")
-  accountability_pairs_accountability_pairs_user1IdTousers accountability_pairs[] @relation("accountability_pairs_user1IdTousers")
-  accountability_pairs_accountability_pairs_user2IdTousers accountability_pairs[] @relation("accountability_pairs_user2IdTousers")
+  agent_action_logs                                        agent_action_logs[]                    @relation("agent_action_logs_user")
+  agent_messages                                           agent_messages[]                       @relation("agent_messages_user")
+  agent_preferences                                        agent_user_preferences?                @relation("agent_preferences_user")
+  agent_pending_actions                                    agent_pending_actions[]                @relation("agent_pending_actions_user")
+  agent_sessions                                           agent_sessions[]                       @relation("agent_sessions_user")
+  user_goals                                               user_goals[]                           @relation("user_goals_user")
+  accountability_pairs_accountability_pairs_user1IdTousers accountability_pairs[]                 @relation("accountability_pairs_user1IdTousers")
+  accountability_pairs_accountability_pairs_user2IdTousers accountability_pairs[]                 @relation("accountability_pairs_user2IdTousers")
   achievements                                             Achievement[]
   certificates                                             Certificate[]
   circle_members                                           circle_members[]
   comment_likes                                            comment_likes[]
-  connections_connections_addresseeIdTousers               connections[]          @relation("connections_addresseeIdTousers")
-  connections_connections_requesterIdTousers               connections[]          @relation("connections_requesterIdTousers")
-  conversations_conversations_participant1IdTousers        conversations[]        @relation("conversations_participant1IdTousers")
-  conversations_conversations_participant2IdTousers        conversations[]        @relation("conversations_participant2IdTousers")
+  connections_connections_addresseeIdTousers               connections[]                          @relation("connections_addresseeIdTousers")
+  connections_connections_requesterIdTousers               connections[]                          @relation("connections_requesterIdTousers")
+  conversations_conversations_participant1IdTousers        conversations[]                        @relation("conversations_participant1IdTousers")
+  conversations_conversations_participant2IdTousers        conversations[]                        @relation("conversations_participant2IdTousers")
   device_tokens                                            device_tokens[]
+  user_devices                                             user_devices[]
   educationHistory                                         Education[]
   engagement_streaks                                       engagement_streaks?
   event_attendees                                          event_attendees[]
   experiences                                              Experience[]
-  follows_follows_followerIdTousers                        follows[]              @relation("follows_followerIdTousers")
-  follows_follows_followingIdTousers                       follows[]              @relation("follows_followingIdTousers")
+  follows_follows_followerIdTousers                        follows[]                              @relation("follows_followerIdTousers")
+  follows_follows_followingIdTousers                       follows[]                              @relation("follows_followingIdTousers")
   game_stats                                               game_stats?
-  arcade_rooms_host                                        arcade_rooms[]         @relation("arcade_rooms_host")
-  arcade_rooms_guest                                       arcade_rooms[]         @relation("arcade_rooms_guest")
-  arcade_rooms_winner                                      arcade_rooms[]         @relation("arcade_rooms_winner")
-  arcade_results_user                                      arcade_results[]       @relation("arcade_results_user")
-  arcade_results_opponent                                  arcade_results[]       @relation("arcade_results_opponent")
+  arcade_rooms_host                                        arcade_rooms[]                         @relation("arcade_rooms_host")
+  arcade_rooms_guest                                       arcade_rooms[]                         @relation("arcade_rooms_guest")
+  arcade_rooms_winner                                      arcade_rooms[]                         @relation("arcade_rooms_winner")
+  arcade_results_user                                      arcade_results[]                       @relation("arcade_results_user")
+  arcade_results_opponent                                  arcade_results[]                       @relation("arcade_results_opponent")
   contactSync                                              ContactSync?
-  matchedContactEntries                                    ContactSyncEntry[]     @relation("MatchedContactEntries")
+  matchedContactEntries                                    ContactSyncEntry[]                     @relation("MatchedContactEntries")
   githubStats                                              GitHubStats?
   group_messages                                           group_messages[]
-  group_invites_received                                   group_invites[]       @relation("group_invites_invitedUser")
-  group_invites_sent                                       group_invites[]       @relation("group_invites_invitedBy")
-  group_join_requests                                      group_join_requests[] @relation("group_join_requests_requester")
-  group_join_requests_reviewed                             group_join_requests[] @relation("group_join_requests_reviewedBy")
+  group_invites_received                                   group_invites[]                        @relation("group_invites_invitedUser")
+  group_invites_sent                                       group_invites[]                        @relation("group_invites_invitedBy")
+  group_join_requests                                      group_join_requests[]                  @relation("group_join_requests_requester")
+  group_join_requests_reviewed                             group_join_requests[]                  @relation("group_join_requests_reviewedBy")
   groups                                                   groups[]
-  mentorship_matches_mentorship_matches_menteeIdTousers    mentorship_matches[]   @relation("mentorship_matches_menteeIdTousers")
-  mentorship_matches_mentorship_matches_mentorIdTousers    mentorship_matches[]   @relation("mentorship_matches_mentorIdTousers")
-  notifications_notifications_actorIdTousers               notifications[]        @relation("notifications_actorIdTousers")
-  notifications_notifications_userIdTousers                notifications[]        @relation("notifications_userIdTousers")
+  mentorship_matches_mentorship_matches_menteeIdTousers    mentorship_matches[]                   @relation("mentorship_matches_menteeIdTousers")
+  mentorship_matches_mentorship_matches_mentorIdTousers    mentorship_matches[]                   @relation("mentorship_matches_mentorIdTousers")
+  notifications_notifications_actorIdTousers               notifications[]                        @relation("notifications_actorIdTousers")
+  notifications_notifications_userIdTousers                notifications[]                        @relation("notifications_userIdTousers")
   onboarding_profiles                                      onboarding_profiles?
-  postCollaborations                                       PostCollaborator[]     @relation("post_collaborators_user")
-  postCollabInvitesSent                                    PostCollaborator[]     @relation("post_collaborators_invitedBy")
+  postCollaborations                                       PostCollaborator[]                     @relation("post_collaborators_user")
+  postCollabInvitesSent                                    PostCollaborator[]                     @relation("post_collaborators_invitedBy")
   post_comments                                            post_comments[]
   postLikes                                                PostLike[]
   postPollVotes                                            PostPollVote[]
   posts                                                    Post[]
-  profile_views_profile_views_viewedIdTousers              profile_views[]        @relation("profile_views_viewedIdTousers")
-  profile_views_profile_views_viewerIdTousers              profile_views[]        @relation("profile_views_viewerIdTousers")
+  profile_views_profile_views_viewedIdTousers              profile_views[]                        @relation("profile_views_viewedIdTousers")
+  profile_views_profile_views_viewerIdTousers              profile_views[]                        @relation("profile_views_viewerIdTousers")
   projects                                                 Project[]
+  discoveryImpressions                                     discovery_impressions[]                @relation("discovery_impressions_user")
+  discoveryImpressionTargets                               discovery_impressions[]                @relation("discovery_impressions_target")
+  discoveryPasses                                          discovery_passes[]                     @relation("discovery_passes_user")
+  discoveryPassTargets                                     discovery_passes[]                     @relation("discovery_passes_target")
+  savedDiscoverySearches                                   saved_discovery_searches[]
+  savedDiscoverySearchMatchTargets                         saved_discovery_search_matches[]       @relation("saved_discovery_search_matches_target")
+  creatorProSettings                                       creator_pro_settings?
   featureAccessOverride                                    user_feature_access_overrides?
+  profileBoosts                                            profile_boosts[]
   premiumCheckoutEvents                                    premium_checkout_events[]
   reengagement_notification_deliveries                     reengagement_notification_deliveries[]
-  quiz_battles_quiz_battles_player1IdTousers               quiz_battles[]         @relation("quiz_battles_player1IdTousers")
-  quiz_battles_quiz_battles_player2IdTousers               quiz_battles[]         @relation("quiz_battles_player2IdTousers")
+  quiz_battles_quiz_battles_player1IdTousers               quiz_battles[]                         @relation("quiz_battles_player1IdTousers")
+  quiz_battles_quiz_battles_player2IdTousers               quiz_battles[]                         @relation("quiz_battles_player2IdTousers")
   reel_comments                                            reel_comments[]
   reel_likes                                               reel_likes[]
   reels                                                    reels[]
+  savedProfiles                                            saved_profiles[]                       @relation("saved_profiles_user")
+  savedProfileTargets                                      saved_profiles[]                       @relation("saved_profiles_target")
   saved_posts                                              saved_posts[]
   social_activity_feed                                     social_activity_feed[]
   stories                                                  stories[]
@@ -149,13 +171,25 @@ model User {
   user_onboarding                                          user_onboarding?
   skills                                                   UserSkill[]
   userStats                                                UserStats?
-  moderation_reports_submitted                             moderation_reports[]     @relation("moderation_reports_reporter")
-  moderation_reports_about                                 moderation_reports[]     @relation("moderation_reports_reported_user")
-  moderation_reports_reviewed                              moderation_reports[]     @relation("moderation_reports_reviewer")
+  moderation_reports_submitted                             moderation_reports[]                   @relation("moderation_reports_reporter")
+  moderation_reports_about                                 moderation_reports[]                   @relation("moderation_reports_reported_user")
+  moderation_reports_reviewed                              moderation_reports[]                   @relation("moderation_reports_reviewer")
+  identity_verifications                                   identity_verifications[]               @relation("identity_verifications_user")
+  identity_verifications_reviewed                          identity_verifications[]               @relation("identity_verifications_reviewer")
+  user_blocks_blocker                                      user_blocks[]                          @relation("user_blocks_blocker")
+  user_blocks_blocked                                      user_blocks[]                          @relation("user_blocks_blocked")
+  user_block_device_scopes_blocker                         user_block_device_scopes[]             @relation("user_block_device_scopes_blocker")
+  safety_events_actor                                      safety_events[]                        @relation("safety_events_actor")
+  safety_events_target                                     safety_events[]                        @relation("safety_events_target")
+  managedAdCampaignsCreated                                ManagedAdCampaign[]                    @relation("managed_ad_campaigns_created_by")
+  managedAdEvents                                          ManagedAdEvent[]                       @relation("managed_ad_events_user")
 
   @@index([username])
   @@index([isAdmin])
   @@index([isBanned])
+  @@index([identityTrustLevel])
+  @@index([safetyRestrictedUntil])
+  @@index([safetySuspendedUntil])
   @@index([onboardingCompleted])
   @@index([resetToken])
   @@index([verificationToken])
@@ -189,20 +223,20 @@ model ContactSync {
 }
 
 model ContactSyncEntry {
-  id                         String       @id @default(uuid())
+  id                         String      @id @default(uuid())
   syncId                     String
   contactName                String?
   emailHash                  String
   matchStatus                String
   matchedUserId              String?
-  source                     String       @default("picker")
+  source                     String      @default("picker")
   invitedAt                  DateTime?
   joinedNotificationQueuedAt DateTime?
   joinedNotificationSentAt   DateTime?
-  createdAt                  DateTime     @default(now())
-  updatedAt                  DateTime     @updatedAt
-  sync                       ContactSync  @relation(fields: [syncId], references: [id], onDelete: Cascade)
-  matchedUser                User?        @relation("MatchedContactEntries", fields: [matchedUserId], references: [id], onDelete: SetNull)
+  createdAt                  DateTime    @default(now())
+  updatedAt                  DateTime    @updatedAt
+  sync                       ContactSync @relation(fields: [syncId], references: [id], onDelete: Cascade)
+  matchedUser                User?       @relation("MatchedContactEntries", fields: [matchedUserId], references: [id], onDelete: SetNull)
 
   @@unique([syncId, emailHash])
   @@index([syncId, matchStatus])
@@ -213,12 +247,12 @@ model ContactSyncEntry {
 }
 
 model ContactJoinNotificationWindow {
-  id             String   @id @default(uuid())
-  userId         String   @unique
+  id             String    @id @default(uuid())
+  userId         String    @unique
   lastNotifiedAt DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([lastNotifiedAt])
   @@map("contact_join_notification_windows")
@@ -496,7 +530,7 @@ model Achievement {
   description    String?
   certificateUrl String?
   createdAt      DateTime @default(now())
-  updatedAt      DateTime  @updatedAt
+  updatedAt      DateTime @updatedAt
   user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
@@ -505,33 +539,87 @@ model Achievement {
 }
 
 model Post {
-  id            String          @id @default(uuid())
+  id            String             @id @default(uuid())
   authorId      String
   content       String
   mediaUrls     String[]
   metadata      Json?
-  type          String          @default("text")
-  visibility    String          @default("public")
-  likesCount    Int             @default(0)
-  commentsCount Int             @default(0)
-  sharesCount   Int             @default(0)
-  isActive      Boolean         @default(true)
-  createdAt     DateTime        @default(now())
-  updatedAt     DateTime  @updatedAt
+  type          String             @default("text")
+  visibility    String             @default("public")
+  likesCount    Int                @default(0)
+  commentsCount Int                @default(0)
+  sharesCount   Int                @default(0)
+  isActive      Boolean            @default(true)
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
   notifications notifications[]
   post_comments post_comments[]
   collaborators PostCollaborator[]
   likes         PostLike[]
   pollVotes     PostPollVote[]
-  author        User            @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  author        User               @relation(fields: [authorId], references: [id], onDelete: Cascade)
   saved_posts   saved_posts[]
 
   @@index([authorId])
   @@index([createdAt])
   @@index([authorId, createdAt])
   @@index([isActive, createdAt])
+  @@index([isActive, createdAt, id])
   @@index([authorId, isActive, createdAt])
   @@map("posts")
+}
+
+model ManagedAdCampaign {
+  id                 String           @id @default(uuid())
+  name               String
+  sponsorName        String
+  status             String           @default("draft")
+  placements         String[]         @default([])
+  priority           Int              @default(0)
+  startsAt           DateTime?
+  endsAt             DateTime?
+  frequencyCapPerDay Int              @default(3)
+  ctaText            String?
+  ctaKind            String?
+  ctaUrl             String?
+  feedTitle          String?
+  feedBody           String?
+  feedImageUrl       String?
+  reelCaption        String?
+  reelsVideoUrl      String?
+  reelsHlsUrl        String?
+  reelsThumbnailUrl  String?
+  targeting          Json?
+  impressionsCount   Int              @default(0)
+  clicksCount        Int              @default(0)
+  createdByAdminId   String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  createdByAdmin     User?            @relation("managed_ad_campaigns_created_by", fields: [createdByAdminId], references: [id], onDelete: SetNull)
+  events             ManagedAdEvent[]
+
+  @@index([status, startsAt, endsAt])
+  @@index([priority])
+  @@index([createdByAdminId])
+  @@map("managed_ad_campaigns")
+}
+
+model ManagedAdEvent {
+  id         String            @id @default(uuid())
+  campaignId String
+  userId     String?
+  eventType  String
+  placement  String
+  slotKey    String?
+  sessionId  String?
+  createdAt  DateTime          @default(now())
+  campaign   ManagedAdCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user       User?             @relation("managed_ad_events_user", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([campaignId, eventType, createdAt])
+  @@index([userId, eventType, createdAt])
+  @@index([sessionId, placement, createdAt])
+  @@map("managed_ad_events")
 }
 
 model PostCollaborator {
@@ -584,10 +672,10 @@ model PostPollVote {
 }
 
 model feed_impressions {
-  id        String   @id @default(uuid())
-  userId    String
-  postId    String
-  seenAt    DateTime @default(now())
+  id     String   @id @default(uuid())
+  userId String
+  postId String
+  seenAt DateTime @default(now())
 
   @@unique([userId, postId])
   @@index([userId, seenAt])
@@ -595,14 +683,14 @@ model feed_impressions {
 }
 
 model reward_card_events {
-  id              String    @id @default(uuid())
-  userId          String    @map("user_id")
-  candidateUserId String?   @map("candidate_user_id")
-  sessionId       String    @map("session_id")
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  candidateUserId String?  @map("candidate_user_id")
+  sessionId       String   @map("session_id")
   surface         String
-  cardType        String?   @map("card_type")
+  cardType        String?  @map("card_type")
   action          String
-  createdAt       DateTime  @default(now()) @map("created_at")
+  createdAt       DateTime @default(now()) @map("created_at")
 
   @@index([userId, createdAt])
   @@index([userId, candidateUserId, createdAt])
@@ -753,7 +841,7 @@ model campus_events {
   coverImageUrl   String?
   tags            String[]
   createdAt       DateTime          @default(now())
-  updatedAt       DateTime  @updatedAt
+  updatedAt       DateTime          @updatedAt
   circles         circles?          @relation(fields: [circleId], references: [id])
   event_attendees event_attendees[]
 
@@ -765,45 +853,45 @@ model campus_events {
 }
 
 model hackathons {
-  id                   String                       @id @default(uuid())
-  slug                 String                       @unique
+  id                   String            @id @default(uuid())
+  slug                 String            @unique
   title                String
   organizer            String?
-  source               String                       @default("college_fest")
+  source               String            @default("college_fest")
   sourceUrl            String?
   sourceId             String?
   college              String?
   description          String
   theme                String?
   location             String?
-  isOnline             Boolean                      @default(false)
+  isOnline             Boolean           @default(false)
   startsAt             DateTime
   endsAt               DateTime
   registrationDeadline DateTime?
-  teamMin              Int                          @default(1)
-  teamMax              Int                          @default(4)
+  teamMin              Int               @default(1)
+  teamMax              Int               @default(4)
   prizeSummary         String?
   tags                 String[]
   skills               String[]
   bannerUrl            String?
-  status               String                       @default("active")
-  isActive             Boolean                      @default(true)
+  status               String            @default("active")
+  isActive             Boolean           @default(true)
   createdById          String?
-  createdAt            DateTime                     @default(now())
-  updatedAt            DateTime                     @updatedAt
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
   teams                hackathon_teams[]
   saves                hackathon_saves[]
 
+  @@unique([source, sourceId])
   @@index([status, startsAt])
   @@index([source, startsAt])
-  @@unique([source, sourceId])
   @@index([college, startsAt])
   @@index([isActive, startsAt])
   @@index([createdAt])
 }
 
 model hackathon_teams {
-  id              String                         @id @default(uuid())
+  id              String                        @id @default(uuid())
   hackathonId     String
   ownerId         String
   groupId         String?
@@ -811,11 +899,11 @@ model hackathon_teams {
   pitch           String?
   lookingForRoles String[]
   requiredSkills  String[]
-  maxMembers      Int                            @default(4)
-  status          String                         @default("open")
-  createdAt       DateTime                       @default(now())
-  updatedAt       DateTime                       @updatedAt
-  hackathon       hackathons                     @relation(fields: [hackathonId], references: [id], onDelete: Cascade)
+  maxMembers      Int                           @default(4)
+  status          String                        @default("open")
+  createdAt       DateTime                      @default(now())
+  updatedAt       DateTime                      @updatedAt
+  hackathon       hackathons                    @relation(fields: [hackathonId], references: [id], onDelete: Cascade)
   members         hackathon_team_members[]
   applications    hackathon_team_applications[]
 
@@ -912,7 +1000,7 @@ model circle_posts {
   commentsCount Int      @default(0)
   isPinned      Boolean  @default(false)
   createdAt     DateTime @default(now())
-  updatedAt     DateTime  @updatedAt
+  updatedAt     DateTime @updatedAt
   circles       circles  @relation(fields: [circleId], references: [id], onDelete: Cascade)
 
   @@index([authorId])
@@ -942,7 +1030,7 @@ model circles {
   weeklyActivity    Float               @default(0)
   creatorId         String?
   createdAt         DateTime            @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime            @updatedAt
   campus_events     campus_events[]
   circle_challenges circle_challenges[]
   circle_members    circle_members[]
@@ -1076,7 +1164,7 @@ model connections {
   addresseeId                          String
   status                               String   @default("pending")
   createdAt                            DateTime @default(now())
-  updatedAt                            DateTime  @updatedAt
+  updatedAt                            DateTime @updatedAt
   users_connections_addresseeIdTousers User     @relation("connections_addresseeIdTousers", fields: [addresseeId], references: [id], onDelete: Cascade)
   users_connections_requesterIdTousers User     @relation("connections_requesterIdTousers", fields: [requesterId], references: [id], onDelete: Cascade)
 
@@ -1088,17 +1176,17 @@ model connections {
   @@index([addresseeId, status])
   @@index([requesterId, status, addresseeId])
   @@index([addresseeId, status, requesterId])
-  }
+}
 
 model conversations {
-  id                                        String     @id @default(uuid())
+  id                                        String               @id @default(uuid())
   participant1Id                            String
   participant2Id                            String
   lastMessageAt                             DateTime?
-  createdAt                                 DateTime   @default(now())
-  updatedAt                                 DateTime  @updatedAt
-  users_conversations_participant1IdTousers User       @relation("conversations_participant1IdTousers", fields: [participant1Id], references: [id], onDelete: Cascade)
-  users_conversations_participant2IdTousers User       @relation("conversations_participant2IdTousers", fields: [participant2Id], references: [id], onDelete: Cascade)
+  createdAt                                 DateTime             @default(now())
+  updatedAt                                 DateTime             @updatedAt
+  users_conversations_participant1IdTousers User                 @relation("conversations_participant1IdTousers", fields: [participant1Id], references: [id], onDelete: Cascade)
+  users_conversations_participant2IdTousers User                 @relation("conversations_participant2IdTousers", fields: [participant2Id], references: [id], onDelete: Cascade)
   messages                                  messages[]
   moderation_reports                        moderation_reports[]
 
@@ -1106,40 +1194,156 @@ model conversations {
   @@index([lastMessageAt])
   @@index([participant1Id])
   @@index([participant2Id])
+  @@index([participant1Id, lastMessageAt, id])
+  @@index([participant2Id, lastMessageAt, id])
 }
 
 /// User-generated reports (posts, chats, users, comments, groups) for admin moderation.
 model moderation_reports {
-  id                  String         @id @default(uuid())
-  reportType          String
-  reporterId          String
-  reason              String
-  description         String?
-  status              String         @default("PENDING")
-  priority            Int            @default(0)
-  actionTaken         String         @default("NONE")
-  adminNotes          String?
-  banReason           String?
-  reviewedById        String?
-  reviewedAt          DateTime?
-  reportedUserId      String?
-  reportedPostId      String?
-  reportedCommentId   String?
-  conversationId      String?
-  reportedGroupId     String?
-  extra               Json?
-  createdAt           DateTime       @default(now())
+  id                String         @id @default(uuid())
+  reportType        String
+  reporterId        String
+  reason            String
+  description       String?
+  status            String         @default("PENDING")
+  priority          Int            @default(0)
+  actionTaken       String         @default("NONE")
+  adminNotes        String?
+  banReason         String?
+  reviewedById      String?
+  reviewedAt        DateTime?
+  reportedUserId    String?
+  reportedPostId    String?
+  reportedCommentId String?
+  conversationId    String?
+  reportedGroupId   String?
+  extra             Json?
+  evidenceSnapshot  Json?
+  reporterPriorReports Int         @default(0)
+  reportedUserPriorReports Int     @default(0)
+  blockedUserAfterReport Boolean   @default(false)
+  createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
-  reporter            User           @relation("moderation_reports_reporter", fields: [reporterId], references: [id], onDelete: Cascade)
-  reportedUser        User?          @relation("moderation_reports_reported_user", fields: [reportedUserId], references: [id], onDelete: SetNull)
-  reviewerUser        User?          @relation("moderation_reports_reviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
-  conversation        conversations? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  reporter          User           @relation("moderation_reports_reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reportedUser      User?          @relation("moderation_reports_reported_user", fields: [reportedUserId], references: [id], onDelete: SetNull)
+  reviewerUser      User?          @relation("moderation_reports_reviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  conversation      conversations? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
 
   @@index([status])
   @@index([reportType])
   @@index([createdAt])
   @@index([conversationId])
   @@map("moderation_reports")
+}
+
+/// Identity checks for trust tiers. Evidence files are temporary and must be deleted after review.
+model identity_verifications {
+  id                 String    @id @default(uuid())
+  userId             String
+  type               String
+  status             String    @default("PENDING")
+  valueHash          String?
+  valueMasked        String?
+  evidenceStorageKey String?
+  evidenceFileName   String?
+  evidenceMimeType   String?
+  evidenceSize       Int?
+  evidenceDeletedAt  DateTime?
+  reviewNotes        String?
+  rejectionReason    String?
+  metadata           Json?
+  reviewedById       String?
+  requestedAt        DateTime  @default(now())
+  verifiedAt         DateTime?
+  expiresAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  user               User      @relation("identity_verifications_user", fields: [userId], references: [id], onDelete: Cascade)
+  reviewerUser       User?     @relation("identity_verifications_reviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@index([type, status])
+  @@index([reviewedById])
+  @@index([createdAt])
+  @@map("identity_verifications")
+}
+
+/// Explicit user blocks. Server-side enforcement must consult this table, not client state.
+model user_blocks {
+  id        String   @id @default(uuid())
+  blockerId String
+  blockedId String
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  blocker   User     @relation("user_blocks_blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked   User     @relation("user_blocks_blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  deviceScopes user_block_device_scopes[]
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+  @@index([blockerId, createdAt])
+  @@map("user_blocks")
+}
+
+/// Per-install identity signal for cross-account safety enforcement. Raw install IDs are never stored.
+model user_devices {
+  id            String   @id @default(uuid())
+  userId        String
+  installHash   String
+  platform      String   @default("unknown")
+  userAgentHash String?
+  ipHash        String?
+  firstSeenAt   DateTime @default(now())
+  lastSeenAt    DateTime @default(now())
+  lastLoginAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, installHash])
+  @@index([installHash])
+  @@index([userId, lastSeenAt])
+  @@index([platform, lastSeenAt])
+  @@map("user_devices")
+}
+
+/// Snapshot of blocked-side install hashes covered by a user block.
+model user_block_device_scopes {
+  id          String      @id @default(uuid())
+  blockId     String
+  blockerId   String
+  installHash String
+  platform    String?
+  createdAt   DateTime    @default(now())
+  block       user_blocks @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  blocker     User        @relation("user_block_device_scopes_blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+
+  @@unique([blockId, installHash])
+  @@index([blockerId, installHash])
+  @@index([installHash])
+  @@map("user_block_device_scopes")
+}
+
+/// Append-only safety audit trail for reports, blocks, identity reviews, and admin actions.
+model safety_events {
+  id           String   @id @default(uuid())
+  actorId      String?
+  targetUserId String?
+  eventType    String
+  entityType   String?
+  entityId     String?
+  reason       String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+  actor        User?    @relation("safety_events_actor", fields: [actorId], references: [id], onDelete: SetNull)
+  targetUser   User?    @relation("safety_events_target", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  @@index([actorId, createdAt])
+  @@index([targetUserId, createdAt])
+  @@index([eventType, createdAt])
+  @@index([entityType, entityId])
+  @@map("safety_events")
 }
 
 model daily_trivia_sessions {
@@ -1164,30 +1368,30 @@ model device_tokens {
   token     String   @unique
   platform  String
   isActive  Boolean  @default(true)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  users     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  users     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([userId, isActive])
 }
 
 model reengagement_notification_deliveries {
-  id              String   @id @default(uuid())
+  id              String    @id @default(uuid())
   userId          String
   campaignDateKey String
   slotKey         String
   slotHour        Int
   campaignType    String
-  status          String   @default("pending")
+  status          String    @default("pending")
   title           String
   body            String
   payload         Json?
   reason          String?
   sentAt          DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  users           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  users           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, campaignDateKey, slotKey])
   @@index([campaignDateKey, status])
@@ -1256,7 +1460,7 @@ model feature_flags {
   requiredPlan String   @default("free")
   isEnabled    Boolean  @default(true)
   createdAt    DateTime @default(now())
-  updatedAt    DateTime  @updatedAt
+  updatedAt    DateTime @updatedAt
 
   @@index([key])
 }
@@ -1307,28 +1511,28 @@ model game_stats {
 }
 
 model arcade_rooms {
-  id           String            @id @default(uuid())
-  gameType     String
-  hostId       String
-  guestId      String?
-  inviteCode   String            @unique
-  status       String            @default("waiting")
-  hostReady    Boolean           @default(false)
-  guestReady   Boolean           @default(false)
-  seed         Int               @default(0)
-  hostScore    Int               @default(0)
-  guestScore   Int               @default(0)
-  winnerId     String?
-  metadata     Json?
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
-  startedAt    DateTime?
-  completedAt  DateTime?
-  expiresAt    DateTime?
-  host         User              @relation("arcade_rooms_host", fields: [hostId], references: [id], onDelete: Cascade)
-  guest        User?             @relation("arcade_rooms_guest", fields: [guestId], references: [id], onDelete: SetNull)
-  winner       User?             @relation("arcade_rooms_winner", fields: [winnerId], references: [id], onDelete: SetNull)
-  results      arcade_results[]
+  id          String           @id @default(uuid())
+  gameType    String
+  hostId      String
+  guestId     String?
+  inviteCode  String           @unique
+  status      String           @default("waiting")
+  hostReady   Boolean          @default(false)
+  guestReady  Boolean          @default(false)
+  seed        Int              @default(0)
+  hostScore   Int              @default(0)
+  guestScore  Int              @default(0)
+  winnerId    String?
+  metadata    Json?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  startedAt   DateTime?
+  completedAt DateTime?
+  expiresAt   DateTime?
+  host        User             @relation("arcade_rooms_host", fields: [hostId], references: [id], onDelete: Cascade)
+  guest       User?            @relation("arcade_rooms_guest", fields: [guestId], references: [id], onDelete: SetNull)
+  winner      User?            @relation("arcade_rooms_winner", fields: [winnerId], references: [id], onDelete: SetNull)
+  results     arcade_results[]
 
   @@index([gameType, status])
   @@index([hostId])
@@ -1338,22 +1542,22 @@ model arcade_rooms {
 }
 
 model arcade_results {
-  id              String        @id @default(uuid())
+  id              String       @id @default(uuid())
   roomId          String
   gameType        String
   userId          String
   opponentId      String?
   result          String
-  score           Int           @default(0)
-  opponentScore   Int           @default(0)
-  xpEarned        Int           @default(0)
-  coinsEarned     Int           @default(0)
-  durationSeconds Int           @default(0)
+  score           Int          @default(0)
+  opponentScore   Int          @default(0)
+  xpEarned        Int          @default(0)
+  coinsEarned     Int          @default(0)
+  durationSeconds Int          @default(0)
   metadata        Json?
-  createdAt       DateTime      @default(now())
-  room            arcade_rooms  @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  user            User          @relation("arcade_results_user", fields: [userId], references: [id], onDelete: Cascade)
-  opponent        User?         @relation("arcade_results_opponent", fields: [opponentId], references: [id], onDelete: SetNull)
+  createdAt       DateTime     @default(now())
+  room            arcade_rooms @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user            User         @relation("arcade_results_user", fields: [userId], references: [id], onDelete: Cascade)
+  opponent        User?        @relation("arcade_results_opponent", fields: [opponentId], references: [id], onDelete: SetNull)
 
   @@unique([roomId, userId])
   @@index([gameType])
@@ -1363,12 +1567,14 @@ model arcade_results {
 }
 
 model group_members {
-  id       String   @id
-  groupId  String
-  userId   String
-  role     String   @default("member")
-  joinedAt DateTime @default(now())
-  groups   groups   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  id              String    @id
+  groupId         String
+  userId          String
+  role            String    @default("member")
+  joinedAt        DateTime  @default(now())
+  showInMessages  Boolean   @default(false)
+  messagesAddedAt DateTime?
+  groups          groups    @relation(fields: [groupId], references: [id], onDelete: Cascade)
 
   @@unique([groupId, userId])
   @@index([groupId])
@@ -1441,7 +1647,7 @@ model group_messages {
   isDeleted               Boolean                   @default(false)
   replyToId               String?
   createdAt               DateTime                  @default(now())
-  updatedAt               DateTime  @updatedAt
+  updatedAt               DateTime                  @updatedAt
   group_message_reactions group_message_reactions[]
   groups                  groups                    @relation(fields: [groupId], references: [id], onDelete: Cascade)
   group_messages          group_messages?           @relation("group_messagesTogroup_messages", fields: [replyToId], references: [id])
@@ -1454,30 +1660,30 @@ model group_messages {
 }
 
 model groups {
-  id             String           @id
-  name           String
-  slug           String?          @unique
-  description    String?
-  category       String?
-  rules          String[]         @default([])
-  imageUrl       String?
-  iconImage      String?
-  coverImage     String?
-  inviteCode     String?          @unique
-  inviteLinkVisibility String     @default("ADMINS")
-  inviteLinkUpdatedAt DateTime?
-  creatorId      String
-  isPrivate      Boolean          @default(false)
-  memberCount    Int              @default(1)
-  maxMembers     Int              @default(50)
-  tags           String[]
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime  @updatedAt
-  group_members  group_members[]
-  group_invites  group_invites[]  @relation("group_invites_group")
-  group_join_requests group_join_requests[] @relation("group_join_requests_group")
-  group_messages group_messages[]
-  users          User             @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  id                   String                @id
+  name                 String
+  slug                 String?               @unique
+  description          String?
+  category             String?
+  rules                String[]              @default([])
+  imageUrl             String?
+  iconImage            String?
+  coverImage           String?
+  inviteCode           String?               @unique
+  inviteLinkVisibility String                @default("ADMINS")
+  inviteLinkUpdatedAt  DateTime?
+  creatorId            String
+  isPrivate            Boolean               @default(false)
+  memberCount          Int                   @default(1)
+  maxMembers           Int                   @default(50)
+  tags                 String[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  group_members        group_members[]
+  group_invites        group_invites[]       @relation("group_invites_group")
+  group_join_requests  group_join_requests[] @relation("group_join_requests_group")
+  group_messages       group_messages[]
+  users                User                  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   @@index([creatorId])
   @@index([isPrivate])
@@ -1535,7 +1741,7 @@ model messages {
   isDeleted         Boolean             @default(false)
   replyToId         String?
   createdAt         DateTime            @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime            @updatedAt
   message_reactions message_reactions[]
   conversations     conversations       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   messages          messages?           @relation("messagesTomessages", fields: [replyToId], references: [id])
@@ -1543,6 +1749,7 @@ model messages {
 
   @@unique([conversationId, senderId, clientMessageId])
   @@index([conversationId, createdAt])
+  @@index([conversationId, createdAt, id])
   @@index([conversationId])
   @@index([receiverId])
   @@index([senderId])
@@ -1573,9 +1780,11 @@ model notifications {
   @@index([actorId])
   @@index([type])
   @@index([userId, createdAt])
+  @@index([userId, createdAt, id])
   @@index([userId])
   @@index([userId, isRead])
   @@index([userId, isRead, createdAt])
+  @@index([userId, isRead, createdAt, id])
 }
 
 model onboarding_profiles {
@@ -1612,7 +1821,7 @@ model onboarding_stats {
   totalConnections Int      @default(0)
   activeToday      Int      @default(0)
   calculatedAt     DateTime @default(now())
-  updatedAt        DateTime  @updatedAt
+  updatedAt        DateTime @updatedAt
 
   @@index([scope])
 }
@@ -1625,7 +1834,7 @@ model post_comments {
   content             String
   likesCount          Int             @default(0)
   createdAt           DateTime        @default(now())
-  updatedAt           DateTime  @updatedAt
+  updatedAt           DateTime        @updatedAt
   comment_likes       comment_likes[]
   users               User            @relation(fields: [authorId], references: [id], onDelete: Cascade)
   post_comments       post_comments?  @relation("post_commentsTopost_comments", fields: [parentId], references: [id], onDelete: Cascade)
@@ -1639,23 +1848,25 @@ model post_comments {
 }
 
 model OutboxEvent {
-  id           String   @id @default(uuid())
+  id            String    @id @default(uuid())
   aggregateType String
   aggregateId   String
   eventType     String
   queueName     String
+  idempotencyKey String?
   payload       Json
-  status        String   @default("pending")
-  attempts      Int      @default(0)
-  availableAt   DateTime @default(now())
+  status        String    @default("pending")
+  attempts      Int       @default(0)
+  availableAt   DateTime  @default(now())
   publishedAt   DateTime?
   lastError     String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   @@index([status, availableAt, createdAt])
   @@index([queueName, status, createdAt])
   @@index([aggregateType, aggregateId, createdAt])
+  @@index([idempotencyKey])
   @@map("outbox_events")
 }
 
@@ -1719,7 +1930,7 @@ model reel_audio {
   savesCount        Int                @default(0)
   isActive          Boolean            @default(true)
   createdAt         DateTime           @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime           @updatedAt
   reel_audio_saves  reel_audio_saves[]
   reels             reels[]
 
@@ -1760,7 +1971,7 @@ model reel_challenges {
   viewsCount        Int      @default(0)
   createdById       String
   createdAt         DateTime @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime @updatedAt
   reels             reels[]
 
   @@index([endsAt])
@@ -1791,7 +2002,7 @@ model reel_comments {
   isPinned            Boolean              @default(false)
   isAuthorHeart       Boolean              @default(false)
   createdAt           DateTime             @default(now())
-  updatedAt           DateTime  @updatedAt
+  updatedAt           DateTime             @updatedAt
   reel_comment_likes  reel_comment_likes[]
   users               User                 @relation(fields: [authorId], references: [id], onDelete: Cascade)
   reel_comments       reel_comments?       @relation("reel_commentsToreel_comments", fields: [parentId], references: [id], onDelete: Cascade)
@@ -1854,6 +2065,7 @@ model reel_reports {
   createdAt   DateTime  @default(now())
   reels       reels     @relation(fields: [reelId], references: [id], onDelete: Cascade)
 
+  @@unique([reelId, reporterId])
   @@index([reelId])
   @@index([status])
 }
@@ -1868,6 +2080,7 @@ model reel_saves {
 
   @@unique([reelId, userId])
   @@index([userId])
+  @@index([userId, createdAt, id])
 }
 
 model reel_shares {
@@ -1880,6 +2093,7 @@ model reel_shares {
   createdAt   DateTime @default(now())
   reels       reels    @relation(fields: [reelId], references: [id], onDelete: Cascade)
 
+  @@unique([reelId, userId])
   @@index([reelId])
   @@index([userId])
 }
@@ -1894,7 +2108,7 @@ model reel_views {
   source         String?
   deviceType     String?
   createdAt      DateTime @default(now())
-  updatedAt      DateTime  @updatedAt
+  updatedAt      DateTime @updatedAt
   reels          reels    @relation(fields: [reelId], references: [id], onDelete: Cascade)
 
   @@index([createdAt])
@@ -1974,7 +2188,7 @@ model reels {
   publishedAt         DateTime?
   scheduledAt         DateTime?
   createdAt           DateTime            @default(now())
-  updatedAt           DateTime  @updatedAt
+  updatedAt           DateTime            @updatedAt
   notifications       notifications[]
   reel_comments       reel_comments[]
   reel_likes          reel_likes[]
@@ -2000,7 +2214,12 @@ model reels {
   @@index([viewsCount])
   @@index([visibility])
   @@index([status, visibility, publishedAt, viewsCount, id])
+  @@index([status, visibility, publishedAt, id])
   @@index([authorId, status, visibility, publishedAt])
+  @@index([authorId, status, visibility, createdAt, id])
+  @@index([status, visibility, audioId, createdAt, id])
+  @@index([originalReelId, status, visibility, createdAt, id])
+  @@index([authorId, status, updatedAt, id])
 }
 
 model saved_posts {
@@ -2015,6 +2234,20 @@ model saved_posts {
   @@index([postId])
   @@index([userId])
   @@index([userId, createdAt, id])
+}
+
+model saved_profiles {
+  id           String   @id @default(uuid())
+  userId       String
+  targetUserId String
+  createdAt    DateTime @default(now())
+  user         User     @relation("saved_profiles_user", fields: [userId], references: [id], onDelete: Cascade)
+  targetUser   User     @relation("saved_profiles_target", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, targetUserId])
+  @@index([userId, createdAt])
+  @@index([targetUserId, createdAt])
+  @@map("saved_profiles")
 }
 
 model social_activity_feed {
@@ -2048,23 +2281,23 @@ model social_proof_leaderboards {
 }
 
 model stories {
-  id              String        @id
+  id              String            @id
   authorId        String
   mediaType       String
   mediaUrl        String?
   thumbnailUrl    String?
   textContent     String?
   backgroundColor String?
-  category        String        @default("GENERAL")
-  visibility      String        @default("PUBLIC")
+  category        String            @default("GENERAL")
+  visibility      String            @default("PUBLIC")
   linkUrl         String?
   linkTitle       String?
   musicMetadata   Json?
-  viewsCount      Int           @default(0)
-  reactionsCount  Int           @default(0)
+  viewsCount      Int               @default(0)
+  reactionsCount  Int               @default(0)
   expiresAt       DateTime
-  createdAt       DateTime      @default(now())
-  users           User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  createdAt       DateTime          @default(now())
+  users           User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
   story_views     story_views[]
   story_reactions story_reactions[]
 
@@ -2076,11 +2309,11 @@ model stories {
 
 // Story views tracking - unique per story per viewer (Instagram-style)
 model story_views {
-  id        String   @id @default(uuid())
-  storyId   String
-  viewerId  String
-  viewedAt  DateTime @default(now())
-  story     stories  @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  id       String   @id @default(uuid())
+  storyId  String
+  viewerId String
+  viewedAt DateTime @default(now())
+  story    stories  @relation(fields: [storyId], references: [id], onDelete: Cascade)
 
   @@unique([storyId, viewerId])
   @@index([storyId])
@@ -2105,31 +2338,31 @@ model story_reactions {
 }
 
 model subscriptions {
-  id                     String    @id
-  userId                 String    @unique
-  plan                   String    @default("free")
-  status                 String    @default("active")
-  provider               String    @default("manual")
-  razorpaySubscriptionId String?
-  razorpayCustomerId     String?
-  razorpayPlanId         String?
-  googlePlayPurchaseToken String?   @unique
-  googlePlayOrderId      String?
-  googlePlayProductId    String?
-  googlePlayBasePlanId   String?
-  googlePlaySubscriptionState String?
+  id                             String    @id
+  userId                         String    @unique
+  plan                           String    @default("free")
+  status                         String    @default("active")
+  provider                       String    @default("manual")
+  razorpaySubscriptionId         String?
+  razorpayCustomerId             String?
+  razorpayPlanId                 String?
+  googlePlayPurchaseToken        String?   @unique
+  googlePlayOrderId              String?
+  googlePlayProductId            String?
+  googlePlayBasePlanId           String?
+  googlePlaySubscriptionState    String?
   googlePlayAcknowledgementState String?
-  lastProviderSyncAt     DateTime?
-  amount                 Int?
-  currency               String    @default("INR")
-  billingCycle           String?
-  currentPeriodStart     DateTime?
-  currentPeriodEnd       DateTime?
-  trialEndsAt            DateTime?
-  cancelledAt            DateTime?
-  createdAt              DateTime  @default(now())
-  updatedAt              DateTime  @updatedAt
-  users                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastProviderSyncAt             DateTime?
+  amount                         Int?
+  currency                       String    @default("INR")
+  billingCycle                   String?
+  currentPeriodStart             DateTime?
+  currentPeriodEnd               DateTime?
+  trialEndsAt                    DateTime?
+  cancelledAt                    DateTime?
+  createdAt                      DateTime  @default(now())
+  updatedAt                      DateTime  @updatedAt
+  users                          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([plan])
   @@index([status])
@@ -2140,27 +2373,27 @@ model subscriptions {
 }
 
 model app_feature_settings {
-  id                       String   @id
-  premiumDefaultAmountMinor Int     @default(19900)
-  premiumCurrency          String   @default("INR")
-  agentAvailabilityMode    String   @default("all")
-  createdAt                DateTime @default(now())
-  updatedAt                DateTime @updatedAt
+  id                        String   @id
+  premiumDefaultAmountMinor Int      @default(19900)
+  premiumCurrency           String   @default("INR")
+  agentAvailabilityMode     String   @default("all")
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
 
   @@map("app_feature_settings")
 }
 
 model user_feature_access_overrides {
-  id                           String   @id @default(uuid())
-  userId                       String   @unique
-  premiumPriceOverrideMinor    Int?
-  agentEnabled                 Boolean  @default(false)
-  agentBlocked                 Boolean  @default(false)
-  profileCustomizationGranted  Boolean  @default(false)
-  profileCustomizationBlocked  Boolean  @default(false)
-  createdAt                    DateTime @default(now())
-  updatedAt                    DateTime @updatedAt
-  user                         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                          String   @id @default(uuid())
+  userId                      String   @unique
+  premiumPriceOverrideMinor   Int?
+  agentEnabled                Boolean  @default(false)
+  agentBlocked                Boolean  @default(false)
+  profileCustomizationGranted Boolean  @default(false)
+  profileCustomizationBlocked Boolean  @default(false)
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+  user                        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([agentEnabled])
   @@index([agentBlocked])
@@ -2169,22 +2402,134 @@ model user_feature_access_overrides {
   @@map("user_feature_access_overrides")
 }
 
+model creator_pro_settings {
+  id                             String   @id @default(uuid())
+  userId                         String   @unique
+  monetizedDmEnabled             Boolean  @default(false)
+  dmPriceMinor                   Int      @default(0)
+  sessionBookingEnabled          Boolean  @default(false)
+  sessionPriceMinor              Int      @default(0)
+  sessionDurationMinutes         Int      @default(30)
+  sessionCurrency                String   @default("INR")
+  collabPriorityEnabled          Boolean  @default(true)
+  showcaseAmplificationEnabled   Boolean  @default(true)
+  portfolioAmplificationEnabled  Boolean  @default(true)
+  availabilityNote               String?
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+  user                           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([collabPriorityEnabled])
+  @@index([showcaseAmplificationEnabled])
+  @@map("creator_pro_settings")
+}
+
 model premium_checkout_events {
-  id         String   @id @default(uuid())
-  userId     String
-  eventType  String
-  outcome    String   @default("info")
-  message    String?
+  id          String   @id @default(uuid())
+  userId      String
+  eventType   String
+  outcome     String   @default("info")
+  message     String?
   amountMinor Int?
-  currency   String?
-  metadata   Json?
-  createdAt  DateTime @default(now())
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currency    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([eventType, createdAt])
   @@index([outcome, createdAt])
   @@map("premium_checkout_events")
+}
+
+model profile_boosts {
+  id        String   @id @default(uuid())
+  userId    String
+  source    String   @default("premium")
+  status    String   @default("active")
+  priority  Int      @default(100)
+  startsAt  DateTime @default(now())
+  endsAt    DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, endsAt])
+  @@index([status, endsAt, priority])
+  @@map("profile_boosts")
+}
+
+model discovery_impressions {
+  id           String   @id @default(uuid())
+  userId       String
+  targetUserId String
+  source       String   @default("for_you")
+  windowStart  DateTime @db.Date
+  createdAt    DateTime @default(now())
+  user         User     @relation("discovery_impressions_user", fields: [userId], references: [id], onDelete: Cascade)
+  targetUser   User     @relation("discovery_impressions_target", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, targetUserId, source, windowStart])
+  @@index([userId, source, windowStart])
+  @@index([targetUserId])
+  @@map("discovery_impressions")
+}
+
+model discovery_passes {
+  id           String    @id @default(uuid())
+  userId       String
+  targetUserId String
+  source       String    @default("for_you")
+  status       String    @default("active")
+  passedAt     DateTime  @default(now())
+  rewoundAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  user         User      @relation("discovery_passes_user", fields: [userId], references: [id], onDelete: Cascade)
+  targetUser   User      @relation("discovery_passes_target", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, targetUserId, source])
+  @@index([userId, source, status, passedAt])
+  @@index([targetUserId])
+  @@map("discovery_passes")
+}
+
+model saved_discovery_searches {
+  id                   String                           @id @default(uuid())
+  userId               String
+  name                 String
+  filters              Json
+  notificationsEnabled Boolean                          @default(true)
+  digestEnabled        Boolean                          @default(true)
+  lastViewedAt         DateTime                         @default(now())
+  lastScannedAt        DateTime?
+  lastDigestSentAt     DateTime?
+  createdAt            DateTime                         @default(now())
+  updatedAt            DateTime                         @updatedAt
+  user                 User                             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  matches              saved_discovery_search_matches[]
+
+  @@index([userId, updatedAt])
+  @@index([notificationsEnabled, digestEnabled, lastDigestSentAt])
+  @@map("saved_discovery_searches")
+}
+
+model saved_discovery_search_matches {
+  id             String                   @id @default(uuid())
+  savedSearchId  String
+  targetUserId   String
+  firstMatchedAt DateTime                 @default(now())
+  seenAt         DateTime?
+  notifiedAt     DateTime?
+  digestSentAt   DateTime?
+  savedSearch    saved_discovery_searches @relation(fields: [savedSearchId], references: [id], onDelete: Cascade)
+  targetUser     User                     @relation("saved_discovery_search_matches_target", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([savedSearchId, targetUserId])
+  @@index([savedSearchId, seenAt, firstMatchedAt])
+  @@index([savedSearchId, digestSentAt])
+  @@index([targetUserId])
+  @@map("saved_discovery_search_matches")
 }
 
 model trending_items {

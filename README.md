@@ -27,6 +27,27 @@ npm run prisma:migrate
 npm run dev
 ```
 
+By default `npm run dev` skips API Redis realtime fanout and BullMQ
+worker/scheduler processes when `REDIS_URL` points at Upstash. This avoids
+burning through a low-quota remote Redis while you are only testing the API or
+Android client. To intentionally use remote Redis locally, set
+`API_REDIS_MODE=true` and `DEV_BACKGROUND_JOBS=true`.
+
+For Android/local API debugging, start only the API server on port `5000` and use the in-memory local rate limiter:
+
+```bash
+REDIS_URL= REDIS_REQUIRED=false PORT=5000 npm run dev:server
+```
+
+If you see `ERR Your database has been temporarily rate-limited` from worker
+logs, treat it as a Redis capacity issue. Use a local Redis for development,
+keep `WORKER_CONCURRENCY` low on starter Redis plans, or upgrade the Redis plan
+for production background jobs.
+
+When remote Upstash Redis is skipped in development, bearer JWTs are allowed to
+survive backend restarts. Production should keep `AUTH_REQUIRE_SESSION_ID=true`
+so access tokens remain bound to server-side sessions.
+
 If you want to disable the automatic Neon keep-alive helper for a session, run with `AUTO_KEEP_DB_AWAKE=false`.
 
 ### Render Deploy
@@ -41,6 +62,39 @@ Pre-Deploy Command: npm run migrate:deploy
 Start Command: npm start
 Health Check Path: /api/health
 ```
+
+### Database Pooling
+
+Production API, worker, and scheduler processes should connect to Postgres
+through a transaction-mode pooler, not the direct database host. Use the managed
+pooler from your provider when available: Supabase/Neon pooled connection,
+PgBouncer, RDS Proxy, or an equivalent transaction pooler.
+
+Required production shape:
+
+```bash
+# Runtime app traffic: pooled transaction-mode endpoint.
+DATABASE_URL="postgresql://user:pass@pooler-host:6543/db?sslmode=require&pgbouncer=true&connection_limit=3"
+
+# Optional read split: use the read-replica pooler if your provider exposes one.
+READ_DATABASE_URL="postgresql://user:pass@read-pooler-host:6543/db?sslmode=require&pgbouncer=true&connection_limit=3"
+
+# Migrations only: direct Postgres endpoint, not PgBouncer.
+DIRECT_URL="postgresql://user:pass@direct-db-host:5432/db?sslmode=require"
+```
+
+Recommended starting point per API/worker instance:
+
+- `PRISMA_CONNECTION_LIMIT=3`
+- `PRISMA_READ_CONNECTION_LIMIT=3`
+- `PRISMA_PGBOUNCER=auto` or `true`
+- Pooler `default_pool_size`: start near `10-20`, then tune to DB size.
+- Pooler `max_client_conn`: high enough for app instances, workers, deploys, and admin access.
+
+Keep `DB_POOLER_REQUIRED=true` in production so the app fails fast if runtime
+traffic is accidentally pointed at a direct Postgres URL. Prisma migrations use
+`DIRECT_URL` from `schema.prisma`; run them with the normal deploy command
+before starting new app instances.
 
 This package also includes a `postinstall` hook that runs `npm run build`. That makes Render's default Node build behavior safer, because a plain `npm install` will still generate `dist/api.js`.
 

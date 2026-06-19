@@ -370,6 +370,15 @@ function contentCompletenessScore(post: any): number {
   return score;
 }
 
+function authorPremiumVisibilityScore(post: any): number {
+  const author = post?.author || {};
+  let score = 0;
+  score += toNumber(author.discoveryPriority) * 35;
+  if (author.profileBoostActive) score += 1800;
+  if (author.isPremium) score += 700;
+  return score;
+}
+
 function stableExplorationBoost(id: unknown): number {
   const value = String(id || '');
   let hash = 0;
@@ -425,6 +434,7 @@ export function calculatePostScore(
   score += exactTagScore(tagTokens, context.interestWeights, 920, 2760);
   score += exactTagScore(tagTokens, context.educationWeights, 720, 2160);
   score += contentCompletenessScore(post);
+  score += authorPremiumVisibilityScore(post);
   score += stableExplorationBoost(post?.id);
 
   score *= seenPenalty(post, context);

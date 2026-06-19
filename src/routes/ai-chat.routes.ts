@@ -9,12 +9,14 @@ import {
   changeTone,
   translateMessage,
   expandMessage,
+  assistantChat,
   careerChat,
 } from '../controllers/ai-chat.controller';
 
 const router = Router();
 const helperRateLimit = createAIRateLimitMiddleware('helper');
 const careerRateLimit = createAIRateLimitMiddleware('career-chat');
+const assistantRateLimit = createAIRateLimitMiddleware('talk');
 
 router.use(authenticate);
 
@@ -25,6 +27,7 @@ router.post('/smart-replies', helperRateLimit, getSmartReplies);
 router.post('/change-tone', helperRateLimit, changeTone);
 router.post('/translate', helperRateLimit, translateMessage);
 router.post('/expand', helperRateLimit, expandMessage);
+router.post('/assistant', assistantRateLimit, assistantChat);
 router.post('/career-chat', careerRateLimit, careerChat);
 
 export default router;

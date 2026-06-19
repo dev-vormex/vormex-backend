@@ -1,4 +1,5 @@
 import { OAuth2Client } from 'google-auth-library';
+import { fetchWithBreaker } from './http-client-with-breaker.util';
 
 /**
  * Google Token Payload Interface
@@ -122,6 +123,9 @@ async function parseGoogleTokenError(response: Response): Promise<string> {
   const errorDescription = String(body?.error_description || body?.error || '');
 
   if (errorCode === 'invalid_client') {
+    if (process.env.NODE_ENV !== 'production') {
+      return 'Google OAuth client secret is invalid for GOOGLE_CLIENT_ID_WEB. Update GOOGLE_CLIENT_SECRET from the same Web OAuth client in Google Cloud Console and restart the backend.';
+    }
     return 'Google sign-in is misconfigured. Please contact support.';
   }
 
@@ -158,13 +162,13 @@ export async function exchangeGoogleAuthorizationCodeForIdToken(
     code_verifier: codeVerifier,
   });
 
-  const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+  const tokenResponse = await fetchWithBreaker('google_oauth', 'exchange_token', 'https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: tokenParams.toString(),
-  });
+  }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
   if (!tokenResponse.ok) {
     throw new Error(await parseGoogleTokenError(tokenResponse));

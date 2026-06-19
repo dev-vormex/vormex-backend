@@ -5,6 +5,10 @@ import {
   trackProfileView,
   getProfileViews,
   getProfileViewHistory,
+  toggleProfileSave,
+  getProfileSaves,
+  getRecentProfileViews,
+  getProfileInsights,
   getLeaderboard,
   getGroupStats,
   getEventStats,
@@ -47,6 +51,10 @@ router.use(authenticate);
 router.post('/track-view', trackProfileView);
 router.get('/profile-views/:userId', getProfileViews);
 router.get('/profile-views/:userId/history', getProfileViewHistory);
+router.post('/profile-saves/:targetUserId/toggle', toggleProfileSave);
+router.get('/profile-saves/:userId', getProfileSaves);
+router.get('/recent-profile-views', getRecentProfileViews);
+router.get('/profile-insights/:userId', getProfileInsights);
 
 // Group/circle stats
 router.get('/group-stats/:groupId', getGroupStats);

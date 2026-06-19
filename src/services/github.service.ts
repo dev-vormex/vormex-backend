@@ -10,10 +10,68 @@ import type {
 } from '../types/github.types';
 import { encryptToken } from '../utils/encryption.util';
 import { prisma } from '../config/prisma';
+import { requestWithBreaker } from '../utils/http-client-with-breaker.util';
 
 // Validate environment variables at module load
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
+
+interface GitHubRateLimitResponse {
+  resources?: {
+    core?: {
+      remaining?: number;
+    };
+  };
+}
+
+interface GitHubOAuthTokenResponse {
+  access_token?: string;
+  error?: string;
+  error_description?: string;
+}
+
+interface GitHubApiUserResponse {
+  login?: string;
+  id?: number;
+  avatar_url?: string;
+  html_url?: string;
+  name?: string | null;
+  bio?: string | null;
+  public_repos?: number;
+  followers?: number;
+  following?: number;
+}
+
+interface GitHubGraphQlResponse {
+  errors?: Array<{ message?: string }>;
+  data?: {
+    user?: {
+      contributionsCollection?: {
+        contributionYears?: number[];
+        contributionCalendar?: {
+          colors?: string[];
+          totalContributions?: number;
+          months?: Array<{
+            firstDay: string;
+            name: string;
+            totalWeeks: number;
+            year: number;
+          }>;
+          weeks?: Array<{
+            firstDay: string;
+            contributionDays?: Array<{
+              color: string;
+              contributionCount: number;
+              contributionLevel: string;
+              date: string;
+              weekday: number;
+            }>;
+          }>;
+        };
+      };
+    };
+  };
+}
 
 if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
   throw new Error('GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set in environment variables');
@@ -26,14 +84,16 @@ if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
  */
 async function checkRateLimit(accessToken: string): Promise<void> {
   try {
-    const response = await axios.get('https://api.github.com/rate_limit', {
+    const response = await requestWithBreaker<GitHubRateLimitResponse>('github', 'rate_limit', {
+      method: 'GET',
+      url: 'https://api.github.com/rate_limit',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Accept': 'application/vnd.github+json',
       },
-    });
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
-    const remaining = response.data.resources.core.remaining;
+    const remaining = response.data.resources?.core?.remaining ?? 0;
     console.log(`GitHub API rate limit: ${remaining} requests remaining`);
 
     if (remaining < 10) {
@@ -58,19 +118,18 @@ async function checkRateLimit(accessToken: string): Promise<void> {
  */
 export async function exchangeCodeForToken(code: string): Promise<string> {
   try {
-    const response = await axios.post(
-      'https://github.com/login/oauth/access_token',
-      {
+    const response = await requestWithBreaker<GitHubOAuthTokenResponse>('github', 'oauth_token', {
+      method: 'POST',
+      url: 'https://github.com/login/oauth/access_token',
+      data: {
         client_id: GITHUB_CLIENT_ID,
         client_secret: GITHUB_CLIENT_SECRET,
         code,
       },
-      {
-        headers: {
-          'Accept': 'application/json',
-        },
-      }
-    );
+      headers: {
+        'Accept': 'application/json',
+      },
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
     if (response.data.error) {
       throw new Error(`GitHub OAuth error: ${response.data.error_description || response.data.error}`);
@@ -103,12 +162,14 @@ export async function exchangeCodeForToken(code: string): Promise<string> {
  */
 export async function getGitHubUserProfile(accessToken: string): Promise<GitHubUser> {
   try {
-    const response = await axios.get('https://api.github.com/user', {
+    const response = await requestWithBreaker<GitHubApiUserResponse>('github', 'user_profile', {
+      method: 'GET',
+      url: 'https://api.github.com/user',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Accept': 'application/vnd.github+json',
       },
-    });
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
     const user = response.data;
 
@@ -163,21 +224,20 @@ export async function getUserRepositories(
     let hasMore = true;
 
     while (hasMore) {
-      const response = await axios.get(
-        `https://api.github.com/users/${username}/repos`,
-        {
-          params: {
-            type: 'owner',
-            per_page: 100,
-            sort: 'updated',
-            page,
-          },
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Accept': 'application/vnd.github+json',
-          },
-        }
-      );
+      const response = await requestWithBreaker<GitHubRepo[]>('github', 'user_repositories', {
+        method: 'GET',
+        url: `https://api.github.com/users/${username}/repos`,
+        params: {
+          type: 'owner',
+          per_page: 100,
+          sort: 'updated',
+          page,
+        },
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Accept': 'application/vnd.github+json',
+        },
+      }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
       const repos: GitHubRepo[] = response.data
         .filter((repo: any) => !repo.private) // Only public repos
@@ -235,15 +295,14 @@ export async function getRepositoryLanguages(
   accessToken: string
 ): Promise<GitHubLanguageResponse> {
   try {
-    const response = await axios.get(
-      `https://api.github.com/repos/${owner}/${repo}/languages`,
-      {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Accept': 'application/vnd.github+json',
-        },
-      }
-    );
+    const response = await requestWithBreaker<GitHubLanguageResponse>('github', 'repository_languages', {
+      method: 'GET',
+      url: `https://api.github.com/repos/${owner}/${repo}/languages`,
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Accept': 'application/vnd.github+json',
+      },
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
 
     // Handle empty response (repo with no code)
     if (!response.data || Object.keys(response.data).length === 0) {
@@ -352,9 +411,10 @@ export async function getGitHubContributionCalendar(
   accessToken: string
 ): Promise<GitHubContributionCalendar> {
   try {
-    const response = await axios.post(
-      'https://api.github.com/graphql',
-      {
+    const response = await requestWithBreaker<GitHubGraphQlResponse>('github', 'contribution_calendar', {
+      method: 'POST',
+      url: 'https://api.github.com/graphql',
+      data: {
         query: `
           query GetContributionCalendar($username: String!) {
             user(login: $username) {
@@ -386,13 +446,11 @@ export async function getGitHubContributionCalendar(
         `,
         variables: { username },
       },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/vnd.github+json',
-        },
-      }
-    );
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/vnd.github+json',
+      },
+    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 12_000 });
 
     if (response.data?.errors?.length) {
       const firstError = response.data.errors[0];

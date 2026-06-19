@@ -25,6 +25,10 @@ import {
   enqueueRealtimeFanout,
 } from '../outbox/helpers';
 import {
+  applyPremiumVisibilityToUser,
+  getPremiumVisibilityByUserIds,
+} from '../services/premium-visibility.service';
+import {
   extractDomain,
   mapPollOptionsForResponse,
   mapPostResponse,
@@ -38,6 +42,18 @@ import {
 } from '../utils/post.util';
 import { parseStoredMusicAttachment } from '../utils/music.util';
 import { buildPostVisibilityWhere, canViewPost } from '../utils/access-control.util';
+import { enforceTrustTierLimit, getBlockedUserIds, safetyErrorResponse } from '../services/trust-safety.service';
+import { selectManagedAdPlacements } from '../services/managed-ad.service';
+import {
+  createStorageUploadIntent,
+  validateFinalizedStorageMedia,
+  type FinalizedDirectMedia,
+} from '../utils/direct-media-upload.util';
+import {
+  createdAtDescKeysetWhere,
+  decodeKeysetCursor,
+  encodeKeysetCursor,
+} from '../utils/keyset-pagination.util';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -47,7 +63,7 @@ const FEED_REALTIME_ROOM = 'feed:global';
 const FEED_IMPRESSION_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const FEED_IMPRESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const HOME_FEED_CACHE_TTL_SECONDS = 60;
-const HOME_FEED_CACHE_VERSION = 'v1';
+const HOME_FEED_CACHE_VERSION = 'v2';
 const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
 const HOME_FEED_DEFAULT_LIMIT = 40;
 const HOME_FEED_MAX_LIMIT = 50;
@@ -67,6 +83,8 @@ const postAuthorSelect = {
   profileImage: true,
   headline: true,
   isVerified: true,
+  profileBadgeStyle: true,
+  identityTrustLevel: true,
 };
 const postAuthorWithProfileSignalsSelect = {
   ...postAuthorSelect,
@@ -105,6 +123,26 @@ const postResponseInclude = (
   },
   _count: { select: { saved_posts: true } },
 });
+
+async function selectHomeFeedAdPlacements(
+  currentUserId: string,
+  itemCount: number,
+  itemOffset: number,
+  sessionId?: string | null
+) {
+  try {
+    return await selectManagedAdPlacements({
+      userId: currentUserId,
+      placement: 'feed',
+      itemCount,
+      itemOffset,
+      sessionId,
+    });
+  } catch (error) {
+    console.error('Failed to select home feed ads:', error);
+    return [];
+  }
+}
 
 const feedCacheTags = (...tags: Array<string | null | undefined>): string[] => {
   const dynamicTags = tags.filter((tag): tag is string => Boolean(tag));
@@ -297,6 +335,92 @@ function buildMetadataFromRequest(
 
   return Object.keys(metadata).length > 0 ? metadata : null;
 }
+
+function parseDirectMediaField(value: unknown): FinalizedDirectMedia[] {
+  const parsed = typeof value === 'string'
+    ? (() => {
+        try {
+          return JSON.parse(value) as unknown;
+        } catch {
+          return [];
+        }
+      })()
+    : value;
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((item): item is FinalizedDirectMedia => Boolean(item && typeof item === 'object'))
+    .slice(0, 10);
+}
+
+async function validateDirectPostMedia(
+  userId: string,
+  value: unknown
+): Promise<Array<FinalizedDirectMedia & { url: string }>> {
+  const media = parseDirectMediaField(value);
+  const validated: Array<FinalizedDirectMedia & { url: string }> = [];
+
+  for (const item of media) {
+    if (!item.objectKey || !item.token || !item.mimeType || !Number.isFinite(Number(item.sizeBytes))) {
+      throw new Error('Invalid direct media payload');
+    }
+
+    const url = await validateFinalizedStorageMedia({
+      userId,
+      token: String(item.token),
+      objectKey: String(item.objectKey),
+      mimeType: String(item.mimeType),
+      sizeBytes: Number(item.sizeBytes),
+      purpose: 'post_media',
+    });
+
+    validated.push({
+      ...item,
+      url,
+      sizeBytes: Number(item.sizeBytes),
+    });
+  }
+
+  return validated;
+}
+
+export const getPostUploadUrl = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const mimeType = ensureString(req.body?.mimeType);
+    const sizeBytes = Number(req.body?.sizeBytes);
+    if (!mimeType || !Number.isFinite(sizeBytes)) {
+      res.status(400).json({ error: 'mimeType and sizeBytes are required' });
+      return;
+    }
+
+    const credential = createStorageUploadIntent({
+      userId: String(req.user.userId),
+      purpose: 'post_media',
+      mimeType,
+      sizeBytes,
+    });
+
+    res.json({
+      provider: 'bunny_storage',
+      uploadMethod: 'PUT',
+      uploadUrl: credential.uploadUrl,
+      uploadHeaders: credential.headers,
+      objectKey: credential.objectKey,
+      cdnUrl: credential.cdnUrl,
+      uploadToken: credential.token,
+      expiresAt: credential.intent.expiresAt,
+      maxBytes: credential.intent.maxBytes,
+      mimeType,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to issue upload credential';
+    res.status(message.includes('large') || message.includes('Unsupported') ? 400 : 500).json({ error: message });
+  }
+};
 
 function compactStringList(values: unknown[]): string[] {
   return values
@@ -513,6 +637,9 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     );
     const modeRaw = (ensureString(req.query.mode) || 'recommended').toLowerCase();
     const mode: 'latest' | 'recommended' = modeRaw === 'latest' ? 'latest' : 'recommended';
+    const adSessionId = ensureString(req.query.adSessionId);
+    const requestedAdItemOffset = parseInt(ensureString(req.query.adItemOffset) || '0', 10);
+    const adItemOffset = Math.min(Math.max(Number.isFinite(requestedAdItemOffset) ? requestedAdItemOffset : 0, 0), 10000);
     const recommendedCursorState =
       mode === 'recommended'
         ? decodeRecommendedFeedCursor(cursor, requestStartedAtMs)
@@ -522,7 +649,12 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     const dbCursor =
       mode === 'recommended'
         ? recommendedCursorState?.baseCursor
-        : cursor;
+        : null;
+    const latestCursor =
+      mode === 'latest'
+        ? decodeKeysetCursor(cursor, 'feed.latest')
+        : null;
+    const latestCursorWhere = createdAtDescKeysetWhere(latestCursor);
     const candidateLimit =
       mode === 'recommended'
         ? recommendedFeedCandidateLimit(limit)
@@ -531,139 +663,160 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     const cacheCursor =
       mode === 'recommended'
         ? cursor
-        : dbCursor;
+        : cursor;
     const feedCacheKey = buildHomeFeedCacheKey({
       userId: currentUserId,
       cursor: cacheCursor || '',
       limit,
       mode,
     });
+    const blockedUserIds = await getBlockedUserIds(currentUserId);
+    const blockedUserIdSet = new Set(blockedUserIds);
 
-    if (!bypassFeedCache) {
-      const cachedFeed = await cacheService.get<{
-        posts: any[];
-        nextCursor: string | null;
-        hasMore: boolean;
-      }>(feedCacheKey);
-      if (cachedFeed) {
-        res.setHeader('X-Vormex-Cache', 'HIT');
-        res.json(cachedFeed);
-        if (mode === 'recommended') {
-          writeRecommendedFeedImpressions(currentUserId, cachedFeed.posts.map((post) => post.id));
-        }
-        return;
-      }
-    }
+    const computeFeedPayload = async () => {
+      const accessWhere = await buildPostVisibilityWhere(currentUserId);
 
-    const accessWhere = await buildPostVisibilityWhere(currentUserId);
+      const postsPromise = prismaRead.post.findMany({
+        where: {
+          isActive: true,
+          ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
+          ...accessWhere,
+          ...(mode === 'recommended'
+            ? { createdAt: { lte: new Date(recommendationSessionStartedAtMs + 5_000) } }
+            : {}),
+          ...(mode === 'latest' && latestCursorWhere ? { AND: [latestCursorWhere] } : {}),
+        },
+        include: postResponseInclude(currentUserId, { authorProfileSignals: mode === 'recommended' }),
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: candidateLimit + 1,
+        ...(dbCursor ? { cursor: { id: dbCursor }, skip: 1 } : {}),
+      });
 
-    const postsPromise = prismaRead.post.findMany({
-      where: {
-        isActive: true,
-        ...accessWhere,
-        ...(mode === 'recommended'
-          ? { createdAt: { lte: new Date(recommendationSessionStartedAtMs + 5_000) } }
-          : {}),
-      },
-      include: postResponseInclude(currentUserId, { authorProfileSignals: mode === 'recommended' }),
-      orderBy: { createdAt: 'desc' },
-      take: candidateLimit + 1,
-      ...(dbCursor ? { cursor: { id: dbCursor }, skip: 1 } : {}),
-    });
+      const feedImpressionsModel = (prismaRead as any).feed_impressions;
+      const recommendationContextPromise =
+        mode === 'recommended'
+          ? buildFeedRecommendationContextForUser(currentUserId)
+          : Promise.resolve(null);
 
-    const feedImpressionsModel = (prismaRead as any).feed_impressions;
-    const recommendationContextPromise =
-      mode === 'recommended'
-        ? buildFeedRecommendationContextForUser(currentUserId)
-        : Promise.resolve(null);
+      const [posts, recommendationContext] = await Promise.all([
+        postsPromise,
+        recommendationContextPromise,
+      ]);
 
-    const [posts, recommendationContext] = await Promise.all([
-      postsPromise,
-      recommendationContextPromise,
-    ]);
+      const hasMoreChronological = posts.length > candidateLimit;
+      const rawChronologicalItems = hasMoreChronological ? posts.slice(0, candidateLimit) : posts;
+      const authorVisibilityByUser = await getPremiumVisibilityByUserIds(
+        rawChronologicalItems.map((post) => post.authorId)
+      );
+      const chronologicalItems = rawChronologicalItems.map((post) => ({
+        ...post,
+        author: post.author
+          ? applyPremiumVisibilityToUser(post.author, authorVisibilityByUser)
+          : post.author,
+      }));
 
-    const hasMoreChronological = posts.length > candidateLimit;
-    const chronologicalItems = hasMoreChronological ? posts.slice(0, candidateLimit) : posts;
-
-    const impressions =
-      mode === 'recommended' && feedImpressionsModel && chronologicalItems.length > 0
-        ? await feedImpressionsModel.findMany({
-            where: {
-              userId: currentUserId,
-              postId: { in: chronologicalItems.map((post) => post.id) },
-              seenAt: { gte: new Date(Date.now() - FEED_IMPRESSION_LOOKBACK_MS) },
-            },
-            select: { postId: true, seenAt: true },
+      const impressions =
+        mode === 'recommended' && feedImpressionsModel && chronologicalItems.length > 0
+          ? await feedImpressionsModel.findMany({
+              where: {
+                userId: currentUserId,
+                postId: { in: chronologicalItems.map((post) => post.id) },
+                seenAt: { gte: new Date(Date.now() - FEED_IMPRESSION_LOOKBACK_MS) },
+              },
+              select: { postId: true, seenAt: true },
+            })
+          : [];
+      const rankingImpressions = Array.isArray(impressions)
+        ? impressions.filter((item: { seenAt: Date }) => {
+            const seenAtMs = new Date(item.seenAt).getTime();
+            return !Number.isFinite(seenAtMs) || seenAtMs < recommendationSessionStartedAtMs;
           })
         : [];
-    const rankingImpressions = Array.isArray(impressions)
-      ? impressions.filter((item: { seenAt: Date }) => {
-          const seenAtMs = new Date(item.seenAt).getTime();
-          return !Number.isFinite(seenAtMs) || seenAtMs < recommendationSessionStartedAtMs;
-        })
-      : [];
 
-    const seenPostIds = Array.isArray(rankingImpressions)
-      ? rankingImpressions.map((item: { postId: string }) => item.postId)
-      : [];
-    const seenAtByPostId = Array.isArray(rankingImpressions)
-      ? Object.fromEntries(
-          rankingImpressions.map((item: { postId: string; seenAt: Date }) => [item.postId, item.seenAt])
-        )
-      : {};
+      const seenPostIds = Array.isArray(rankingImpressions)
+        ? rankingImpressions.map((item: { postId: string }) => item.postId)
+        : [];
+      const seenAtByPostId = Array.isArray(rankingImpressions)
+        ? Object.fromEntries(
+            rankingImpressions.map((item: { postId: string; seenAt: Date }) => [item.postId, item.seenAt])
+          )
+        : {};
 
-    let pageItems = chronologicalItems;
-    let nextCursor: string | null = null;
-    let hasMore = hasMoreChronological;
-    if (mode === 'recommended') {
-      try {
-        const rankedPage = rankFeedPage(chronologicalItems, {
-          ...(recommendationContext || {}),
-          seenPostIds,
-          seenAtByPostId,
-          nowMs: recommendationSessionStartedAtMs,
-        }, {
-          limit,
-          cursorState: recommendedCursorState || undefined,
-          hasMoreChronological,
-          chronologicalBoundaryCursor: chronologicalItems[chronologicalItems.length - 1]?.id || null,
-        });
-        pageItems = rankedPage.items;
-        nextCursor = rankedPage.nextCursor;
-        hasMore = rankedPage.hasMore;
-      } catch (rankingError) {
-        console.error('Feed ranking failed, falling back to latest ordering:', rankingError);
+      let pageItems = chronologicalItems;
+      let nextCursor: string | null = null;
+      let hasMore = hasMoreChronological;
+      if (mode === 'recommended') {
+        try {
+          const rankedPage = rankFeedPage(chronologicalItems, {
+            ...(recommendationContext || {}),
+            seenPostIds,
+            seenAtByPostId,
+            nowMs: recommendationSessionStartedAtMs,
+          }, {
+            limit,
+            cursorState: recommendedCursorState || undefined,
+            hasMoreChronological,
+            chronologicalBoundaryCursor: chronologicalItems[chronologicalItems.length - 1]?.id || null,
+          });
+          pageItems = rankedPage.items;
+          nextCursor = rankedPage.nextCursor;
+          hasMore = rankedPage.hasMore;
+        } catch (rankingError) {
+          console.error('Feed ranking failed, falling back to latest ordering:', rankingError);
+          pageItems = chronologicalItems.slice(0, limit);
+          nextCursor =
+            hasMoreChronological || chronologicalItems.length > pageItems.length
+              ? pageItems[pageItems.length - 1]?.id || null
+              : null;
+          hasMore = Boolean(nextCursor);
+        }
+      } else {
         pageItems = chronologicalItems.slice(0, limit);
-        nextCursor =
-          hasMoreChronological || chronologicalItems.length > pageItems.length
-            ? pageItems[pageItems.length - 1]?.id || null
-            : null;
-        hasMore = Boolean(nextCursor);
+        const lastItem = pageItems[pageItems.length - 1];
+        nextCursor = hasMoreChronological && lastItem
+          ? encodeKeysetCursor({ scope: 'feed.latest', id: lastItem.id, t: new Date(lastItem.createdAt).toISOString() })
+          : null;
       }
-    } else {
-      pageItems = chronologicalItems.slice(0, limit);
-      nextCursor = hasMoreChronological ? pageItems[pageItems.length - 1]?.id || null : null;
-    }
+
+      return {
+        posts: pageItems.map((post) => mapPostResponse(post, currentUserId)),
+        nextCursor,
+        hasMore,
+      };
+    };
+
+    const feedPayload = bypassFeedCache
+      ? await computeFeedPayload()
+      : await cacheService.getOrSet(feedCacheKey, computeFeedPayload, {
+          tags: feedCacheTags(`feed:${currentUserId}`),
+          swr: {
+            softTtlSeconds: HOME_FEED_CACHE_TTL_SECONDS,
+            hardTtlSeconds: HOME_FEED_CACHE_TTL_SECONDS * 4,
+          },
+        });
+    const filteredPosts = feedPayload.posts.filter((post) => {
+      const authorId = post.authorId || post.author?.id;
+      return !authorId || !blockedUserIdSet.has(String(authorId));
+    });
+
+    const adPlacements = await selectHomeFeedAdPlacements(
+      currentUserId,
+      filteredPosts.length,
+      adItemOffset,
+      adSessionId
+    );
 
     const responsePayload = {
-      posts: pageItems.map((post) => mapPostResponse(post, currentUserId)),
-      nextCursor,
-      hasMore,
+      ...feedPayload,
+      posts: filteredPosts,
+      adPlacements,
     };
 
     res.setHeader('X-Vormex-Cache', bypassFeedCache ? 'BYPASS' : 'MISS');
     res.json(responsePayload);
 
-    if (!bypassFeedCache) {
-      void cacheService
-        .set(feedCacheKey, responsePayload, HOME_FEED_CACHE_TTL_SECONDS, feedCacheTags(`feed:${currentUserId}`))
-        .catch((cacheError: unknown) => {
-          console.error('Failed to cache home feed:', cacheError);
-        });
-    }
-
-    if (mode === 'recommended' && feedImpressionsModel && pageItems.length > 0) {
-      writeRecommendedFeedImpressions(currentUserId, pageItems.map((post) => post.id));
+    if (mode === 'recommended' && filteredPosts.length > 0) {
+      writeRecommendedFeedImpressions(currentUserId, filteredPosts.map((post) => post.id));
     }
   } catch (error) {
     console.error('getFeed error:', error);
@@ -725,18 +878,27 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
     const files = (req.files as Express.Multer.File[] | undefined) || [];
     const imageFiles = files.filter((file) => file.mimetype?.startsWith('image/'));
     const videoFiles = files.filter((file) => file.mimetype?.startsWith('video/'));
+    let directMedia: Array<FinalizedDirectMedia & { url: string }> = [];
+    try {
+      directMedia = await validateDirectPostMedia(userId, req.body.directMedia);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid direct media' });
+      return;
+    }
+    const directImageCount = directMedia.filter((item) => item.mimeType.startsWith('image/')).length;
+    const directVideoCount = directMedia.filter((item) => item.mimeType.startsWith('video/')).length;
 
     if (mappedType === 'text' && !content) {
       res.status(400).json({ error: 'Content is required' });
       return;
     }
 
-    if (mappedType === 'image' && imageFiles.length === 0) {
+    if (mappedType === 'image' && imageFiles.length + directImageCount === 0) {
       res.status(400).json({ error: 'At least one image is required' });
       return;
     }
 
-    if (mappedType === 'video' && videoFiles.length === 0) {
+    if (mappedType === 'video' && videoFiles.length + directVideoCount === 0) {
       res.status(400).json({ error: 'A video file is required' });
       return;
     }
@@ -761,7 +923,12 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const mediaUrls: string[] = [];
+    await enforceTrustTierLimit(userId, 'post');
+    if (files.length > 0 || directMedia.length > 0) {
+      await enforceTrustTierLimit(userId, 'media');
+    }
+
+    const mediaUrls: string[] = directMedia.map((item) => item.url);
 
     // Upload images/videos to Bunny.net CDN
     if (files.length > 0) {
@@ -982,10 +1149,17 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
 
     res.status(201).json(mapPostResponse(created, userId));
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('createPost error:', error);
     res.status(500).json({ error: 'Failed to create post' });
   }
 };
+
+export const finalizePostUpload = createPost;
 
 // Update post
 export const updatePost = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -1555,6 +1729,7 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
               name: true,
               profileImage: true,
               isVerified: true,
+              profileBadgeStyle: true,
             },
           },
           _count: { select: { other_post_comments: true } },
@@ -1594,6 +1769,7 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
               name: true,
               profileImage: true,
               isVerified: true,
+              profileBadgeStyle: true,
             },
           },
           _count: { select: { other_post_comments: true } },
@@ -1696,6 +1872,8 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    await enforceTrustTierLimit(userId, 'comment');
+
     if (parentId) {
       const parentComment = await prismaRead.post_comments.findFirst({
         where: { id: String(parentId), postId },
@@ -1724,6 +1902,8 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
               profileImage: true,
               headline: true,
               isVerified: true,
+              profileBadgeStyle: true,
+              identityTrustLevel: true,
             },
           },
           comment_likes: {
@@ -1831,6 +2011,11 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
 
     res.status(201).json(mapped);
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('createComment error:', error);
     res.status(500).json({ error: 'Failed to create comment' });
   }
@@ -2101,6 +2286,7 @@ export const getLikes = async (req: AuthRequest, res: Response): Promise<void> =
             profileImage: true,
             headline: true,
             isVerified: true,
+            profileBadgeStyle: true,
           },
         },
       },
@@ -2120,6 +2306,7 @@ export const getLikes = async (req: AuthRequest, res: Response): Promise<void> =
           headline: likeWithUser.user.headline,
           verified: Boolean((likeWithUser.user as any).isVerified),
           isVerified: Boolean((likeWithUser.user as any).isVerified),
+          profileBadgeStyle: (likeWithUser.user as any).profileBadgeStyle ?? null,
           reactionType: 'LIKE',
           createdAt: like.createdAt,
         };

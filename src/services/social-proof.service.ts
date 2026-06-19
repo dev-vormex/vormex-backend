@@ -1,7 +1,9 @@
 // @ts-nocheck
 import { randomUUID } from 'crypto';
 import { prisma } from '../config/prisma';
+import { cacheService } from './cache.service';
 import { notificationService } from './notification.service';
+import { DISCOVERY_SOURCE_FOR_YOU, DISCOVERY_SOURCE_PEOPLE_SEARCH } from './discovery-power.service';
 
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -27,6 +29,53 @@ interface LeaderboardParams {
 
 function normalizeCollege(value?: string | null) {
     return value?.trim().toLowerCase() || null;
+}
+
+function startOfToday() {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    return date;
+}
+
+function daysAgo(days: number) {
+    return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+}
+
+function pushWeightedTag(
+    tags: Map<string, { label: string; weight: number; source: string }>,
+    value: unknown,
+    source: string,
+    weight: number
+) {
+    if (typeof value !== 'string') return;
+    const label = value.trim().replace(/\s+/g, ' ');
+    if (!label) return;
+    const key = label.toLowerCase();
+    const current = tags.get(key);
+    tags.set(key, {
+        label: current?.label || label,
+        weight: (current?.weight || 0) + weight,
+        source: current?.source || source,
+    });
+}
+
+function formatPercent(value: number) {
+    if (!Number.isFinite(value)) return '0%';
+    return `${value % 1 === 0 ? value.toFixed(0) : value.toFixed(1)}%`;
+}
+
+function mapProfileInsightPerson(user: any) {
+    return {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        profileImage: user.profileImage,
+        college: user.college,
+        headline: user.headline,
+        verified: Boolean(user.isVerified),
+        isVerified: Boolean(user.isVerified),
+        profileBadgeStyle: user.profileBadgeStyle ?? null,
+    };
 }
 
 class SocialProofService {
@@ -164,6 +213,7 @@ class SocialProofService {
                             college: true,
                             headline: true,
                             isVerified: true,
+                            profileBadgeStyle: true,
                         },
                     },
                 },
@@ -195,6 +245,7 @@ class SocialProofService {
                     headline: view.users_profile_views_viewerIdTousers.headline,
                     verified: Boolean(view.users_profile_views_viewerIdTousers.isVerified),
                     isVerified: Boolean(view.users_profile_views_viewerIdTousers.isVerified),
+                    profileBadgeStyle: view.users_profile_views_viewerIdTousers.profileBadgeStyle ?? null,
                     isSameCollege:
                         !!normalizeCollege(profileOwner?.college) &&
                         normalizeCollege(profileOwner?.college) ===
@@ -274,6 +325,7 @@ class SocialProofService {
                     college: true,
                     headline: true,
                     isVerified: true,
+                    profileBadgeStyle: true,
                 },
             })
             : [];
@@ -305,10 +357,383 @@ class SocialProofService {
                             headline: viewer.headline,
                             verified: Boolean(viewer.isVerified),
                             isVerified: Boolean(viewer.isVerified),
+                            profileBadgeStyle: viewer.profileBadgeStyle ?? null,
                         }
                         : null,
                 };
             }),
+        };
+    }
+
+    async isProfileSaved(userId: string, targetUserId: string): Promise<boolean> {
+        if (!userId || !targetUserId || userId === targetUserId) return false;
+        const saved = await (prisma as any).saved_profiles.findUnique({
+            where: {
+                userId_targetUserId: {
+                    userId,
+                    targetUserId,
+                },
+            },
+            select: { id: true },
+        });
+        return Boolean(saved);
+    }
+
+    async toggleProfileSave(userId: string, targetUserId: string) {
+        if (!targetUserId || targetUserId === userId) {
+            throw new Error('Invalid target user');
+        }
+
+        const target = await prisma.user.findUnique({
+            where: { id: targetUserId },
+            select: { id: true },
+        });
+        if (!target) {
+            throw new Error('User not found');
+        }
+
+        const existing = await (prisma as any).saved_profiles.findUnique({
+            where: {
+                userId_targetUserId: {
+                    userId,
+                    targetUserId,
+                },
+            },
+            select: { id: true },
+        });
+
+        if (existing) {
+            await (prisma as any).saved_profiles.delete({ where: { id: existing.id } });
+        } else {
+            await (prisma as any).saved_profiles.create({
+                data: {
+                    id: randomUUID(),
+                    userId,
+                    targetUserId,
+                },
+            });
+        }
+
+        const savesCount = await (prisma as any).saved_profiles.count({
+            where: { targetUserId },
+        });
+        await cacheService.invalidateTags(`user:${targetUserId}`).catch(() => undefined);
+
+        return {
+            saved: !existing,
+            savesCount,
+        };
+    }
+
+    async getProfileSavers(userId: string, page: number = 1, limit: number = 50) {
+        const safePage = Number.isFinite(page) ? Math.max(1, page) : 1;
+        const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 50;
+        const skip = (safePage - 1) * safeLimit;
+
+        const [rows, totalCount] = await Promise.all([
+            (prisma as any).saved_profiles.findMany({
+                where: { targetUserId: userId },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: safeLimit,
+                include: {
+                    user: {
+                        select: {
+                            id: true,
+                            name: true,
+                            username: true,
+                            profileImage: true,
+                            college: true,
+                            headline: true,
+                            isVerified: true,
+                            profileBadgeStyle: true,
+                        },
+                    },
+                },
+            }),
+            (prisma as any).saved_profiles.count({ where: { targetUserId: userId } }),
+        ]);
+
+        return {
+            page: safePage,
+            limit: safeLimit,
+            totalCount,
+            hasMore: skip + rows.length < totalCount,
+            savers: rows.map((row: any) => ({
+                id: row.id,
+                savedAt: row.createdAt.toISOString(),
+                saver: mapProfileInsightPerson(row.user),
+            })),
+        };
+    }
+
+    async getRecentlyViewedProfiles(userId: string, page: number = 1, limit: number = 50) {
+        const safePage = Number.isFinite(page) ? Math.max(1, page) : 1;
+        const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 50;
+        const skip = (safePage - 1) * safeLimit;
+
+        const [groupedViews, distinctProfiles, totalViews] = await Promise.all([
+            prisma.profile_views.groupBy({
+                by: ['viewedId'],
+                where: { viewerId: userId },
+                _count: { _all: true },
+                _max: { viewedAt: true },
+                _min: { viewedAt: true },
+                orderBy: {
+                    _max: {
+                        viewedAt: 'desc',
+                    },
+                },
+                skip,
+                take: safeLimit,
+            }),
+            prisma.profile_views.findMany({
+                where: { viewerId: userId },
+                distinct: ['viewedId'],
+                select: { viewedId: true },
+            }),
+            prisma.profile_views.count({
+                where: { viewerId: userId },
+            }),
+        ]);
+
+        const viewedIds = groupedViews.map((entry) => entry.viewedId);
+        const profiles = viewedIds.length > 0
+            ? await prisma.user.findMany({
+                where: { id: { in: viewedIds } },
+                select: {
+                    id: true,
+                    name: true,
+                    username: true,
+                    profileImage: true,
+                    college: true,
+                    headline: true,
+                    isVerified: true,
+                    profileBadgeStyle: true,
+                },
+            })
+            : [];
+        const profileMap = new Map(profiles.map((profile) => [profile.id, profile]));
+
+        return {
+            page: safePage,
+            limit: safeLimit,
+            totalCount: distinctProfiles.length,
+            totalViews,
+            hasMore: skip + groupedViews.length < distinctProfiles.length,
+            profiles: groupedViews
+                .map((entry) => {
+                    const profile = profileMap.get(entry.viewedId);
+                    if (!profile) return null;
+                    return {
+                        viewedId: entry.viewedId,
+                        lastViewedAt: entry._max.viewedAt?.toISOString() || new Date().toISOString(),
+                        firstViewedAt: entry._min.viewedAt?.toISOString() || new Date().toISOString(),
+                        viewCount: entry._count._all,
+                        profile: mapProfileInsightPerson(profile),
+                    };
+                })
+                .filter(Boolean),
+        };
+    }
+
+    async getProfileInsights(userId: string) {
+        const today = startOfToday();
+        const weekAgo = daysAgo(7);
+        const monthAgo = daysAgo(30);
+        const previousMonthStart = daysAgo(60);
+
+        const [
+            profileOwner,
+            totalViews,
+            todayViews,
+            viewsLast7Days,
+            viewsLast30Days,
+            previous30DayViews,
+            uniqueViewers,
+            searchAppearancesTotal,
+            searchAppearancesLast7Days,
+            searchAppearancesLast30Days,
+            suggestionAppearancesTotal,
+            suggestionAppearancesLast7Days,
+            suggestionAppearancesLast30Days,
+            savesTotal,
+            savesLast7Days,
+            savesLast30Days,
+            connectionRequestsLast30Days,
+            acceptedConnectionsLast30Days,
+        ] = await Promise.all([
+            prisma.user.findUnique({
+                where: { id: userId },
+                select: {
+                    id: true,
+                    college: true,
+                    branch: true,
+                    currentCity: true,
+                    location: true,
+                    interests: true,
+                    headline: true,
+                    bio: true,
+                    isOpenToOpportunities: true,
+                    skills: {
+                        select: {
+                            proficiency: true,
+                            skill: { select: { name: true } },
+                        },
+                    },
+                    projects: {
+                        select: { techStack: true },
+                        orderBy: [{ featured: 'desc' }, { startDate: 'desc' }],
+                        take: 5,
+                    },
+                    user_onboarding: {
+                        select: {
+                            primaryGoal: true,
+                            wantToLearn: true,
+                            canTeach: true,
+                            lookingFor: true,
+                            availability: true,
+                        },
+                    },
+                },
+            }),
+            prisma.profile_views.count({ where: { viewedId: userId } }),
+            prisma.profile_views.count({ where: { viewedId: userId, viewedAt: { gte: today } } }),
+            prisma.profile_views.count({ where: { viewedId: userId, viewedAt: { gte: weekAgo } } }),
+            prisma.profile_views.count({ where: { viewedId: userId, viewedAt: { gte: monthAgo } } }),
+            prisma.profile_views.count({
+                where: { viewedId: userId, viewedAt: { gte: previousMonthStart, lt: monthAgo } },
+            }),
+            prisma.profile_views.findMany({
+                where: { viewedId: userId },
+                distinct: ['viewerId'],
+                select: { viewerId: true },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_PEOPLE_SEARCH },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_PEOPLE_SEARCH, createdAt: { gte: weekAgo } },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_PEOPLE_SEARCH, createdAt: { gte: monthAgo } },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_FOR_YOU },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_FOR_YOU, createdAt: { gte: weekAgo } },
+            }),
+            prisma.discovery_impressions.count({
+                where: { targetUserId: userId, source: DISCOVERY_SOURCE_FOR_YOU, createdAt: { gte: monthAgo } },
+            }),
+            (prisma as any).saved_profiles.count({ where: { targetUserId: userId } }),
+            (prisma as any).saved_profiles.count({ where: { targetUserId: userId, createdAt: { gte: weekAgo } } }),
+            (prisma as any).saved_profiles.count({ where: { targetUserId: userId, createdAt: { gte: monthAgo } } }),
+            prisma.connections.count({
+                where: { addresseeId: userId, createdAt: { gte: monthAgo } },
+            }),
+            prisma.connections.count({
+                where: {
+                    status: 'accepted',
+                    updatedAt: { gte: monthAgo },
+                    OR: [{ requesterId: userId }, { addresseeId: userId }],
+                },
+            }),
+        ]);
+
+        const exposureLast30Days = viewsLast30Days + searchAppearancesLast30Days + suggestionAppearancesLast30Days;
+        const matchRate = exposureLast30Days > 0
+            ? Math.min(100, Math.round((connectionRequestsLast30Days / exposureLast30Days) * 1000) / 10)
+            : 0;
+        const viewTrendDelta = viewsLast30Days - previous30DayViews;
+        const viewTrendPercent = previous30DayViews > 0
+            ? Math.round((viewTrendDelta / previous30DayViews) * 100)
+            : viewsLast30Days > 0 ? 100 : 0;
+
+        const tags = new Map<string, { label: string; weight: number; source: string }>();
+        for (const skill of profileOwner?.skills || []) {
+            const proficiencyWeight = String(skill.proficiency || '').toLowerCase() === 'advanced' ? 5 : 4;
+            pushWeightedTag(tags, skill.skill?.name, 'skill', proficiencyWeight);
+        }
+        for (const interest of profileOwner?.interests || []) {
+            pushWeightedTag(tags, interest, 'interest', 3);
+        }
+        for (const tech of (profileOwner?.projects || []).flatMap((project: any) => project.techStack || [])) {
+            pushWeightedTag(tags, tech, 'project', 2);
+        }
+        const onboarding = profileOwner?.user_onboarding;
+        pushWeightedTag(tags, onboarding?.primaryGoal, 'goal', 3);
+        pushWeightedTag(tags, onboarding?.availability, 'availability', 2);
+        for (const value of onboarding?.lookingFor || []) pushWeightedTag(tags, value, 'intent', 3);
+        for (const value of onboarding?.canTeach || []) pushWeightedTag(tags, value, 'canTeach', 3);
+        for (const value of onboarding?.wantToLearn || []) pushWeightedTag(tags, value, 'learning', 2);
+        pushWeightedTag(tags, profileOwner?.branch, 'branch', 1);
+        pushWeightedTag(tags, profileOwner?.college, 'college', 1);
+        pushWeightedTag(tags, profileOwner?.currentCity || profileOwner?.location, 'location', 1);
+
+        const topTags = Array.from(tags.values())
+            .sort((left, right) => right.weight - left.weight || left.label.localeCompare(right.label))
+            .slice(0, 10);
+
+        const reasons: string[] = [];
+        if (topTags.length > 0) {
+            reasons.push(`Your top tags are ${topTags.slice(0, 3).map((tag) => tag.label).join(', ')}.`);
+        }
+        if (profileOwner?.college) {
+            reasons.push(`People from ${profileOwner.college} can match with you through campus discovery.`);
+        }
+        if (onboarding?.primaryGoal) {
+            reasons.push(`Your goal "${onboarding.primaryGoal}" helps match you with people chasing the same outcome.`);
+        }
+        if ((onboarding?.lookingFor || []).length > 0) {
+            reasons.push(`Your intent (${onboarding.lookingFor.slice(0, 2).join(', ')}) makes you easier to find for focused collaboration.`);
+        }
+        if (searchAppearancesLast30Days + suggestionAppearancesLast30Days > 0) {
+            reasons.push(`You appeared in ${searchAppearancesLast30Days + suggestionAppearancesLast30Days} discovery surfaces in the last 30 days.`);
+        }
+        if (savesLast30Days > 0) {
+            reasons.push(`${savesLast30Days} ${savesLast30Days === 1 ? 'person bookmarked' : 'people bookmarked'} your profile in the last 30 days.`);
+        }
+
+        return {
+            analytics: {
+                views: {
+                    total: totalViews,
+                    today: todayViews,
+                    last7Days: viewsLast7Days,
+                    last30Days: viewsLast30Days,
+                    unique: uniqueViewers.length,
+                    trendPercent: viewTrendPercent,
+                    trendDirection: viewTrendDelta < 0 ? 'down' : viewTrendDelta > 0 ? 'up' : 'stable',
+                },
+                searchAppearances: {
+                    total: searchAppearancesTotal,
+                    last7Days: searchAppearancesLast7Days,
+                    last30Days: searchAppearancesLast30Days,
+                },
+                suggestionAppearances: {
+                    total: suggestionAppearancesTotal,
+                    last7Days: suggestionAppearancesLast7Days,
+                    last30Days: suggestionAppearancesLast30Days,
+                },
+                profileSaves: {
+                    total: savesTotal,
+                    last7Days: savesLast7Days,
+                    last30Days: savesLast30Days,
+                },
+                matchRate: {
+                    value: matchRate,
+                    display: formatPercent(matchRate),
+                    connectionRequests: connectionRequestsLast30Days,
+                    acceptedConnections: acceptedConnectionsLast30Days,
+                    appearances: exposureLast30Days,
+                },
+            },
+            matchInsights: {
+                reasons,
+                topTags,
+            },
         };
     }
 

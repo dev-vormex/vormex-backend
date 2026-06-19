@@ -7,6 +7,8 @@ import {
   createGroup,
   getGroup,
   getMyGroups,
+  getGroupMessageShortcuts,
+  updateGroupMessageShortcut,
   discoverGroups,
   getUserPendingInvites,
   getGroupInviteLinkPreview,
@@ -57,6 +59,7 @@ const validateGroupImageUpload = validateUploadedFiles({
 
 // Static routes first
 router.get('/my', authenticate, getMyGroups);
+router.get('/message-shortcuts', authenticate, getGroupMessageShortcuts);
 router.get('/discover', optionalAuth, discoverGroups);
 router.get('/invites/pending', authenticate, getUserPendingInvites);
 router.get('/invites/link/:code', optionalAuth, getGroupInviteLinkPreview);
@@ -74,6 +77,7 @@ router.get('/', optionalAuth, listGroups);
 router.get('/:groupId/invite-link', authenticate, getGroupInviteLink);
 router.patch('/:groupId/invite-link/settings', authenticate, updateGroupInviteLinkSettings);
 router.post('/:groupId/invite-link/reset', authenticate, resetGroupInviteLink);
+router.patch('/:groupId/message-shortcut', authenticate, updateGroupMessageShortcut);
 router.post('/:groupId/invites', authenticate, createGroupInvite);
 router.get('/:groupId/join-requests', authenticate, getGroupJoinRequests);
 router.post('/:groupId/join-requests/:requestId/respond', authenticate, respondToGroupJoinRequest);

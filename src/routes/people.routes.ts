@@ -7,6 +7,13 @@ import {
   getPeopleNearMe,
   getFilterOptions,
   searchColleges,
+  getCollegeLogo,
+  passDiscoverySuggestion,
+  rewindDiscoveryPass,
+  getSavedDiscoverySearches,
+  createSavedDiscoverySearchController,
+  updateSavedDiscoverySearchController,
+  deleteSavedDiscoverySearchController,
 } from '../controllers/people.controller';
 import {
   clearPeopleYouKnow,
@@ -30,12 +37,19 @@ const router = Router();
 
 // Filter options should be first to avoid path conflicts (optional auth - works for both logged in and anonymous)
 router.get('/filter-options', optionalAuth, getFilterOptions);
+router.get('/college-logo', getCollegeLogo);
 
 // Protected routes
 router.get('/contacts', authenticate, getPeopleYouKnow);
 router.post('/contacts/import', authenticate, importPeopleYouKnow);
 router.delete('/contacts', authenticate, clearPeopleYouKnow);
 router.post('/contacts/:entryId/invite', authenticate, markPeopleYouKnowInviteSent);
+router.get('/saved-searches', authenticate, getSavedDiscoverySearches);
+router.post('/saved-searches', authenticate, createSavedDiscoverySearchController);
+router.patch('/saved-searches/:id', authenticate, updateSavedDiscoverySearchController);
+router.delete('/saved-searches/:id', authenticate, deleteSavedDiscoverySearchController);
+router.post('/discovery/pass', authenticate, passDiscoverySuggestion);
+router.post('/discovery/rewind', authenticate, rewindDiscoveryPass);
 router.get('/suggestions', authenticate, getSuggestions);
 router.get('/same-college', authenticate, getPeopleFromSameCollege);
 router.get('/near-me', authenticate, getPeopleNearMe);

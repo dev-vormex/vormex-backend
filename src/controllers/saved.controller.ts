@@ -34,10 +34,10 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
       include: {
         posts: {
           include: {
-            author: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true } },
+            author: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true, profileBadgeStyle: true } },
             collaborators: {
               include: {
-                user: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true } },
+                user: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true, profileBadgeStyle: true } },
               },
             },
             likes: { where: { userId }, select: { userId: true } },
@@ -78,6 +78,66 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
   } catch (error) {
     console.error('getSaved error:', error);
     res.status(500).json({ error: 'Failed to fetch saved posts' });
+  }
+};
+
+export const getSavedProfiles = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const cursor = ensureString(req.query.cursor);
+    const limit = Math.min(50, Math.max(1, parseInt(ensureString(req.query.limit) || '20', 10)));
+
+    const savedProfiles = await prisma.saved_profiles.findMany({
+      where: { userId },
+      include: {
+        targetUser: {
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            profileImage: true,
+            headline: true,
+            college: true,
+            isVerified: true,
+            profileBadgeStyle: true,
+          },
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = savedProfiles.length > limit;
+    const pageItems = hasMore ? savedProfiles.slice(0, limit) : savedProfiles;
+
+    res.json({
+      profiles: pageItems.map((item) => ({
+        id: item.id,
+        savedAt: item.createdAt,
+        user: {
+          id: item.targetUser.id,
+          username: item.targetUser.username,
+          name: item.targetUser.name,
+          profileImage: item.targetUser.profileImage,
+          headline: item.targetUser.headline,
+          college: item.targetUser.college,
+          verified: Boolean(item.targetUser.isVerified),
+          isVerified: Boolean(item.targetUser.isVerified),
+          profileBadgeStyle: item.targetUser.profileBadgeStyle,
+        },
+      })),
+      nextCursor: hasMore ? pageItems[pageItems.length - 1]?.id : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error('getSavedProfiles error:', error);
+    res.status(500).json({ error: 'Failed to fetch saved profiles' });
   }
 };
 
