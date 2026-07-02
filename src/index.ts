@@ -100,7 +100,7 @@ import { optionalAppCheck } from './middleware/app-check.middleware';
 import { authenticate, optionalAuth, verifyAccessToken } from './middleware/auth.middleware';
 import { ACCESS_TOKEN_COOKIE, parseCookieHeader } from './utils/auth-cookie.util';
 import type { JWTPayload } from './utils/jwt.util';
-import { getPostMetadata, mapPollOptionsForResponse } from './utils/post.util';
+import { getPostMetadata, getReactionSummaries, mapPollOptionsForResponse, normalizeReactionType } from './utils/post.util';
 import { canViewPost, canViewReel, canViewStory } from './utils/access-control.util';
 import { pushNotificationService } from './services/push-notification.service';
 import { sendChatMessage } from './services/chat-message.service';
@@ -463,6 +463,7 @@ async function togglePostReactionWithFanout(
   reactionType: string | null,
   eventName: 'post:liked' | 'post:reacted'
 ): Promise<{ liked: boolean; likesCount: number; reactionType: string | null } | null> {
+  const requestedReaction = normalizeReactionType(reactionType);
   return prisma.$transaction(async (tx) => {
     const post = await tx.post.findFirst({
       where: { id: postId, isActive: true },
@@ -477,16 +478,28 @@ async function togglePostReactionWithFanout(
       where: { postId_userId: { postId, userId } },
     });
 
-    let liked = false;
-    if (existingLike) {
+    // Semantics: no reaction → add; same reaction → remove; different → switch.
+    let liked: boolean;
+    let nextReaction: string | null;
+    if (!existingLike) {
+      await tx.postLike.create({
+        data: { postId, userId, reactionType: requestedReaction },
+      });
+      liked = true;
+      nextReaction = requestedReaction;
+    } else if (existingLike.reactionType === requestedReaction) {
       await tx.postLike.delete({
         where: { postId_userId: { postId, userId } },
       });
+      liked = false;
+      nextReaction = null;
     } else {
-      await tx.postLike.create({
-        data: { postId, userId },
+      await tx.postLike.update({
+        where: { postId_userId: { postId, userId } },
+        data: { reactionType: requestedReaction },
       });
       liked = true;
+      nextReaction = requestedReaction;
     }
 
     const likesCount = await tx.postLike.count({ where: { postId } });
@@ -494,6 +507,8 @@ async function togglePostReactionWithFanout(
       where: { id: postId },
       data: { likesCount },
     });
+    const summaries = await getReactionSummaries(tx as any, [postId]);
+    const reactionSummary = summaries.get(postId) ?? [];
     const postRooms = String(post.visibility || '').toLowerCase() === 'public'
       ? [feedRealtimeRoom, `post:${postId}`]
       : [`post:${postId}`];
@@ -510,9 +525,9 @@ async function togglePostReactionWithFanout(
             postId,
             userId,
             liked,
-            reactionType: liked ? reactionType : null,
+            reactionType: nextReaction,
             likesCount,
-            reactionSummary: [],
+            reactionSummary,
           },
         },
       ],
@@ -528,7 +543,7 @@ async function togglePostReactionWithFanout(
     return {
       liked,
       likesCount,
-      reactionType: liked ? reactionType : null,
+      reactionType: nextReaction,
     };
   }, {
     maxWait: 10_000,

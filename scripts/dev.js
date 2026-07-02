@@ -32,6 +32,8 @@ function spawnChild(command, args, name) {
     cwd: projectRoot,
     env: process.env,
     stdio: 'inherit',
+    // Node >=20.12 blocks spawning .cmd files without a shell (CVE-2024-27980)
+    shell: process.platform === 'win32' && command.endsWith('.cmd'),
   });
 
   child.on('error', (error) => {

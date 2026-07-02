@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
-import { mapPostResponse } from '../utils/post.util';
+import { attachReactionSummaries, mapPostResponse } from '../utils/post.util';
 import { canViewPost } from '../utils/access-control.util';
 import { cacheService } from '../services/cache.service';
 
@@ -40,7 +40,7 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
                 user: { select: { id: true, username: true, name: true, profileImage: true, headline: true, isVerified: true, profileBadgeStyle: true } },
               },
             },
-            likes: { where: { userId }, select: { userId: true } },
+            likes: { where: { userId }, select: { userId: true, reactionType: true } },
             saved_posts: { where: { userId }, select: { userId: true } },
             pollVotes: { where: { userId }, select: { optionId: true, userId: true } },
             _count: { select: { saved_posts: true } },
@@ -60,6 +60,11 @@ export const getSaved = async (req: AuthRequest, res: Response): Promise<void> =
         visibleSavedItems.push(item);
       }
     }
+
+    await attachReactionSummaries(
+      prisma as any,
+      visibleSavedItems.map((s) => s.posts as { id: string })
+    );
 
     const posts = visibleSavedItems
       .map((s) => {
