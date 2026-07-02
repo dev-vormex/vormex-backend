@@ -36,6 +36,8 @@ for (const sqlFile of sqlFiles) {
       cwd: projectRoot,
       env: process.env,
       stdio: 'inherit',
+      // Node >=20.12 blocks spawning .cmd files without a shell (CVE-2024-27980)
+      shell: process.platform === 'win32',
     }
   );
 

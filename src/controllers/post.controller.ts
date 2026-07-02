@@ -29,9 +29,12 @@ import {
   getPremiumVisibilityByUserIds,
 } from '../services/premium-visibility.service';
 import {
+  attachReactionSummaries,
   extractDomain,
+  getReactionSummaries,
   mapPollOptionsForResponse,
   mapPostResponse,
+  normalizeReactionType,
   parseBooleanField,
   parseNumberField,
   parseStringArrayField,
@@ -111,7 +114,7 @@ const postResponseInclude = (
   },
   likes: {
     where: { userId: currentUserId },
-    select: { userId: true },
+    select: { userId: true, reactionType: true },
   },
   saved_posts: {
     where: { userId: currentUserId },
@@ -778,6 +781,8 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
           : null;
       }
 
+      await attachReactionSummaries(prismaRead as any, pageItems);
+
       return {
         posts: pageItems.map((post) => mapPostResponse(post, currentUserId)),
         nextCursor,
@@ -853,6 +858,7 @@ export const getPost = async (req: AuthRequest, res: Response): Promise<void> =>
       return;
     }
 
+    await attachReactionSummaries(prismaRead as any, [post]);
     res.status(200).json(mapPostResponse(post, currentUserId));
   } catch (error) {
     console.error('getPost error:', error);
@@ -1205,6 +1211,7 @@ export const updatePost = async (req: AuthRequest, res: Response): Promise<void>
       include: postResponseInclude(userId),
     });
 
+    await attachReactionSummaries(prisma as any, [updated]);
     res.status(200).json(mapPostResponse(updated, userId));
   } catch (error) {
     console.error('updatePost error:', error);
@@ -1476,94 +1483,116 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const { liked, likesCount } = await prisma.$transaction(async (tx) => {
-      const existingLike = await tx.postLike.findUnique({
-        where: { postId_userId: { postId, userId } },
-      });
+    const requestedReaction = normalizeReactionType(req.body?.reactionType);
 
-      let nextLiked = false;
-      if (existingLike) {
-        await tx.postLike.delete({
+    const { liked, likesCount, reactionType, reactionSummary, isNewReaction } =
+      await prisma.$transaction(async (tx) => {
+        const existingLike = await tx.postLike.findUnique({
           where: { postId_userId: { postId, userId } },
         });
-      } else {
-        await tx.postLike.create({
-          data: { postId, userId },
+
+        // Semantics: no reaction → add; same reaction → remove; different → switch.
+        let nextLiked: boolean;
+        let nextReaction: string | null;
+        if (!existingLike) {
+          await tx.postLike.create({
+            data: { postId, userId, reactionType: requestedReaction },
+          });
+          nextLiked = true;
+          nextReaction = requestedReaction;
+        } else if (existingLike.reactionType === requestedReaction) {
+          await tx.postLike.delete({
+            where: { postId_userId: { postId, userId } },
+          });
+          nextLiked = false;
+          nextReaction = null;
+        } else {
+          await tx.postLike.update({
+            where: { postId_userId: { postId, userId } },
+            data: { reactionType: requestedReaction },
+          });
+          nextLiked = true;
+          nextReaction = requestedReaction;
+        }
+
+        const nextLikesCount = await tx.postLike.count({ where: { postId } });
+        await tx.post.update({
+          where: { id: postId },
+          data: { likesCount: nextLikesCount },
         });
-        nextLiked = true;
-      }
 
-      const nextLikesCount = await tx.postLike.count({ where: { postId } });
-      await tx.post.update({
-        where: { id: postId },
-        data: { likesCount: nextLikesCount },
-      });
+        const summaries = await getReactionSummaries(tx as any, [postId]);
+        const nextReactionSummary = summaries.get(postId) ?? [];
 
-      await enqueueRealtimeFanout(tx as any, {
-        aggregateType: 'post',
-        aggregateId: postId,
-        eventType: 'post.like.fanout',
-        envelopes: [
-          {
-            event: 'post:liked',
-            rooms: getPostRealtimeRooms(postId, post.visibility),
-            payload: {
-              postId,
-              userId,
-              liked: nextLiked,
-              likesCount: nextLikesCount,
-              reactionType: nextLiked ? 'LIKE' : null,
-              reactionSummary: [],
-            },
-          },
-        ],
-      });
-
-      await enqueueCacheInvalidation(tx as any, {
-        aggregateType: 'post',
-        aggregateId: postId,
-        eventType: 'post.like.cache.invalidate',
-        tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
-      });
-
-      if (nextLiked && post.authorId !== userId) {
-        await enqueueNotificationDelivery(tx as any, {
+        await enqueueRealtimeFanout(tx as any, {
           aggregateType: 'post',
           aggregateId: postId,
-          eventType: 'post.like.push',
-          payload: {
-            kind: 'generic',
-            userId: post.authorId,
-            title: '❤️ New Like',
-            body: `${liker?.name || 'Someone'} liked your post`,
-            data: {
-              type: 'like',
-              postId,
-              actorId: userId,
-              screen: 'post',
+          eventType: 'post.like.fanout',
+          envelopes: [
+            {
+              event: 'post:liked',
+              rooms: getPostRealtimeRooms(postId, post.visibility),
+              payload: {
+                postId,
+                userId,
+                liked: nextLiked,
+                likesCount: nextLikesCount,
+                reactionType: nextReaction,
+                reactionSummary: nextReactionSummary,
+              },
             },
-          },
+          ],
         });
-      }
 
-      return { liked: nextLiked, likesCount: nextLikesCount };
-    });
+        await enqueueCacheInvalidation(tx as any, {
+          aggregateType: 'post',
+          aggregateId: postId,
+          eventType: 'post.like.cache.invalidate',
+          tags: feedCacheTags(`feed:${post.authorId}`, `user:${post.authorId}`),
+        });
+
+        // Only notify on a brand-new reaction, not on unreact or reaction switch
+        if (!existingLike && nextLiked && post.authorId !== userId) {
+          await enqueueNotificationDelivery(tx as any, {
+            aggregateType: 'post',
+            aggregateId: postId,
+            eventType: 'post.like.push',
+            payload: {
+              kind: 'generic',
+              userId: post.authorId,
+              title: '❤️ New Like',
+              body: `${liker?.name || 'Someone'} liked your post`,
+              data: {
+                type: 'like',
+                postId,
+                actorId: userId,
+                screen: 'post',
+              },
+            },
+          });
+        }
+
+        return {
+          liked: nextLiked,
+          likesCount: nextLikesCount,
+          reactionType: nextReaction,
+          reactionSummary: nextReactionSummary,
+          isNewReaction: !existingLike && nextLiked,
+        };
+      });
 
     // Send notification on like (not unlike)
-    if (liked) {
-      // Get post author and liker info
-      if (post.authorId !== userId) {
-        // Send in-app notification (non-blocking)
-        notificationService.notifyPostLike(
-          post.authorId,
-          userId,
-          liker?.name || 'Someone',
-          postId
-        ).catch(console.error);
-      }
+    if (isNewReaction && post.authorId !== userId) {
+      // Send in-app notification (non-blocking)
+      notificationService.notifyPostLike(
+        post.authorId,
+        userId,
+        liker?.name || 'Someone',
+        postId
+      ).catch(console.error);
     }
 
-    res.json({ liked, likesCount });
+    res.json({ liked, isLiked: liked, likesCount, reactionType, reactionSummary });
   } catch (error) {
     console.error('toggleLike error:', error);
     res.status(500).json({ error: 'Failed to toggle like' });
@@ -2210,11 +2239,12 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
     }
 
     const sharesCount = await prisma.$transaction(async (tx) => {
-      const nextSharesCount = (post.sharesCount || 0) + 1;
-      await tx.post.update({
+      const updatedPost = await tx.post.update({
         where: { id: postId },
-        data: { sharesCount: nextSharesCount },
+        data: { sharesCount: { increment: 1 } },
+        select: { sharesCount: true },
       });
+      const nextSharesCount = updatedPost.sharesCount;
 
       await enqueueRealtimeFanout(tx as any, {
         aggregateType: 'post',
@@ -2307,7 +2337,7 @@ export const getLikes = async (req: AuthRequest, res: Response): Promise<void> =
           verified: Boolean((likeWithUser.user as any).isVerified),
           isVerified: Boolean((likeWithUser.user as any).isVerified),
           profileBadgeStyle: (likeWithUser.user as any).profileBadgeStyle ?? null,
-          reactionType: 'LIKE',
+          reactionType: like.reactionType || 'LIKE',
           createdAt: like.createdAt,
         };
       }),

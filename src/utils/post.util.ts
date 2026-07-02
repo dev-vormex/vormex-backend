@@ -50,6 +50,75 @@ export interface StoredPostMetadata {
 
 const DEFAULT_CONTENT_TYPE = 'text/plain';
 
+export const VALID_REACTION_TYPES = ['LIKE', 'CELEBRATE', 'SUPPORT', 'INSIGHTFUL', 'CURIOUS'] as const;
+export type PostReactionType = (typeof VALID_REACTION_TYPES)[number];
+
+export function normalizeReactionType(value: unknown): PostReactionType {
+  const normalized = String(value || '').toUpperCase();
+  return (VALID_REACTION_TYPES as readonly string[]).includes(normalized)
+    ? (normalized as PostReactionType)
+    : 'LIKE';
+}
+
+export interface ReactionSummaryEntry {
+  type: string;
+  count: number;
+}
+
+type ReactionGroupByClient = {
+  postLike: {
+    groupBy(args: {
+      by: ['postId', 'reactionType'];
+      where: { postId: { in: string[] } };
+      _count: { _all: true };
+    }): Promise<Array<{ postId: string; reactionType: string; _count: { _all: number } }>>;
+  };
+};
+
+/**
+ * One groupBy for a whole page of posts → Map<postId, ReactionSummaryEntry[]>,
+ * each summary sorted by count descending.
+ */
+export async function getReactionSummaries(
+  client: ReactionGroupByClient,
+  postIds: string[]
+): Promise<Map<string, ReactionSummaryEntry[]>> {
+  const summaries = new Map<string, ReactionSummaryEntry[]>();
+  if (postIds.length === 0) return summaries;
+
+  const grouped = await client.postLike.groupBy({
+    by: ['postId', 'reactionType'],
+    where: { postId: { in: postIds } },
+    _count: { _all: true },
+  });
+
+  for (const row of grouped) {
+    const entry = { type: row.reactionType, count: row._count._all };
+    const existing = summaries.get(row.postId);
+    if (existing) existing.push(entry);
+    else summaries.set(row.postId, [entry]);
+  }
+  for (const entries of summaries.values()) {
+    entries.sort((a, b) => b.count - a.count);
+  }
+  return summaries;
+}
+
+/**
+ * Attach `reactionSummary` to each raw post row (read by mapPostResponse).
+ */
+export async function attachReactionSummaries<T extends { id: string }>(
+  client: ReactionGroupByClient,
+  posts: T[]
+): Promise<T[]> {
+  const summaries = await getReactionSummaries(client, posts.map((post) => post.id));
+  for (const post of posts) {
+    (post as T & { reactionSummary?: ReactionSummaryEntry[] }).reactionSummary =
+      summaries.get(post.id) ?? [];
+  }
+  return posts;
+}
+
 function asRecord(value: unknown): JsonRecord {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as JsonRecord;
@@ -467,8 +536,9 @@ export function mapPostResponse(post: any, currentUserId: string) {
     savesCount,
     isLiked: Boolean(post.likes?.some((like: any) => like.userId === currentUserId)),
     isSaved,
-    userReactionType: null,
-    reactionSummary: [],
+    userReactionType:
+      post.likes?.find((like: any) => like.userId === currentUserId)?.reactionType ?? null,
+    reactionSummary: Array.isArray(post.reactionSummary) ? post.reactionSummary : [],
     createdAt: post.createdAt,
     updatedAt: post.updatedAt,
   };
