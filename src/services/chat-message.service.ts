@@ -1,8 +1,11 @@
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { prisma, prismaRead } from '../config/prisma';
-import { enqueueCacheInvalidation, enqueueNotificationDelivery, enqueueRealtimeFanout } from '../outbox/helpers';
+import { enqueueOutboxEvents } from '../outbox/service';
+import { queueNames } from '../infrastructure/queue/queue-names';
 import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
+import { TtlMemo } from '../infrastructure/cache/ttl-memo';
+import { getConversationPeerIdCached } from './chat-conversation-cache.service';
 import {
   assertUsersCanInteract,
   enforceTrustTierLimit,
@@ -58,6 +61,7 @@ type MessageRecordForPayload = {
   status: string;
   deliveredAt: Date | string | null;
   readAt: Date | string | null;
+  editedAt?: Date | string | null;
   isDeleted: boolean;
   replyToId: string | null;
   messages?: ReplyMessagePayload;
@@ -80,6 +84,8 @@ export type ChatMessagePayload = {
   status: string;
   deliveredAt?: string;
   readAt?: string;
+  editedAt?: string;
+  isEdited: boolean;
   isDeleted: boolean;
   replyToId: string | null;
   replyTo: ReplyMessagePayload | undefined;
@@ -219,6 +225,12 @@ async function getChatPremiumVisibilityByUserIds(
   }
 }
 
+// Identity/premium flags tolerate short staleness; both lookups fan out into
+// several DB queries each and sit on the ack critical path of every send.
+const CHAT_IDENTITY_MEMO_TTL_MS = 45_000;
+const senderPayloadMemo = new TtlMemo<ChatSenderPayload | null>(CHAT_IDENTITY_MEMO_TTL_MS, 10_000);
+const readReceiptMemo = new TtlMemo<boolean>(CHAT_IDENTITY_MEMO_TTL_MS, 10_000);
+
 async function getReadReceiptVisibility(userId: string): Promise<boolean> {
   try {
     return await canUserUsePremiumFeature(userId, 'read_receipts');
@@ -226,6 +238,19 @@ async function getReadReceiptVisibility(userId: string): Promise<boolean> {
     console.error('read receipt premium check failed:', error);
     return false;
   }
+}
+
+export async function getReadReceiptVisibilityCached(userId: string): Promise<boolean> {
+  return readReceiptMemo.get(userId, () => getReadReceiptVisibility(userId));
+}
+
+export async function getChatSenderPayloadCached(senderId: string): Promise<ChatSenderPayload | null> {
+  return senderPayloadMemo.get(senderId, () => getSenderPayload(senderId));
+}
+
+export function invalidateChatIdentityCache(userId: string): void {
+  senderPayloadMemo.delete(userId);
+  readReceiptMemo.delete(userId);
 }
 
 function toIsoString(value: Date | string | null): string | undefined {
@@ -262,6 +287,8 @@ function mapChatMessagePayload(params: {
     status: visibleMessage.status,
     deliveredAt: toIsoString(visibleMessage.deliveredAt),
     readAt: toIsoString(visibleMessage.readAt),
+    editedAt: toIsoString(visibleMessage.editedAt ?? null),
+    isEdited: Boolean(visibleMessage.editedAt),
     isDeleted: visibleMessage.isDeleted,
     replyToId: visibleMessage.replyToId,
     replyTo: visibleMessage.messages,
@@ -289,6 +316,7 @@ function buildRealtimeEnvelopes(params: {
       event: 'chat:new_message',
       rooms: [`chat:${params.conversationId}`],
       users: [params.senderId, params.receiverId],
+      dedupeKey: `chat:new_message:${params.message.id}`,
       payload: {
         conversationId: params.conversationId,
         message: params.message,
@@ -297,6 +325,7 @@ function buildRealtimeEnvelopes(params: {
     {
       event: 'chat:notification',
       users: [params.receiverId],
+      dedupeKey: `chat:notification:${params.message.id}`,
       payload: {
         type: 'new_message',
         conversationId: params.conversationId,
@@ -312,11 +341,13 @@ function isPrismaUniqueViolation(error: unknown): boolean {
 }
 
 async function getSenderPayload(senderId: string): Promise<ChatSenderPayload | null> {
-  const senderRecord = await prismaRead.user.findUnique({
-    where: { id: senderId },
-    select: userSelect,
-  });
-  const senderPremiumVisibility = await getChatPremiumVisibilityByUserIds([senderId]);
+  const [senderRecord, senderPremiumVisibility] = await Promise.all([
+    prismaRead.user.findUnique({
+      where: { id: senderId },
+      select: userSelect,
+    }),
+    getChatPremiumVisibilityByUserIds([senderId]),
+  ]);
   return senderRecord ? buildChatUserIdentity(senderRecord, senderPremiumVisibility) : null;
 }
 
@@ -391,30 +422,40 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
     throw new Error('Content or media is required');
   }
 
-  const conversation = await prisma.conversations.findFirst({
-    where: {
-      id: conversationId,
-      OR: [
-        { participant1Id: senderId },
-        { participant2Id: senderId },
-      ],
-    },
-  });
-
-  if (!conversation) {
+  const receiverId = await getConversationPeerIdCached(conversationId, senderId);
+  if (!receiverId) {
     throw new Error('Conversation not found');
   }
 
-  const receiverId =
-    conversation.participant1Id === senderId
-      ? conversation.participant2Id
-      : conversation.participant1Id;
+  // Every one of these previously ran serially before the sender's ack; on a
+  // high-latency DB link that alone added seconds. Safety checks stay live,
+  // identity/premium lookups are memoized, and everything runs concurrently.
+  const [, , sender, viewerCanUseReadReceipts, replyToMessage] = await Promise.all([
+    assertUsersCanInteract(senderId, receiverId, 'message'),
+    enforceTrustTierLimit(senderId, 'dm'),
+    getChatSenderPayloadCached(senderId),
+    getReadReceiptVisibilityCached(senderId),
+    replyToMessageId
+      ? prismaRead.messages.findFirst({
+          where: {
+            id: replyToMessageId,
+            conversationId,
+            isDeleted: false,
+          },
+          select: {
+            id: true,
+            content: true,
+            contentType: true,
+            senderId: true,
+          },
+        })
+      : Promise.resolve(null),
+  ]);
 
-  await assertUsersCanInteract(senderId, receiverId, 'message');
-  await enforceTrustTierLimit(senderId, 'dm');
+  if (replyToMessageId && !replyToMessage) {
+    throw new Error('Reply target is invalid for this conversation');
+  }
 
-  const sender = await getSenderPayload(senderId);
-  const viewerCanUseReadReceipts = await getReadReceiptVisibility(senderId);
   const now = new Date();
   const messageId = randomUUID();
   const preview = normalizedContent
@@ -425,26 +466,6 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
 
   try {
     return await prisma.$transaction(async (tx) => {
-      const replyToMessage = replyToMessageId
-        ? await tx.messages.findFirst({
-            where: {
-              id: replyToMessageId,
-              conversationId,
-              isDeleted: false,
-            },
-            select: {
-              id: true,
-              content: true,
-              contentType: true,
-              senderId: true,
-            },
-          })
-        : null;
-
-      if (replyToMessageId && !replyToMessage) {
-        throw new Error('Reply target is invalid for this conversation');
-      }
-
       await tx.messages.create({
         data: {
           id: messageId,
@@ -486,6 +507,7 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
           status: 'SENT',
           deliveredAt: null,
           readAt: null,
+          editedAt: null,
           isDeleted: false,
           replyToId: replyToMessageId,
           messages: replyToMessage,
@@ -506,48 +528,51 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
       });
       const cacheTags = conversationCacheTags(conversationId, senderId, receiverId);
 
-      await enqueueRealtimeFanout(tx, {
-        aggregateType: 'message',
-        aggregateId: messageId,
-        eventType: 'chat.message.created',
-        idempotencyKey: `chat:realtime:${messageId}`,
-        envelopes: realtimeEnvelopes,
-      });
-
-      await enqueueNotificationDelivery(tx, {
-        aggregateType: 'message',
-        aggregateId: messageId,
-        eventType: 'chat.message.push',
-        idempotencyKey: `chat:push:${messageId}`,
-        payload: {
-          kind: 'new_message',
-          userId: receiverId,
-          title: sender?.name || sender?.username || 'Someone',
-          body: preview,
-          conversationId,
-          senderId,
-          senderName: sender?.name || sender?.username || 'Someone',
-          senderImage: sender?.profileImage || undefined,
-          messageId,
-          clientMessageId: clientMessageId || undefined,
-          messageContent: normalizedContent,
-          contentType: normalizedContentType,
-          mediaUrl: normalizedMediaUrl || undefined,
-          mediaType: normalizedMediaType || undefined,
-          fileName: normalizedFileName || undefined,
-          fileSize: normalizedFileSize || undefined,
-          messageCreatedAt: now.toISOString(),
-          messageUpdatedAt: now.toISOString(),
+      await enqueueOutboxEvents(tx, [
+        {
+          aggregateType: 'message',
+          aggregateId: messageId,
+          eventType: 'chat.message.created',
+          queueName: queueNames.realtimeFanout,
+          idempotencyKey: `chat:realtime:${messageId}`,
+          payload: { envelopes: realtimeEnvelopes },
         },
-      });
-
-      await enqueueCacheInvalidation(tx, {
-        aggregateType: 'conversation',
-        aggregateId: conversationId,
-        eventType: 'chat.cache.invalidate',
-        idempotencyKey: `chat:cache:${messageId}`,
-        tags: cacheTags,
-      });
+        {
+          aggregateType: 'message',
+          aggregateId: messageId,
+          eventType: 'chat.message.push',
+          queueName: queueNames.notificationDelivery,
+          idempotencyKey: `chat:push:${messageId}`,
+          payload: {
+            kind: 'new_message',
+            userId: receiverId,
+            title: sender?.name || sender?.username || 'Someone',
+            body: preview,
+            conversationId,
+            senderId,
+            senderName: sender?.name || sender?.username || 'Someone',
+            senderImage: sender?.profileImage || undefined,
+            messageId,
+            clientMessageId: clientMessageId || undefined,
+            messageContent: normalizedContent,
+            contentType: normalizedContentType,
+            mediaUrl: normalizedMediaUrl || undefined,
+            mediaType: normalizedMediaType || undefined,
+            fileName: normalizedFileName || undefined,
+            fileSize: normalizedFileSize || undefined,
+            messageCreatedAt: now.toISOString(),
+            messageUpdatedAt: now.toISOString(),
+          },
+        },
+        {
+          aggregateType: 'conversation',
+          aggregateId: conversationId,
+          eventType: 'chat.cache.invalidate',
+          queueName: queueNames.cacheInvalidation,
+          idempotencyKey: `chat:cache:${messageId}`,
+          payload: { tags: cacheTags },
+        },
+      ]);
 
       return {
         conversationId,

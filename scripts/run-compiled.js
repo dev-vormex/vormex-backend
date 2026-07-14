@@ -6,7 +6,7 @@ const { spawnSync } = require('child_process');
 
 const projectRoot = path.join(__dirname, '..');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const allowedEntries = new Set(['api', 'worker', 'scheduler']);
+const allowedEntries = new Set(['api', 'worker', 'scheduler', 'proximity-worker', 'proximity-scheduler']);
 const entryName = process.argv[2] || 'api';
 
 if (!allowedEntries.has(entryName)) {

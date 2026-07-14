@@ -19,7 +19,10 @@ export async function initializeRealtimeSubscriptions(io: Server): Promise<void>
 
     try {
       const envelope = JSON.parse(message) as RealtimeEnvelope;
-      emitRealtimeEnvelopeToServer(io, envelope);
+      // Every instance receives this publish, so each one delivers to its own
+      // sockets only. Re-emitting through the Redis adapter here would deliver
+      // N copies per client (N = instance count).
+      emitRealtimeEnvelopeToServer(io, envelope, { localOnly: true });
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.error({

@@ -1,6 +1,7 @@
 # Backend Load Testing
 
-This folder contains a no-dependency load-test runner for the Vormex Express API.
+This folder contains a no-dependency HTTP load-test runner plus a Socket.IO
+chat load test for the Vormex Express API.
 
 ## What To Test First
 
@@ -10,6 +11,8 @@ Use separate tests for separate bottlenecks:
 - `health-ready`: database connection overhead through Prisma.
 - `public-read`: anonymous feed/discovery traffic.
 - `auth-read`: logged-in app-home traffic.
+- `chat-socket-load.js`: the realtime chat send path (socket ack, cross-socket
+  delivery, typing relay, delivered receipts, duplicate detection).
 
 The backend currently has a general API rate limit of 120 requests/minute per IP and 600 requests/minute per authenticated user. For larger staging tests, use several test users/tokens or temporarily raise limits in a staging-only config.
 
@@ -73,12 +76,54 @@ Create up to 5 staging users/tokens:
 node load-tests/create-tokens.js --count 5
 ```
 
+Registration requires email OTP verification, so `create-tokens.js` completes
+the flow by planting a known OTP in the database and calling the real
+`POST /api/auth/verify-email` endpoint. It therefore needs `../.env` with
+`DATABASE_URL` and `JWT_SECRET`/`AUTH_OTP_PEPPER` matching the target backend,
+plus a compiled build (`npm run build`). Only use it against local/staging.
+
 Then paste the printed `LOAD_TEST_TOKENS="..."` before the authenticated test:
 
 ```bash
 LOAD_TEST_TOKENS="token1,token2,token3,token4,token5" \
 node load-tests/simple-load.js --scenario auth-read --duration 120 --concurrency 30 --virtual-ips 30
 ```
+
+## Chat Socket Load Test
+
+Exercises the realtime send path end-to-end: connect + authenticate,
+`chat:join`, `chat:typing` relay, `chat:send_message` ack latency,
+cross-socket `chat:new_message` delivery latency, `chat:delivered` receipts,
+and duplicate-delivery detection (must stay 0 — realtime envelopes are
+deduped server-side).
+
+Tokens pair up: token1↔token2, token3↔token4, ... Use an even count.
+
+```bash
+node load-tests/create-tokens.js --count 4 --prefix chat-load
+LOAD_TEST_TOKENS="t1,t2,t3,t4" node load-tests/chat-socket-load.js \
+  --duration 60 --message-rate 1 --max-error-rate 1 --max-ack-p95 800
+```
+
+Options: `--base-url`, `--duration` (s), `--message-rate` (msgs/s per pair),
+`--typing true|false`, `--max-ack-p95` (ms), `--max-error-rate` (%).
+
+Fresh users are BASIC trust tier and DM sends are trust-tier rate limited.
+For capacity tests, raise the limit in the target environment (staging only):
+
+```bash
+TRUST_LIMIT_DM_BASIC=100000
+```
+
+Reading the report:
+
+- `send -> ack`: server persist + ack time as the sender perceives it.
+- `send -> peer delivery`: full realtime fan-out to the other participant.
+- `duplicate deliveries`: must be 0; anything else is a dedupe regression
+  (outbox replay or per-room double emit).
+- `missing deliveries`: acked but never received by the peer before drain end.
+- Latency from a dev machine includes your round-trip to the database region;
+  compare trends, not absolute values, unless running near the DB.
 
 ## Get A Token
 

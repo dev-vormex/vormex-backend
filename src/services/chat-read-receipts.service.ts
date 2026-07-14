@@ -31,9 +31,10 @@ export function maskReadReceiptForViewer<T extends ChatReadReceiptMessage>(
     return message;
   }
 
+  // Delivery receipts are not premium-gated; a read message was necessarily delivered.
   return {
     ...message,
-    status: String(message.status || '').toUpperCase() === 'READ' ? 'SENT' : message.status,
+    status: String(message.status || '').toUpperCase() === 'READ' ? 'DELIVERED' : message.status,
     readAt: null,
   };
 }

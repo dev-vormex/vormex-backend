@@ -11,8 +11,8 @@ import {
   maskReadReceiptForViewer,
   shouldNotifySenderAboutReadReceipt,
 } from '../services/chat-read-receipts.service';
-import { canUserUsePremiumFeature } from '../services/premium-feature-gates.service';
-import { sendChatMessage } from '../services/chat-message.service';
+import { getReadReceiptVisibilityCached, sendChatMessage } from '../services/chat-message.service';
+import { invalidateConversationParticipants } from '../services/chat-conversation-cache.service';
 import {
   getPremiumVisibilityByUserIds,
   type PremiumVisibilityState,
@@ -133,14 +133,9 @@ const toIsoString = (value: unknown): string | undefined => {
   return undefined;
 };
 
-const getReadReceiptVisibility = async (userId: string): Promise<boolean> => {
-  try {
-    return await canUserUsePremiumFeature(userId, 'read_receipts');
-  } catch (error) {
-    console.error('read receipt premium check failed:', error);
-    return false;
-  }
-};
+// Memoized in chat-message.service: this check fans out into several queries
+// and runs on every conversation/messages list request.
+const getReadReceiptVisibility = getReadReceiptVisibilityCached;
 
 const maskLastMessagePayload = (
   message: any,
@@ -178,6 +173,8 @@ const mapMessagePayload = (
     status: visibleMessage.status,
     deliveredAt: toIsoString(visibleMessage.deliveredAt),
     readAt: toIsoString(visibleMessage.readAt),
+    editedAt: toIsoString(visibleMessage.editedAt),
+    isEdited: Boolean(visibleMessage.editedAt),
     isDeleted: visibleMessage.isDeleted,
     replyToId: visibleMessage.replyToId,
     replyTo: (visibleMessage as typeof visibleMessage & { messages: unknown }).messages,
@@ -1103,6 +1100,7 @@ export const deleteConversation = async (req: AuthRequest, res: Response): Promi
     });
 
     await invalidateChatCaches(cacheTags);
+    invalidateConversationParticipants(conversationId);
     console.log(`Deleted conversation ${conversationId} and all its messages`);
     res.status(200).json({ success: true });
   } catch (error) {
@@ -1155,9 +1153,10 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
     let realtimeEnvelopes: RealtimeEnvelope[] = [];
     const cacheTags = messageCacheTags(message);
     const updated = await prisma.$transaction(async (tx) => {
+      const editedAt = new Date();
       const nextMessage = await tx.messages.update({
         where: { id: messageId },
-        data: { content, updatedAt: new Date() },
+        data: { content, editedAt, updatedAt: editedAt },
         include: {
           messages: {
             select: {
@@ -1174,11 +1173,12 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
         {
           event: 'chat:message_edited',
           rooms: [`chat:${nextMessage.conversationId}`],
+          dedupeKey: `chat:message_edited:${nextMessage.id}:${editedAt.getTime()}`,
           payload: {
             messageId: nextMessage.id,
             conversationId: nextMessage.conversationId,
             content: nextMessage.content,
-            editedAt: nextMessage.updatedAt.toISOString(),
+            editedAt: editedAt.toISOString(),
           },
         },
       ];

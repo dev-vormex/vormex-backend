@@ -6,7 +6,9 @@ import test from 'node:test';
 const root = process.cwd();
 
 function source(path: string): string {
-  return readFileSync(join(root, path), 'utf8');
+  // Normalize CRLF so "\n"-based markers slice identically on Windows
+  // working trees and CI.
+  return readFileSync(join(root, path), 'utf8').replace(/\r\n/g, '\n');
 }
 
 function between(text: string, start: string, end: string): string {
@@ -27,9 +29,11 @@ test('sendChatMessage writes message, conversation metadata, and outbox rows in 
 
   assert.match(transactionBlock, /await tx\.messages\.create/);
   assert.match(transactionBlock, /await tx\.conversations\.update/);
-  assert.match(transactionBlock, /await enqueueRealtimeFanout\(tx,/);
-  assert.match(transactionBlock, /await enqueueNotificationDelivery\(tx,/);
-  assert.match(transactionBlock, /await enqueueCacheInvalidation\(tx,/);
+  // All three chat side effects ride one batched outbox insert inside the tx.
+  assert.match(transactionBlock, /await enqueueOutboxEvents\(tx, \[/);
+  assert.match(transactionBlock, /queueName: queueNames\.realtimeFanout/);
+  assert.match(transactionBlock, /queueName: queueNames\.notificationDelivery/);
+  assert.match(transactionBlock, /queueName: queueNames\.cacheInvalidation/);
   assert.doesNotMatch(transactionBlock, /prisma\.(messages|conversations|outbox_events)/);
 });
 

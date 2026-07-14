@@ -273,10 +273,14 @@ export async function getUnifiedContentFeed(
     }
 
     const skip = (page - 1) * limit;
+    // Fetch through the requested page plus one sentinel item. A fixed per-type cap
+    // made profiles with more than 100 items report that no additional activity existed.
+    const queryTake = skip + limit + 1;
     const allItems: UnifiedContentItem[] = [];
 
     // Query different content types based on filter
-    const shouldFetchPosts = !filter || filter === 'all' || filter === 'posts';
+    // Video posts and dedicated Reel rows both belong in the Android "Reels" tab.
+    const shouldFetchPosts = !filter || filter === 'all' || filter === 'posts' || filter === 'videos';
     const shouldFetchReels = !filter || filter === 'all' || filter === 'videos';
     const shouldFetchArticles = !filter || filter === 'all' || filter === 'articles';
     const shouldFetchForum = !filter || filter === 'all' || filter === 'forum';
@@ -292,13 +296,14 @@ export async function getUnifiedContentFeed(
             publishedAt: { not: null },
           },
           orderBy: { publishedAt: 'desc' },
-          take: 100,
+          take: queryTake,
         });
 
         for (const reel of reels) {
           const item: UnifiedContentItem = {
             id: reel.id,
             contentType: 'short_video',
+            entityType: 'reel',
             content: reel.caption || '',
             createdAt: reel.publishedAt!,
             updatedAt: reel.updatedAt,
@@ -307,6 +312,8 @@ export async function getUnifiedContentFeed(
             viewsCount: reel.viewsCount,
             title: reel.title || undefined,
             images: reel.thumbnailUrl ? [reel.thumbnailUrl] : undefined,
+            videoUrl: reel.videoUrl,
+            videoThumbnail: reel.thumbnailUrl || undefined,
             tags: reel.hashtags?.length ? reel.hashtags : undefined,
           };
           allItems.push(item);
@@ -324,8 +331,10 @@ export async function getUnifiedContentFeed(
           const accessWhere = await buildPostVisibilityWhere(requestingUserId);
           const postTypeFilter =
             filter === 'posts'
-              ? { in: ['text', 'image', 'link', 'poll', 'celebration', 'document', 'mixed'] }
-              : { in: ['text', 'image', 'video', 'link', 'poll', 'celebration', 'document', 'mixed'] };
+              ? { in: ['text', 'TEXT', 'image', 'IMAGE', 'link', 'LINK', 'poll', 'POLL', 'celebration', 'CELEBRATION', 'document', 'DOCUMENT', 'mixed', 'MIXED'] }
+              : filter === 'videos'
+                ? { in: ['video', 'VIDEO'] }
+                : { in: ['text', 'TEXT', 'image', 'IMAGE', 'video', 'VIDEO', 'link', 'LINK', 'poll', 'POLL', 'celebration', 'CELEBRATION', 'document', 'DOCUMENT', 'mixed', 'MIXED'] };
 
           const posts = await postModel.findMany({
             where: {
@@ -351,11 +360,11 @@ export async function getUnifiedContentFeed(
               ],
             },
             orderBy: { createdAt: 'desc' },
-            take: 100,
+            take: queryTake,
           });
 
           for (const post of posts) {
-            const contentType = post.type === 'video' ? 'short_video' : 'post';
+            const contentType = post.type?.toLowerCase() === 'video' ? 'short_video' : 'post';
             allItems.push(formatUnifiedItem(post, contentType));
           }
         }
@@ -388,13 +397,13 @@ export async function getUnifiedContentFeed(
                 },
                 {
                   isActive: true,
-                  type: 'article',
+                  type: { in: ['article', 'ARTICLE'] },
                 },
                 accessWhere,
               ],
             },
             orderBy: { createdAt: 'desc' },
-            take: 100,
+            take: queryTake,
           });
 
           for (const article of articles) {
@@ -414,7 +423,7 @@ export async function getUnifiedContentFeed(
           const questions = await forumQuestionModel.findMany({
             where: { userId },
             orderBy: { createdAt: 'desc' },
-            take: 100,
+            take: queryTake,
           });
 
           for (const question of questions) {
@@ -440,7 +449,7 @@ export async function getUnifiedContentFeed(
               },
             },
             orderBy: { createdAt: 'desc' },
-            take: 100,
+            take: queryTake,
           });
 
           for (const answer of answers) {

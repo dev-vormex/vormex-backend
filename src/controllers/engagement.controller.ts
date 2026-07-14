@@ -22,6 +22,7 @@ import {
   getDailyUsageWindowStart,
 } from '../services/tier-limits.service';
 import { cacheService } from '../services/cache.service';
+import { getPremiumVisibilityByUserIds } from '../services/premium-visibility.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -417,6 +418,8 @@ export const getDailyMatches = async (req: AuthRequest, res: Response): Promise<
         college: true,
         lastActiveAt: true,
         interests: true,
+        isVerified: true,
+        profileBadgeStyle: true,
       },
       take: matchCount * 3, // Get more than needed for filtering
     });
@@ -442,16 +445,22 @@ export const getDailyMatches = async (req: AuthRequest, res: Response): Promise<
     });
 
     // Sort by score and take top matches
-    const matches = scoredMatches
+    const topMatches = scoredMatches
       .sort((a, b) => b.score - a.score)
-      .slice(0, matchCount)
-      .map((user) => ({
+      .slice(0, matchCount);
+    const premiumVisibilityByUser = await getPremiumVisibilityByUserIds(topMatches.map((user) => user.id));
+
+    const matches = topMatches.map((user) => ({
         id: user.id,
         username: user.username,
         name: user.name,
         profileImage: user.profileImage,
         headline: user.headline,
         college: user.college,
+        verified: Boolean(user.isVerified),
+        isVerified: Boolean(user.isVerified),
+        profileBadgeStyle: user.profileBadgeStyle ?? null,
+        isPremium: Boolean(premiumVisibilityByUser.get(user.id)?.isPremium),
         isOnline: user.lastActiveAt ? new Date(user.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000) : false,
         replyRate: Math.floor(Math.random() * 40) + 60, // TODO: Calculate real reply rate
       }));
@@ -650,6 +659,8 @@ export const getHiddenGem = async (req: AuthRequest, res: Response): Promise<voi
         headline: true,
         college: true,
         lastActiveAt: true,
+        isVerified: true,
+        profileBadgeStyle: true,
       },
       orderBy: {
         userStats: { connectionsCount: 'desc' },
@@ -661,6 +672,8 @@ export const getHiddenGem = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    const hiddenGemPremiumVisibility = await getPremiumVisibilityByUserIds([hiddenGem.id]);
+
     res.json({
       data: {
         match: {
@@ -670,6 +683,10 @@ export const getHiddenGem = async (req: AuthRequest, res: Response): Promise<voi
           profileImage: hiddenGem.profileImage,
           headline: hiddenGem.headline,
           college: hiddenGem.college,
+          verified: Boolean(hiddenGem.isVerified),
+          isVerified: Boolean(hiddenGem.isVerified),
+          profileBadgeStyle: hiddenGem.profileBadgeStyle ?? null,
+          isPremium: Boolean(hiddenGemPremiumVisibility.get(hiddenGem.id)?.isPremium),
           isOnline: hiddenGem.lastActiveAt ? new Date(hiddenGem.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000) : false,
           replyRate: 85,
         },

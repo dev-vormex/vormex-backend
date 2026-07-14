@@ -1,17 +1,22 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
 const locationControllerPath = path.join(process.cwd(), 'src/controllers/location.controller.ts');
 const discoveryPowerPath = path.join(process.cwd(), 'src/services/discovery-power.service.ts');
+
+// These tests slice source text with "\n"-based markers; normalize CRLF so
+// they behave the same on Windows working trees as on CI.
+const readSource = (filePath: string): string =>
+  fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
 const migrationPath = path.join(
   process.cwd(),
   'prisma/migrations/20260608160000_make_location_public_opt_in/migration.sql',
 );
 
 test('storing location does not implicitly opt the user into public nearby', () => {
-  const source = fs.readFileSync(locationControllerPath, 'utf8');
+  const source = readSource(locationControllerPath);
   const updateLocationBlock = source.slice(
     source.indexOf('export const updateLocation'),
     source.indexOf('/**\n * Update location settings')
@@ -23,7 +28,7 @@ test('storing location does not implicitly opt the user into public nearby', () 
 });
 
 test('public nearby visibility requires explicit opt in through settings', () => {
-  const source = fs.readFileSync(locationControllerPath, 'utf8');
+  const source = readSource(locationControllerPath);
   const settingsBlock = source.slice(
     source.indexOf('export const updateLocationSettings'),
     source.indexOf('/**\n * Get current location')
@@ -40,14 +45,14 @@ test('public nearby visibility requires explicit opt in through settings', () =>
 });
 
 test('discovery nearby search excludes users who have not opted in', () => {
-  const source = fs.readFileSync(discoveryPowerPath, 'utf8');
+  const source = readSource(discoveryPowerPath);
 
   assert.match(source, /"shareLocationPublic"\s*=\s*true/);
   assert.match(source, /COALESCE\("locationPermission", true\)\s*=\s*true/);
 });
 
 test('location visibility migration resets historical implicit opt-ins to private', () => {
-  const sql = fs.readFileSync(migrationPath, 'utf8');
+  const sql = readSource(migrationPath);
 
   assert.match(sql, /UPDATE "users"/);
   assert.match(sql, /SET "shareLocationPublic" = false/);

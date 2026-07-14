@@ -37,6 +37,7 @@ import {
   searchCatalogColleges,
 } from '../services/college-catalog.service';
 import { getBlockedUserIds } from '../services/trust-safety.service';
+import { getPeopleRelationshipCapabilities } from '../services/people-relationship.service';
 import {
   CoarseLocationDTO,
   serializeCoarseLocation,
@@ -109,13 +110,12 @@ const PEOPLE_FILTER_OPTIONS_CACHE_TTL_SECONDS = 5 * 60;
 const PEOPLE_ACCEPTED_CONNECTION_IDS_CACHE_TTL_SECONDS = 30;
 const PEOPLE_FILTER_OPTION_LIMIT = 100;
 const PEOPLE_DEFAULT_LIMIT = 20;
-const PEOPLE_MAX_LIMIT = 40;
-const PEOPLE_PERSONALIZED_MAX_LIMIT = 20;
+const PEOPLE_MAX_LIMIT = 50;
+const PEOPLE_PERSONALIZED_MAX_LIMIT = 50;
 const PEOPLE_MAX_FILTER_VALUES = 10;
 const PEOPLE_MAX_PERSON_CARD_SKILLS = 8;
 const PEOPLE_MAX_ACCEPTED_CONNECTION_IDS = 1_000;
 const PEOPLE_MAX_MUTUAL_CONNECTION_SCAN_IDS = 500;
-const PEOPLE_SUGGESTION_POOL_MULTIPLIER = 4;
 const PEOPLE_SUGGESTION_POOL_MAX = 80;
 const PEOPLE_MIN_TEXT_SEARCH_LENGTH = 2;
 const PEOPLE_COLLEGE_SEARCH_CACHE_TTL_SECONDS = 5 * 60;
@@ -359,8 +359,8 @@ const peopleCacheTags = (userId?: string | null): string[] =>
     userId ? `people:connections:${userId}` : '',
   ]);
 
-const peopleSameCollegeCacheKey = (userId: string, limit: number): string =>
-  `people:same-college:${PEOPLE_CACHE_VERSION}:user:${userId}:limit:${limit}`;
+const peopleSameCollegeCacheKey = (userId: string, page: number, limit: number): string =>
+  `people:same-college:${PEOPLE_CACHE_VERSION}:user:${userId}:page:${page}:limit:${limit}`;
 
 const filterBlockedPeople = <T extends { id: string }>(people: T[], blockedUserIds: string[]): T[] => {
   if (blockedUserIds.length === 0) return people;
@@ -444,30 +444,14 @@ const getRelationshipSummary = async (
   const connectionStatusByUser = new Map<string, PersonCard['connectionStatus']>();
   const mutualConnectionsByUser = new Map<string, number>();
 
-  const [directConnections, currentConnectionIds] = await Promise.all([
-    prismaRead.connections.findMany({
-      where: {
-        OR: [
-          { requesterId: currentUserId, addresseeId: { in: uniqueTargetIds } },
-          { requesterId: { in: uniqueTargetIds }, addresseeId: currentUserId },
-        ],
-      },
-      select: { requesterId: true, addresseeId: true, status: true },
-    }),
+  const [capabilities, currentConnectionIds] = await Promise.all([
+    getPeopleRelationshipCapabilities(currentUserId, uniqueTargetIds),
     includeMutualConnections ? getAcceptedConnectionIds(currentUserId) : Promise.resolve([]),
   ]);
 
-  for (const connection of directConnections) {
-    const targetUserId = connection.requesterId === currentUserId
-      ? connection.addresseeId
-      : connection.requesterId;
-    if (connection.status === 'accepted') {
-      connectionStatusByUser.set(targetUserId, 'connected');
-    } else if (connection.status === 'pending') {
-      connectionStatusByUser.set(
-        targetUserId,
-        connection.requesterId === currentUserId ? 'pending_sent' : 'pending_received'
-      );
+  for (const [targetUserId, capability] of capabilities) {
+    if (capability.connectionStatus !== 'none') {
+      connectionStatusByUser.set(targetUserId, capability.connectionStatus);
     }
   }
 
@@ -748,7 +732,9 @@ export const getSuggestions = async (
     }
 
     const userId = String(req.user.userId);
+    const page = parseBoundedInt(req.query.page, 1, 1, Number.MAX_SAFE_INTEGER);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
+    const skip = (page - 1) * limit;
     const quota = await getSuggestionQuotaState(userId);
     const effectiveLimit = quota.isPremium
       ? limit
@@ -790,17 +776,14 @@ export const getSuggestions = async (
     }
     if (currentUser.graduationYear) suggestionSignals.push({ graduationYear: currentUser.graduationYear });
 
-    const candidateTake = Math.min(
-      Math.max(effectiveLimit * PEOPLE_SUGGESTION_POOL_MULTIPLIER, effectiveLimit + 10),
-      PEOPLE_SUGGESTION_POOL_MAX
-    );
     const users = await prismaRead.user.findMany({
       where: {
         id: { notIn: [userId, ...passedTargetIds, ...blockedUserIds] },
         isBanned: false,
         ...(suggestionSignals.length > 0 ? { OR: suggestionSignals } : {}),
       },
-      take: candidateTake,
+      skip,
+      take: effectiveLimit,
       orderBy: peopleOrderBy,
       select: personCardUserSelect,
     });
@@ -810,9 +793,7 @@ export const getSuggestions = async (
     const suggestions: PersonCard[] = sortByPremiumVisibility(
       users.filter((user) => !relationship.connectionStatusByUser.has(user.id)),
       visibilityByUser
-    )
-      .slice(0, effectiveLimit)
-      .map((user) => mapUserToPersonCard(user, relationship, visibilityByUser));
+    ).map((user) => mapUserToPersonCard(user, relationship, visibilityByUser));
     const updatedQuota = await recordSuggestionImpressions(
       userId,
       suggestions.map((suggestion) => suggestion.id),
@@ -820,8 +801,11 @@ export const getSuggestions = async (
     );
     const response = {
       suggestions,
-      total: suggestions.length,
-      hasMore: updatedQuota.isPremium ? false : (updatedQuota.remaining ?? 0) > 0,
+      total: skip + suggestions.length + (users.length === effectiveLimit ? 1 : 0),
+      page,
+      hasMore:
+        users.length === effectiveLimit &&
+        (updatedQuota.isPremium || (updatedQuota.remaining ?? 0) > 0),
       quota: updatedQuota,
       canRewind,
     };
@@ -856,8 +840,10 @@ export const getPeopleFromSameCollege = async (
     }
 
     const userId = String(req.user.userId);
+    const page = parseBoundedInt(req.query.page, 1, 1, Number.MAX_SAFE_INTEGER);
     const limit = parseBoundedInt(req.query.limit, 10, 1, PEOPLE_PERSONALIZED_MAX_LIMIT);
-    const cacheKey = peopleSameCollegeCacheKey(userId, limit);
+    const skip = (page - 1) * limit;
+    const cacheKey = peopleSameCollegeCacheKey(userId, page, limit);
     const blockedUserIds = await getBlockedUserIds(userId);
     const cached = await cacheService.get<{
       people: PersonCard[];
@@ -898,13 +884,15 @@ export const getPeopleFromSameCollege = async (
         isBanned: false,
         college: currentUser.college,
       },
-      take: limit,
+      skip,
+      take: limit + 1,
       orderBy: peopleOrderBy,
       select: personCardUserSelect,
     });
 
     const visibilityByUser = await getPremiumVisibilityByUserIds(users.map((user) => user.id));
-    const sortedUsers = sortByPremiumVisibility(users, visibilityByUser);
+    const hasMore = users.length > limit;
+    const sortedUsers = sortByPremiumVisibility(users.slice(0, limit), visibilityByUser);
     const relationship = await getRelationshipSummary(userId, sortedUsers.map((user) => user.id));
     const people: PersonCard[] = sortedUsers.map((user) =>
       mapUserToPersonCard(user, relationship, visibilityByUser)
@@ -913,10 +901,10 @@ export const getPeopleFromSameCollege = async (
     const response = {
       people,
       userCollege: currentUser.college,
-      total: people.length,
-      page: 1,
-      totalPages: 1,
-      hasMore: false,
+      total: skip + people.length + (hasMore ? 1 : 0),
+      page,
+      totalPages: hasMore ? page + 1 : page,
+      hasMore,
     };
 
     await cacheService.set(

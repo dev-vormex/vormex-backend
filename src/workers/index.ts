@@ -6,7 +6,7 @@ import type { QueueName } from '../infrastructure/queue/queue-names';
 import { getQueue } from '../infrastructure/queue/queues';
 import { isRedisEnabled, isRedisRequired, redisCommand } from '../infrastructure/redis/client';
 import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
-import { publishRealtimeEnvelope } from '../infrastructure/realtime/channels';
+import { claimEnvelopePublish, publishRealtimeEnvelope } from '../infrastructure/realtime/channels';
 import type {
   CacheInvalidationPayload,
   NotificationDeliveryPayload,
@@ -47,6 +47,19 @@ type CacheInvalidationJobData =
 async function processRealtimeFanout(job: Job<{ event: { payload: RealtimeFanoutPayload } }>) {
   const envelopes = job.data.event.payload.envelopes || [];
   for (const envelope of envelopes) {
+    // The API emits envelopes immediately on the request path; this outbox
+    // replay is only the crash-recovery backstop. Skip anything a live
+    // instance already delivered, or clients see duplicates.
+    if (envelope.dedupeKey) {
+      try {
+        const claimed = await claimEnvelopePublish(envelope.dedupeKey);
+        if (!claimed) {
+          continue;
+        }
+      } catch {
+        // Redis hiccup: fall through and publish; clients de-dupe by id.
+      }
+    }
     await publishRealtimeEnvelope(envelope);
   }
 }
