@@ -98,9 +98,8 @@ import {
 import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
 import { botGuard, generalApiRateLimit } from './middleware/abuse-protection.middleware';
 import { optionalAppCheck } from './middleware/app-check.middleware';
-import { authenticate, optionalAuth, verifyAccessToken } from './middleware/auth.middleware';
+import { authenticate, optionalAuth, verifySocketAccessToken } from './middleware/auth.middleware';
 import { ACCESS_TOKEN_COOKIE, parseCookieHeader } from './utils/auth-cookie.util';
-import type { JWTPayload } from './utils/jwt.util';
 import { getPostMetadata, getReactionSummaries, mapPollOptionsForResponse, normalizeReactionType } from './utils/post.util';
 import { canViewPost, canViewReel, canViewStory } from './utils/access-control.util';
 import { pushNotificationService } from './services/push-notification.service';
@@ -216,7 +215,10 @@ const io = new SocketIOServer(httpServer, {
     credentials: true,
     methods: ['GET', 'POST'],
   },
-  transports: ['websocket'],
+  // Prefer WebSocket for low latency, while retaining Engine.IO polling for
+  // networks/proxies that cannot complete a WebSocket upgrade.
+  transports: ['websocket', 'polling'],
+  allowUpgrades: true,
 });
 
 // Share Socket.IO instance with controllers via the sockets module
@@ -359,10 +361,6 @@ async function emitPresenceToAuthorizedRooms(
   for (const room of rooms) {
     socket.to(room).emit(eventName, payload);
   }
-}
-
-async function verifySocketAccessToken(token: string): Promise<JWTPayload> {
-  return verifyAccessToken(token);
 }
 
 function getSocketHandshakeToken(socket: any): string | null {
@@ -1057,7 +1055,9 @@ async function createReelCommentWithFanout(
 io.use(async (socket, next) => {
   const token = getSocketHandshakeToken(socket);
   if (!token) {
-    next();
+    const socketError = new Error('Socket authentication required');
+    (socketError as any).data = { code: 'unauthorized' };
+    next(socketError);
     return;
   }
 

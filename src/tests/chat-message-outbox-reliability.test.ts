@@ -73,6 +73,18 @@ test('socket chat send reuses shared service and has no inline push notification
   assert.doesNotMatch(handler, /prisma\.messages\.create|prisma\.conversations\.update/);
 });
 
+test('Socket.IO supports production fallback transport and requires authentication', () => {
+  const indexSource = source('src/index.ts');
+
+  assert.match(indexSource, /transports: \['websocket', 'polling'\]/);
+  assert.match(indexSource, /verifySocketAccessToken\(token\)/);
+  assert.match(indexSource, /Socket authentication required/);
+  assert.doesNotMatch(
+    between(indexSource, 'io.use(async (socket, next) => {', '// Socket.IO connection handling'),
+    /if \(!token\) \{\s*next\(\)/
+  );
+});
+
 test('REST chat send reuses shared service and does not invalidate cache inline', () => {
   const controller = source('src/controllers/chat.controller.ts');
   const handler = between(

@@ -63,6 +63,16 @@ Start Command: npm start
 Health Check Path: /api/health
 ```
 
+The production web app should keep REST same-origin (`NEXT_PUBLIC_API_URL=/api`)
+so browser auth cookies stay on `vormex.in`, while Socket.IO connects directly
+to the Render service. The web client obtains a short-lived socket ticket from
+`POST /api/auth/socket-ticket`; deploy this backend before deploying the matching
+web client.
+
+A single API instance can deliver realtime chat without Redis. Before scaling
+the API to multiple instances, configure `REDIS_URL` and enable API Redis mode so
+Socket.IO rooms and events are shared across instances.
+
 ### Database Pooling
 
 Production API, worker, and scheduler processes should connect to Postgres

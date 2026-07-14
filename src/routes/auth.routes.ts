@@ -18,6 +18,8 @@ import {
   verifyCsrfToken,
 } from '../utils/auth-cookie.util';
 import { getRefreshTokenSessionId } from '../services/auth-session.service';
+import { generateSocketTicket, getSocketTicketTtlSeconds } from '../utils/jwt.util';
+import type { AuthenticatedRequest } from '../types/auth.types';
 
 const router = Router();
 const authWriteLimit = createRateLimitMiddleware(() => [
@@ -111,6 +113,15 @@ const loginRateLimit = createRateLimitMiddleware((req) => {
     },
   ];
 });
+const socketTicketRateLimit = createRateLimitMiddleware((_req) => [
+  {
+    keyPrefix: 'rate:user:auth:socket-ticket',
+    limit: 60,
+    windowSeconds: 60,
+    code: 'socket_ticket_rate_limited',
+    message: 'Too many realtime connection attempts. Please wait a moment.',
+  },
+]);
 
 function requireRefreshCookieCsrf(req: Request, res: Response, next: NextFunction): void {
   if (req.body?.refreshToken) {
@@ -154,6 +165,29 @@ router.post('/login', loginRateLimit, login);
 router.post('/refresh', authWriteLimit, requireRefreshCookieCsrf, refreshSession);
 router.post('/logout', authWriteLimit, requireRefreshCookieCsrf, logout);
 router.post('/logout-all', authenticate, logoutAll);
+
+// A short-lived, purpose-bound credential lets the browser authenticate a
+// direct Render WebSocket while REST authentication remains on vormex.in/api.
+router.post(
+  '/socket-ticket',
+  authenticate,
+  socketTicketRateLimit,
+  (req: AuthenticatedRequest, res: Response): void => {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Authentication is required', code: 'unauthorized' });
+      return;
+    }
+
+    const ttlSeconds = getSocketTicketTtlSeconds();
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.json({
+      token: generateSocketTicket(userId, req.user?.sessionId),
+      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    });
+  }
+);
 
 // Get current user endpoint (protected)
 router.get('/me', authenticate, getCurrentUser);
