@@ -97,8 +97,22 @@ export function assertUsableAuthSecret(name: string, secret: string | undefined)
 export interface JWTPayload {
   userId: string | number; // Supports both String (UUID) and Number (legacy) IDs
   sessionId?: string;
+  purpose?: 'socket';
   iat?: number;
   exp?: number;
+}
+
+const DEFAULT_SOCKET_TICKET_TTL_SECONDS = 90;
+const MIN_SOCKET_TICKET_TTL_SECONDS = 15;
+const MAX_SOCKET_TICKET_TTL_SECONDS = 5 * 60;
+
+export function getSocketTicketTtlSeconds(): number {
+  const configured = Number(process.env.SOCKET_TICKET_TTL_SECONDS);
+  const seconds = Number.isFinite(configured)
+    ? Math.floor(configured)
+    : DEFAULT_SOCKET_TICKET_TTL_SECONDS;
+
+  return Math.min(MAX_SOCKET_TICKET_TTL_SECONDS, Math.max(MIN_SOCKET_TICKET_TTL_SECONDS, seconds));
 }
 
 /**
@@ -124,6 +138,24 @@ export function generateAccessToken(userId: string | number, sessionId?: string)
 
 export function generateToken(userId: string | number): string {
   return generateAccessToken(userId);
+}
+
+/**
+ * Issue a short-lived credential for a cross-origin Socket.IO handshake.
+ * The browser obtains this through the authenticated same-origin API proxy,
+ * so the long-lived HttpOnly access token never has to be exposed to JS.
+ */
+export function generateSocketTicket(userId: string | number, sessionId?: string): string {
+  const payload: JWTPayload = {
+    userId,
+    ...(sessionId ? { sessionId } : {}),
+    purpose: 'socket',
+  };
+
+  return jwt.sign(payload, getJwtSecret(), {
+    algorithm: 'HS256',
+    expiresIn: `${getSocketTicketTtlSeconds()}s`,
+  } as jwt.SignOptions);
 }
 
 /**

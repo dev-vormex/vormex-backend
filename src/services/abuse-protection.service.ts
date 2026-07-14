@@ -86,24 +86,36 @@ export function resolveGeneralApiRateLimitRules(req: AuthenticatedRequest): Rate
   const missingUserAgent = userAgent.trim().length === 0;
   const readHeavy = isReadHeavyApiPath(path);
   const writeRequest = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+  // Authenticated UI traffic fans out across feed, notifications, chat, and
+  // profile data. Keep anonymous limits conservative, but do not let one
+  // signed-in browser or a campus/mobile NAT exhaust the anonymous buckets.
+  const ipBurstLimit = userId
+    ? intEnv('RATE_LIMIT_AUTH_API_IP_PER_MINUTE', 1200)
+    : intEnv('RATE_LIMIT_API_IP_PER_MINUTE', 120);
+  const ipSustainedLimit = userId
+    ? intEnv('RATE_LIMIT_AUTH_API_IP_PER_HOUR', 20_000)
+    : intEnv('RATE_LIMIT_API_IP_PER_HOUR', 3000);
+  const fingerprintBurstLimit = userId
+    ? intEnv('RATE_LIMIT_AUTH_API_FINGERPRINT_PER_MINUTE', 600)
+    : intEnv('RATE_LIMIT_API_FINGERPRINT_PER_MINUTE', 90);
   const rules: RateLimitRule[] = [
     {
       keyPrefix: 'rate:ip:api:burst',
-      limit: intEnv('RATE_LIMIT_API_IP_PER_MINUTE', 120),
+      limit: ipBurstLimit,
       windowSeconds: MINUTE,
       code: 'api_rate_limited',
       message: 'Too many API requests. Please slow down and try again shortly.',
     },
     {
       keyPrefix: 'rate:ip:api:sustained',
-      limit: intEnv('RATE_LIMIT_API_IP_PER_HOUR', 3000),
+      limit: ipSustainedLimit,
       windowSeconds: HOUR,
       code: 'api_rate_limited',
       message: 'Too many API requests. Please try again later.',
     },
     {
       keyPrefix: 'rate:fingerprint:api:burst',
-      limit: intEnv('RATE_LIMIT_API_FINGERPRINT_PER_MINUTE', 90),
+      limit: fingerprintBurstLimit,
       windowSeconds: MINUTE,
       identifier: clientFingerprint,
       code: 'api_rate_limited',

@@ -99,6 +99,26 @@ async function assertUserCanAuthenticate(decoded: JWTPayload): Promise<void> {
 
 export async function verifyAccessToken(token: string): Promise<JWTPayload> {
   const decoded = verifyToken(token);
+  if (decoded.purpose) {
+    throw new Error('Invalid token purpose');
+  }
+  const sessionActive = await isTokenSessionActive(decoded);
+  if (!sessionActive) {
+    throw new Error('Session is no longer active');
+  }
+  await assertUserCanAuthenticate(decoded);
+  return decoded;
+}
+
+/**
+ * Socket handshakes accept normal bearer access tokens (native clients) and
+ * purpose-bound short-lived socket tickets (web clients behind /api proxy).
+ */
+export async function verifySocketAccessToken(token: string): Promise<JWTPayload> {
+  const decoded = verifyToken(token);
+  if (decoded.purpose && decoded.purpose !== 'socket') {
+    throw new Error('Invalid token purpose');
+  }
   const sessionActive = await isTokenSessionActive(decoded);
   if (!sessionActive) {
     throw new Error('Session is no longer active');

@@ -61,6 +61,21 @@ test('authenticated write API requests receive user write buckets', () => {
   assert.ok(rules.some((rule) => rule.keyPrefix === 'rate:user:api:sustained'));
 });
 
+test('authenticated UI traffic uses production-safe IP and fingerprint buckets', () => {
+  const rules = resolveGeneralApiRateLimitRules(
+    request({
+      headers: { 'user-agent': 'Mozilla/5.0', 'x-vormex-client': 'web' },
+      originalUrl: '/api/chat/conversations',
+      url: '/chat/conversations',
+      user: { userId: 'user-1', sessionId: 'session-1' },
+    })
+  );
+
+  assert.equal(rules.find((rule) => rule.keyPrefix === 'rate:ip:api:burst')?.limit, 1200);
+  assert.equal(rules.find((rule) => rule.keyPrefix === 'rate:ip:api:sustained')?.limit, 20_000);
+  assert.equal(rules.find((rule) => rule.keyPrefix === 'rate:fingerprint:api:burst')?.limit, 600);
+});
+
 test('payment actions use sensitive user and IP buckets', () => {
   const rules = resolveSensitiveActionRateLimitRules(
     request({
