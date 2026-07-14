@@ -295,7 +295,7 @@ export const createExperience = async (
     }
 
     const userId = String(req.user.userId);
-    const { title, company, type, location, startDate, endDate, isCurrent, description, skills } = req.body;
+    const { title, company, type, location, startDate, endDate, isCurrent, description, skills, logo } = req.body;
 
     // Validation
     if (!title || typeof title !== 'string' || title.trim().length < 2 || title.length > 100) {
@@ -333,6 +333,11 @@ export const createExperience = async (
       return;
     }
 
+    if (logo && (typeof logo !== 'string' || !validateUrl(logo))) {
+      res.status(400).json({ error: 'logo must be a valid URL' });
+      return;
+    }
+
     const experience = await prisma.experience.create({
       data: {
         userId,
@@ -345,6 +350,7 @@ export const createExperience = async (
         isCurrent: isCurrent || false,
         description: description?.trim() || null,
         skills: Array.isArray(skills) ? skills : [],
+        logo: logo || null,
       },
     });
 
@@ -442,6 +448,14 @@ export const updateExperience = async (
 
     if (req.body.location !== undefined) {
       updateData.location = req.body.location?.trim() || null;
+    }
+
+    if (req.body.logo !== undefined) {
+      if (req.body.logo && (typeof req.body.logo !== 'string' || !validateUrl(req.body.logo))) {
+        res.status(400).json({ error: 'logo must be a valid URL' });
+        return;
+      }
+      updateData.logo = req.body.logo || null;
     }
 
     // Validate date range
@@ -563,7 +577,7 @@ export const createEducation = async (
     }
 
     const userId = String(req.user.userId);
-    const { school, degree, fieldOfStudy, startDate, endDate, isCurrent, grade, activities, description } = req.body;
+    const { school, degree, fieldOfStudy, startDate, endDate, isCurrent, grade, activities, description, logo } = req.body;
 
     // Validation
     if (!school || typeof school !== 'string' || school.trim().length < 2 || school.length > 100) {
@@ -604,6 +618,11 @@ export const createEducation = async (
       return;
     }
 
+    if (logo && (typeof logo !== 'string' || !validateUrl(logo))) {
+      res.status(400).json({ error: 'logo must be a valid URL' });
+      return;
+    }
+
     const education = await prisma.education.create({
       data: {
         userId,
@@ -616,6 +635,7 @@ export const createEducation = async (
         grade: grade?.trim() || null,
         activities: activities?.trim() || null,
         description: description?.trim() || null,
+        logo: logo || null,
       },
     });
 
@@ -716,6 +736,14 @@ export const updateEducation = async (
         return;
       }
       updateData.description = req.body.description?.trim() || null;
+    }
+
+    if (req.body.logo !== undefined) {
+      if (req.body.logo && (typeof req.body.logo !== 'string' || !validateUrl(req.body.logo))) {
+        res.status(400).json({ error: 'logo must be a valid URL' });
+        return;
+      }
+      updateData.logo = req.body.logo || null;
     }
 
     // Validate date range

@@ -166,6 +166,17 @@ export const getProfileFeed = async (
       userId = userId.substring(1);
     }
 
+    // Android uses "me" for the signed-in user's profile. Without resolving it here,
+    // the initial embedded activity works but every filter request searches for a
+    // literal username named "me" and returns 404.
+    if (userId.toLowerCase() === 'me') {
+      if (!requestingUserId) {
+        res.status(401).json({ error: 'Authentication is required to load your activity' });
+        return;
+      }
+      userId = requestingUserId;
+    }
+
     // Validate filter
     const validFilters = ['all', 'posts', 'articles', 'forum', 'videos'];
     if (!validFilters.includes(filter)) {

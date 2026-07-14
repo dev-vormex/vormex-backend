@@ -5,6 +5,7 @@ import {
   createdAtDescKeysetWhere,
   decodeKeysetCursor,
   encodeKeysetCursor,
+  numberDescDateDescIdDescWhere,
 } from '../utils/keyset-pagination.util';
 
 async function withCursorSecret<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -57,6 +58,26 @@ test('createdAt keyset predicate pages older rows without overlap under inserts'
       OR: [
         { createdAt: { lt: new Date('2026-06-08T10:00:00.000Z') } },
         { createdAt: new Date('2026-06-08T10:00:00.000Z'), id: { lt: 'post-b' } },
+      ],
+    });
+  });
+});
+
+test('numeric duration cursor preserves stable descending tie-breakers', async () => {
+  await withCursorSecret(() => {
+    const encoded = encodeKeysetCursor({
+      scope: 'proximity-history:duration',
+      id: 'encounter-b',
+      n: 720,
+      t: '2026-07-13T10:00:00.000Z',
+    });
+    const decoded = decodeKeysetCursor(encoded, 'proximity-history:duration');
+    assert.equal(decoded?.n, 720);
+    assert.deepEqual(numberDescDateDescIdDescWhere(decoded, 'duration', 'lastSeenAt'), {
+      OR: [
+        { duration: { lt: 720 } },
+        { duration: 720, lastSeenAt: { lt: new Date('2026-07-13T10:00:00.000Z') } },
+        { duration: 720, lastSeenAt: new Date('2026-07-13T10:00:00.000Z'), id: { lt: 'encounter-b' } },
       ],
     });
   });

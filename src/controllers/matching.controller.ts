@@ -93,12 +93,11 @@ export const getSmartMatches = async (
       excludedIds: [...excludeIds, ...blockedUserIds],
     });
 
-    const candidateTake = Math.min(Math.max(skip + limit * 3, limit), 150);
     const [candidateUsers, total] = await Promise.all([
       prisma.user.findMany({
         where,
-        skip: 0,
-        take: candidateTake,
+        skip,
+        take: limit,
         orderBy: [{ lastActiveAt: 'desc' }, { id: 'asc' }],
         select: MATCHING_ENGINE_USER_SELECT,
       }),
@@ -109,7 +108,6 @@ export const getSmartMatches = async (
       candidateUsers.map((user) => user.id)
     );
     const matches = rankUserMatches(currentUser, candidateUsers, { visibilityByUser })
-      .slice(skip, skip + limit)
       .map((match) => ({
         user: serializeMatchedUser(match.candidate, visibilityByUser.get(match.candidate.id)),
         score: match.score,

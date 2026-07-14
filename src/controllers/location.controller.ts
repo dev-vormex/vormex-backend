@@ -4,6 +4,7 @@ import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prisma } from '../config/prisma';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { cacheService } from '../services/cache.service';
+import { removeUserProximityPresence } from '../services/proximity-privacy.service';
 import {
   CoarseLocationDTO,
   serializeCoarseLocation,
@@ -30,6 +31,8 @@ interface NearbyUsersResponse {
   locationRequired?: boolean;
   locationPermissionDenied?: boolean;
   total: number;
+  page?: number;
+  hasMore?: boolean;
   yourLocation?: CoarseLocationDTO | null;
 }
 
@@ -58,7 +61,9 @@ export const getNearbyUsers = async (
 
     const userId = String(req.user.userId);
     const radiusKm = Math.min(500, Math.max(1, parseInt(req.query.radius as string) || 50));
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 30));
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const offset = (page - 1) * limit;
 
     // Get current user's location
     const currentUser = await prisma.user.findUnique({
@@ -122,21 +127,26 @@ export const getNearbyUsers = async (
       ) ranked
       WHERE "distance" <= ${radiusKm}
       ORDER BY "distance" ASC, "lastActiveAt" DESC NULLS LAST, "id" ASC
-      LIMIT ${limit}
+      LIMIT ${limit + 1}
+      OFFSET ${offset}
     `);
 
-    const nearbyIds = nearbyDistanceRows.map((row) => row.id);
+    const hasMore = nearbyDistanceRows.length > limit;
+    const pageRows = nearbyDistanceRows.slice(0, limit);
+    const nearbyIds = pageRows.map((row) => row.id);
     if (nearbyIds.length === 0) {
       res.status(200).json({
         users: [],
         total: 0,
+        page,
+        hasMore: false,
         yourLocation: serializeCoarseLocation(currentUser),
       });
       return;
     }
 
     const distanceByUserId = new Map(
-      nearbyDistanceRows.map((row) => [row.id, Number(row.distance)])
+      pageRows.map((row) => [row.id, Number(row.distance)])
     );
 
     const usersInBox = await prisma.user.findMany({
@@ -190,7 +200,9 @@ export const getNearbyUsers = async (
 
     res.status(200).json({
       users: nearbyUsers,
-      total: nearbyUsers.length,
+      total: offset + nearbyUsers.length + (hasMore ? 1 : 0),
+      page,
+      hasMore,
       yourLocation: serializeCoarseLocation(currentUser),
     });
   } catch (error) {
@@ -303,6 +315,23 @@ export const updateLocationSettings = async (
         locationPermission: locationPermission ?? undefined,
       },
     });
+
+    if (locationPermission === false) {
+      const now = new Date();
+      await Promise.all([
+        prisma.proximity_sessions.updateMany({
+          where: { userId, status: 'active' },
+          data: { status: 'invalidated', endedAt: now, endReason: 'location_permission_disabled' },
+        }),
+        prisma.proximity_preferences.updateMany({
+          where: { userId },
+          data: { crossedPathsDiscoverable: false, publicForegroundPresenceEnabled: false },
+        }),
+      ]);
+    }
+    if (locationPermission === false || shareLocationPublic === false) {
+      await removeUserProximityPresence(userId);
+    }
 
     await cacheService.invalidateTags(`user:${userId}`, `people:user:${userId}`, `matching:user:${userId}`);
 

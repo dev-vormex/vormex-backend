@@ -153,12 +153,21 @@ export function createRateLimitMiddleware(
             limit: result.limit,
             retryAfterSeconds: result.retryAfterSeconds,
           });
-          res.status(429).json({
-            error: rule.message || 'Rate limit exceeded',
-            code: rule.code || 'rate_limited',
-            requestId,
-            retryAfterSeconds: result.retryAfterSeconds,
-          });
+          if (normalizedPath(req).startsWith('/api/proximity/v1')) {
+            res.status(429).json({ error: {
+              code: rule.code || 'PROXIMITY_RATE_LIMITED',
+              message: rule.message || 'Rate limit exceeded',
+              retryable: true,
+              retryAfterSeconds: result.retryAfterSeconds,
+            } });
+          } else {
+            res.status(429).json({
+              error: rule.message || 'Rate limit exceeded',
+              code: rule.code || 'rate_limited',
+              requestId,
+              retryAfterSeconds: result.retryAfterSeconds,
+            });
+          }
           return;
         }
       }

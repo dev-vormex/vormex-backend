@@ -160,11 +160,19 @@ export const authenticate = async (
 ): Promise<void> => {
   const requestId = getRequestId(req);
   const log = getRequestLogger(req);
+  const sendProximityAuthenticationError = (message: string): boolean => {
+    if (!req.baseUrl.startsWith('/api/proximity/v1')) return false;
+    (res as unknown as Response).status(401).json({
+      error: { code: 'AUTHENTICATION_EXPIRED', message, retryable: false },
+    });
+    return true;
+  };
 
   try {
     const tokenResult = getAccessTokenFromRequest(req);
 
     if (tokenResult.invalidAuthorizationHeader) {
+      if (sendProximityAuthenticationError('Authentication is invalid or expired')) return;
       res.status(401).json({
         error: 'Invalid token format. Use "Bearer <token>".',
         code: 'unauthorized',
@@ -174,6 +182,7 @@ export const authenticate = async (
     }
 
     if (!tokenResult.token) {
+      if (sendProximityAuthenticationError('Authentication is required')) return;
       res.status(401).json({
         error: 'No authentication token provided.',
         code: 'unauthorized',
@@ -207,6 +216,7 @@ export const authenticate = async (
       const errorMessage = error instanceof Error ? error.message : 'Token verification failed';
 
       if (errorMessage.includes('expired')) {
+        if (sendProximityAuthenticationError('Authentication has expired')) return;
         res.status(401).json({
           error: 'Token has expired. Please login again.',
           code: 'token_expired',
@@ -252,6 +262,7 @@ export const authenticate = async (
         return;
       }
 
+      if (sendProximityAuthenticationError('Authentication is invalid or expired')) return;
       res.status(401).json({
         error: 'Invalid or malformed token',
         code: 'unauthorized',

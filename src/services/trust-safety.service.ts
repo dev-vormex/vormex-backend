@@ -538,20 +538,21 @@ export async function createUserBlockWithDeviceScope(params: {
 }
 
 export async function findBlockBetween(userAId: string, userBId: string) {
-  const explicit = await prisma.user_blocks.findFirst({
-    where: {
-      OR: [
-        { blockerId: userAId, blockedId: userBId },
-        { blockerId: userBId, blockedId: userAId },
-      ],
-    },
-  });
-  if (explicit) return explicit;
-
-  const [userAInstallHashes, userBInstallHashes] = await Promise.all([
+  // All three lookups run concurrently: this check sits on the hot path of
+  // every message/interaction, and serial round-trips dominate its latency.
+  const [explicit, userAInstallHashes, userBInstallHashes] = await Promise.all([
+    prisma.user_blocks.findFirst({
+      where: {
+        OR: [
+          { blockerId: userAId, blockedId: userBId },
+          { blockerId: userBId, blockedId: userAId },
+        ],
+      },
+    }),
     getUserInstallHashes(userAId),
     getUserInstallHashes(userBId),
   ]);
+  if (explicit) return explicit;
   const scopedWhere: any[] = [];
   if (userBInstallHashes.length > 0) {
     scopedWhere.push({

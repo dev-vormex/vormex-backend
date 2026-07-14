@@ -64,6 +64,8 @@ tags:
     description: Image upload endpoints (expects pre-cropped images from frontend)
   - name: Health
     description: System health and status
+  - name: Crossed Paths
+    description: Privacy-safe Event Mode, foreground presence, live discovery, and seven-day encounter history
 
 components:
   securitySchemes:
@@ -88,6 +90,41 @@ components:
         code:
           type: string
           description: Error code (e.g., "TOKEN_EXPIRED", "NOT_CONNECTED")
+
+    ProximityErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+              enum: [PROXIMITY_PERMISSION_DISABLED, PROXIMITY_SESSION_EXPIRED, PROXIMITY_INVALID_COORDINATES, PROXIMITY_INACCURATE_LOCATION, PROXIMITY_STALE_SAMPLE, PROXIMITY_SEQUENCE_CONFLICT, PROXIMITY_OUT_OF_ORDER, PROXIMITY_RATE_LIMITED, PROXIMITY_SERVICE_DEGRADED, PROXIMITY_REDIS_UNAVAILABLE, AUTHENTICATION_EXPIRED, PROXIMITY_FEATURE_DISABLED]
+            message: { type: string }
+            retryable: { type: boolean }
+            retryAfterSeconds: { type: integer, minimum: 1 }
+
+    ProximitySample:
+      type: object
+      required: [sampleId, capturedAt, latitude, longitude, accuracyM]
+      additionalProperties: false
+      properties:
+        sampleId: { type: string, format: uuid }
+        capturedAt: { type: string, format: date-time }
+        latitude: { type: number, minimum: -90, maximum: 90, writeOnly: true }
+        longitude: { type: number, minimum: -180, maximum: 180, writeOnly: true }
+        accuracyM: { type: number, minimum: 0, maximum: 100 }
+        speedMps: { type: number, minimum: 0, maximum: 120 }
+        movement: { type: string }
+
+    ProximitySettings:
+      type: object
+      properties:
+        crossedPathsDiscoverable: { type: boolean }
+        publicForegroundPresenceEnabled: { type: boolean }
+        summaryNotificationsEnabled: { type: boolean }
 
     Success:
       type: object
@@ -565,6 +602,189 @@ components:
           nullable: true
 
 paths:
+  /proximity/v1/capabilities:
+    get:
+      tags: [Crossed Paths]
+      summary: Resolve authoritative Crossed Paths capabilities and independent kill switches
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: "Effective flags, cadence bounds, radii, map configuration, and degraded mode" }
+
+  /proximity/v1/settings:
+    get:
+      tags: [Crossed Paths]
+      summary: Get proximity consent and notification preferences
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Current settings }
+    put:
+      tags: [Crossed Paths]
+      summary: Update proximity preferences; disabling discoverability invalidates live state
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProximitySettings' }
+      responses:
+        '200': { description: Updated settings }
+        '400': { description: Invalid settings, content: { application/json: { schema: { $ref: '#/components/schemas/ProximityErrorEnvelope' } } } }
+
+  /proximity/v1/sessions:
+    post:
+      tags: [Crossed Paths]
+      summary: Start one idempotent, server-expiring Event Mode session
+      description: Exact coordinates are accepted only as ephemeral input and are never returned or durably stored.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: '#/components/schemas/ProximitySample' }
+                - type: object
+                  required: [clientStartId, radiusM]
+                  properties:
+                    clientStartId: { type: string, format: uuid }
+                    radiusM: { type: integer, enum: [200, 300, 500] }
+      responses:
+        '201': { description: "Authoritative session, generation, expiry, precision category, and heartbeat cadence" }
+        '403': { description: Consent or feature disabled, content: { application/json: { schema: { $ref: '#/components/schemas/ProximityErrorEnvelope' } } } }
+
+  /proximity/v1/sessions/current:
+    get:
+      tags: [Crossed Paths]
+      summary: Reconcile local state with the authoritative active or interrupted session
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Current session or null }
+
+  /proximity/v1/sessions/{sessionId}/resume:
+    post:
+      tags: [Crossed Paths]
+      summary: Explicitly resume an interrupted foreground session and rotate its generation
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Resumed session without extending its original expiry }
+        '410': { description: Session expired, content: { application/json: { schema: { $ref: '#/components/schemas/ProximityErrorEnvelope' } } } }
+
+  /proximity/v1/sessions/{sessionId}/heartbeat:
+    post:
+      tags: [Crossed Paths]
+      summary: Publish an idempotent Event Mode location sample
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: '#/components/schemas/ProximitySample' }
+                - type: object
+                  required: [sessionId, generation, sequence]
+                  properties:
+                    sessionId: { type: string, format: uuid }
+                    generation: { type: integer, minimum: 1 }
+                    sequence: { type: integer, minimum: 1 }
+      responses:
+        '200': { description: "Deterministic acceptance, duplicate state, count, cadence, expiry, and degraded/history-lag flags" }
+        '409': { description: Sequence conflict or out-of-order request, content: { application/json: { schema: { $ref: '#/components/schemas/ProximityErrorEnvelope' } } } }
+
+  /proximity/v1/sessions/{sessionId}/stop:
+    post:
+      tags: [Crossed Paths]
+      summary: Idempotently stop Event Mode and report private-summary state
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Final or already-stopped status }
+
+  /proximity/v1/presence:
+    post:
+      tags: [Crossed Paths]
+      summary: Publish opt-in public presence while the app is visibly foregrounded
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProximitySample' } } }
+      responses:
+        '200': { description: Acceptance and next foreground heartbeat cadence }
+
+  /proximity/v1/live:
+    get:
+      tags: [Crossed Paths]
+      summary: Get bounded privacy-displaced live markers and action-capable list rows
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: radiusM, in: query, schema: { type: integer, enum: [200, 300, 500] } }
+        - { name: viewport, in: query, description: "minLat,minLon,maxLat,maxLon; date-line crossing is supported", schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50 } }
+      responses:
+        '200': { description: At most 200 displaced markers and 50 list rows; exact coordinates are never returned }
+
+  /proximity/v1/history:
+    get:
+      tags: [Crossed Paths]
+      summary: Search stable keyset-paginated Today or seven-day encounter history
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: tab, in: query, schema: { type: string, enum: [today, seven_days] } }
+        - { name: sort, in: query, schema: { type: string, enum: [recent, duration] } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50 } }
+        - { name: query, in: query, schema: { type: string, maxLength: 80 } }
+        - { name: filters, in: query, description: Comma-separated relationship states, schema: { type: string, example: "none,connected" } }
+      responses:
+        '200': { description: Non-expired privacy-safe encounters and relationship capabilities }
+    delete:
+      tags: [Crossed Paths]
+      summary: Directionally remove all currently visible history for the owner
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Removed count }
+
+  /proximity/v1/history/{targetUserId}:
+    delete:
+      tags: [Crossed Paths]
+      summary: Directionally remove one encounter until a newer validated sighting
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: targetUserId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Removal result }
+
+  /proximity/v1/history/{targetUserId}/hidden:
+    put:
+      tags: [Crossed Paths]
+      summary: Persistently hide or unhide a target for this owner
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: targetUserId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [hidden], properties: { hidden: { type: boolean } } } } }
+      responses:
+        '200': { description: Updated directional state }
+
+  /proximity/v1/summaries/pending:
+    get:
+      tags: [Crossed Paths]
+      summary: Get server-retained private count-only summaries
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Pending summaries }
+
+  /proximity/v1/summaries/{sessionId}/viewed:
+    post:
+      tags: [Crossed Paths]
+      summary: Acknowledge a private summary
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Viewed acknowledgment }
+
   /health:
     get:
       tags:

@@ -66,3 +66,23 @@ export const dbConnectionGauge = new client.Gauge({
   labelNames: ['state'],
   registers: [register],
 });
+
+export const proximityHeartbeatDuration = new client.Histogram({
+  name: 'vormex_proximity_heartbeat_duration_ms', help: 'Crossed Paths heartbeat latency', labelNames: ['outcome'],
+  buckets: [25, 50, 100, 200, 300, 500, 1_000, 2_000], registers: [register],
+});
+export const proximityHeartbeatCounter = new client.Counter({
+  name: 'vormex_proximity_heartbeat_total', help: 'Crossed Paths heartbeat outcomes', labelNames: ['outcome', 'reason'], registers: [register],
+});
+export const proximityCandidateGauge = new client.Gauge({
+  name: 'vormex_proximity_candidate_count', help: 'Candidate count for the latest heartbeat per bounded state', labelNames: ['state'], registers: [register],
+});
+export const proximityAccumulatorGauge = new client.Gauge({
+  name: 'vormex_proximity_accumulator_backlog', help: 'Dirty proximity accumulator backlog', labelNames: ['partition'], registers: [register],
+});
+export const proximityDegradedCounter = new client.Counter({
+  name: 'vormex_proximity_degraded_total', help: 'Crossed Paths degraded-mode responses', labelNames: ['mode'], registers: [register],
+});
+export const proximitySummaryCounter = new client.Counter({
+  name: 'vormex_proximity_summary_total', help: 'Crossed Paths summary outcomes', labelNames: ['outcome'], registers: [register],
+});

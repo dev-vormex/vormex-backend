@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 
 export interface KeysetCursor {
   t?: string | null;
+  n?: number;
   id: string;
   scope?: string;
 }
@@ -42,16 +43,37 @@ export function decodeKeysetCursor(value: unknown, scope?: string): KeysetCursor
     const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
       v?: number;
       t?: string | null;
+      n?: unknown;
       id?: unknown;
       scope?: string;
     };
     if (decoded.v !== CURSOR_VERSION || typeof decoded.id !== 'string') return null;
     if (scope && decoded.scope !== scope) return null;
     if (decoded.t !== null && decoded.t !== undefined && typeof decoded.t !== 'string') return null;
-    return { t: decoded.t ?? null, id: decoded.id, scope: decoded.scope };
+    if (decoded.n !== undefined && (typeof decoded.n !== 'number' || !Number.isFinite(decoded.n))) return null;
+    const cursor: KeysetCursor = { t: decoded.t ?? null, id: decoded.id, scope: decoded.scope };
+    if (typeof decoded.n === 'number') cursor.n = decoded.n;
+    return cursor;
   } catch {
     return null;
   }
+}
+
+export function numberDescDateDescIdDescWhere(
+  cursor: KeysetCursor | null,
+  numberField: string,
+  dateField: string,
+): Record<string, unknown> | null {
+  if (!cursor?.t || cursor.n === undefined) return null;
+  const cursorDate = new Date(cursor.t);
+  if (Number.isNaN(cursorDate.getTime())) return null;
+  return {
+    OR: [
+      { [numberField]: { lt: cursor.n } },
+      { [numberField]: cursor.n, [dateField]: { lt: cursorDate } },
+      { [numberField]: cursor.n, [dateField]: cursorDate, id: { lt: cursor.id } },
+    ],
+  };
 }
 
 export function decodeLegacyDateCursor(value: unknown): Date | null {

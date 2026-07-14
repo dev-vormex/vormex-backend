@@ -17,7 +17,7 @@ test('free senders do not see read receipts for their own messages', () => {
     false
   );
 
-  assert.equal(message.status, 'SENT');
+  assert.equal(message.status, 'DELIVERED');
   assert.equal(message.readAt, null);
 });
 

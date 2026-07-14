@@ -27,6 +27,7 @@ import { cacheService } from '../services/cache.service';
 import { normalizeProfileThemeForStorage, serializeProfileTheme } from '../constants/profile-themes';
 import { deleteIdentityEvidence, readEncryptedIdentityEvidence } from '../services/identity-evidence.service';
 import { recordSafetyEvent, recomputeIdentityTrustLevel } from '../services/trust-safety.service';
+import { invalidateUserProximity } from '../services/proximity-privacy.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string; sessionId?: string };
@@ -1050,6 +1051,7 @@ export const banUser = async (req: AuthRequest, res: Response): Promise<void> =>
     });
     await invalidateAuthUserStatus(id);
     await revokeAllAuthSessions(id);
+    await invalidateUserProximity(id, 'admin_ban');
 
     res.json({ message: 'User banned successfully' });
   } catch (error) {
@@ -1125,6 +1127,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     await revokeAllAuthSessions(id);
+    await invalidateUserProximity(id, 'account_deleted');
     await prisma.user.delete({ where: { id } });
     await invalidateAuthUserStatus(id);
 
@@ -2352,6 +2355,7 @@ export const restrictUser = async (req: AuthRequest, res: Response): Promise<voi
       metadata: { until: restrictedUntil.toISOString() },
     });
     await invalidateAuthUserStatus(id);
+    await invalidateUserProximity(id, 'safety_restricted');
     res.json({ message: 'User restricted', restrictedUntil: restrictedUntil.toISOString() });
   } catch (error) {
     console.error('restrictUser error:', error);

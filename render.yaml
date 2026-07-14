@@ -1,8 +1,14 @@
+# NOTE: region must match the database region. The Neon Postgres instance is in
+# ap-southeast-1 (Singapore); running the API elsewhere adds ~150ms+ per query.
+# Render cannot change the region of an existing service — if these services
+# were created before this field existed, they must be recreated (or moved via
+# dashboard) for it to take effect.
 services:
   - type: web
     runtime: node
     name: vormex-backend
     plan: starter
+    region: singapore
     buildCommand: npm ci --include=dev && npm run build
     preDeployCommand: npm run migrate:deploy
     startCommand: npm start
@@ -12,12 +18,43 @@ services:
         value: production
       - key: AUTH_REQUIRE_SESSION_ID
         value: "true"
+      - key: PROXIMITY_REDIS_URL
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: PROXIMITY_MARKER_HMAC_SECRET
+        sync: false
+      - key: PAGINATION_CURSOR_SECRET
+        sync: false
+      - key: CROSSED_PATHS_ENTRY_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_EVENT_MODE_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_PUBLIC_PRESENCE_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_LIVE_MAP_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_LIVE_LIST_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_ACCUMULATION_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_SUMMARY_NOTIFICATIONS_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_PERSISTENCE_ENABLED
+        value: "false"
+      - key: PROXIMITY_ROLLOUT_PERCENT
+        value: "0"
   # These background processes must use the same secret env vars as the web service
   # (DATABASE_URL, REDIS_URL, Firebase creds, etc.) for re-engagement notifications to run.
   - type: worker
     runtime: node
     name: vormex-backend-worker
     plan: starter
+    region: singapore
     buildCommand: npm ci --include=dev && npm run build
     startCommand: npm run start:worker
     envVars:
@@ -33,6 +70,7 @@ services:
     runtime: node
     name: vormex-backend-scheduler
     plan: starter
+    region: singapore
     buildCommand: npm ci --include=dev && npm run build
     startCommand: npm run start:scheduler
     envVars:
@@ -42,3 +80,49 @@ services:
         value: "true"
       - key: OUTBOX_DISPATCH_INTERVAL_MS
         value: "5000"
+  - type: worker
+    runtime: node
+    name: vormex-proximity-worker
+    plan: starter
+    region: singapore
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start:proximity-worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: PROXIMITY_REDIS_URL
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: CROSSED_PATHS_ACCUMULATION_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_SUMMARY_NOTIFICATIONS_ENABLED
+        value: "false"
+      - key: CROSSED_PATHS_PERSISTENCE_ENABLED
+        value: "false"
+      - key: PROXIMITY_ACCUMULATION_CONCURRENCY
+        value: "8"
+      - key: PROXIMITY_PERSISTENCE_CONCURRENCY
+        value: "2"
+      - key: PROXIMITY_QUEUE_HIGH_WATER
+        value: "20000"
+      - key: PROXIMITY_PERSISTENCE_QUEUE_HIGH_WATER
+        value: "5000"
+  - type: worker
+    runtime: node
+    name: vormex-proximity-scheduler
+    plan: starter
+    region: singapore
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start:proximity-scheduler
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PROXIMITY_REDIS_URL
+        sync: false

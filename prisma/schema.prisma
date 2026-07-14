@@ -183,6 +183,11 @@ model User {
   safety_events_target                                     safety_events[]                        @relation("safety_events_target")
   managedAdCampaignsCreated                                ManagedAdCampaign[]                    @relation("managed_ad_campaigns_created_by")
   managedAdEvents                                          ManagedAdEvent[]                       @relation("managed_ad_events_user")
+  proximityPreference                                     proximity_preferences?
+  proximitySessions                                       proximity_sessions[]
+  proximityEncountersAsLower                              proximity_encounter_pairs[]            @relation("proximity_encounter_lower_user")
+  proximityEncountersAsHigher                             proximity_encounter_pairs[]            @relation("proximity_encounter_higher_user")
+  proximityEncounterStates                                proximity_encounter_user_state[]
 
   @@index([username])
   @@index([isAdmin])
@@ -448,6 +453,7 @@ model Experience {
   isCurrent   Boolean   @default(false)
   description String?
   skills      String[]
+  logo        String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -469,6 +475,7 @@ model Education {
   grade        String?
   activities   String?
   description  String?
+  logo         String?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1739,6 +1746,7 @@ model messages {
   status            String              @default("SENT")
   deliveredAt       DateTime?
   readAt            DateTime?
+  editedAt          DateTime?
   isDeleted         Boolean             @default(false)
   replyToId         String?
   createdAt         DateTime            @default(now())
@@ -2711,6 +2719,109 @@ model xp_transactions {
   @@index([currency])
   @@index([userId, createdAt])
   @@index([userId])
+}
+
+model proximity_preferences {
+  userId                          String   @id
+  crossedPathsDiscoverable       Boolean  @default(false)
+  publicForegroundPresenceEnabled Boolean @default(false)
+  summaryNotificationsEnabled    Boolean  @default(true)
+  consentVersion                 String?
+  consentedAt                    DateTime?
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+  user                           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("proximity_preferences")
+}
+
+model proximity_sessions {
+  id                String    @id @default(uuid())
+  userId            String
+  authSessionId     String?
+  deviceInstallHash String?
+  clientStartId     String
+  generation        Int       @default(1)
+  status            String    @default("active")
+  radiusM           Int
+  startedAt         DateTime  @default(now())
+  expiresAt         DateTime
+  lastHeartbeatAt   DateTime?
+  endedAt           DateTime?
+  endReason         String?
+  summaryStatus     String    @default("pending")
+  summaryCount      Int?
+  summaryReadyAt    DateTime?
+  summaryNotifiedAt DateTime?
+  summaryViewedAt   DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientStartId])
+  @@index([status, expiresAt])
+  @@index([userId, status, updatedAt])
+  @@map("proximity_sessions")
+}
+
+model proximity_encounter_pairs {
+  id                         String   @id @default(uuid())
+  lowerUserId                String
+  higherUserId               String
+  firstSeenAt                DateTime
+  lastSeenAt                 DateTime
+  accumulatedDurationSeconds Int      @default(0)
+  sampleCount                Int      @default(0)
+  minimumObservedDistanceM   Float
+  encounterCount             Int      @default(1)
+  areaLabel                  String?
+  expiresAt                  DateTime
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+  lowerUser                  User     @relation("proximity_encounter_lower_user", fields: [lowerUserId], references: [id], onDelete: Cascade)
+  higherUser                 User     @relation("proximity_encounter_higher_user", fields: [higherUserId], references: [id], onDelete: Cascade)
+  userStates                 proximity_encounter_user_state[]
+  flushReceipts              proximity_encounter_flush_receipts[]
+
+  @@unique([lowerUserId, higherUserId])
+  @@index([expiresAt])
+  @@index([lastSeenAt, id])
+  @@index([lowerUserId, lastSeenAt, id])
+  @@index([higherUserId, lastSeenAt, id])
+  @@index([lowerUserId, accumulatedDurationSeconds, lastSeenAt, id], map: "proximity_encounter_pairs_lower_duration_idx")
+  @@index([higherUserId, accumulatedDurationSeconds, lastSeenAt, id], map: "proximity_encounter_pairs_higher_duration_idx")
+  @@map("proximity_encounter_pairs")
+}
+
+model proximity_encounter_user_state {
+  encounterId  String
+  ownerUserId  String
+  hiddenAt     DateTime?
+  removedAt    DateTime?
+  savedAt      DateTime?
+  lastViewedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  encounter    proximity_encounter_pairs @relation(fields: [encounterId], references: [id], onDelete: Cascade)
+  owner        User     @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+
+  @@id([encounterId, ownerUserId])
+  @@index([ownerUserId, hiddenAt, removedAt])
+  @@index([ownerUserId, savedAt])
+  @@map("proximity_encounter_user_state")
+}
+
+model proximity_encounter_flush_receipts {
+  flushId     String   @id
+  encounterId String?
+  lowerUserId String
+  higherUserId String
+  processedAt DateTime @default(now())
+  encounter   proximity_encounter_pairs? @relation(fields: [encounterId], references: [id], onDelete: SetNull)
+
+  @@index([processedAt])
+  @@index([lowerUserId, higherUserId])
+  @@map("proximity_encounter_flush_receipts")
 }
 
 enum CodingCategory {
