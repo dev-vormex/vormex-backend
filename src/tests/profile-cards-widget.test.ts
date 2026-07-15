@@ -8,14 +8,14 @@ import {
 
 test('profile card widget uses the MCP Apps resource contract', () => {
   assert.equal(MCP_APP_MIME_TYPE, 'text/html;profile=mcp-app');
-  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v8.html');
+  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v9.html');
   assert.match(PROFILE_CARDS_HTML, /ui\/initialize/);
   assert.match(PROFILE_CARDS_HTML, /ui\/notifications\/tool-result/);
 });
 
 test('profile card widget renders profile fields without injecting raw HTML', () => {
   assert.match(PROFILE_CARDS_HTML, /document\.createElement\('img'\)/);
-  assert.match(PROFILE_CARDS_HTML, /image\.src = profile\.avatar/);
+  assert.match(PROFILE_CARDS_HTML, /image\.src = mediaUrl\(profile\.avatar\)/);
   assert.match(PROFILE_CARDS_HTML, /profile\.bannerImage/);
   assert.match(PROFILE_CARDS_HTML, /profile\.connectionsCount/);
   assert.doesNotMatch(PROFILE_CARDS_HTML, /Why this match/i);
@@ -31,4 +31,13 @@ test('profile card widget provides an accessible horizontal carousel', () => {
   assert.doesNotMatch(PROFILE_CARDS_HTML, /carousel-next/);
   assert.doesNotMatch(PROFILE_CARDS_HTML, /card-backdrop/);
   assert.match(PROFILE_CARDS_HTML, /profile card carousel/i);
+});
+
+test('profile cards open an in-widget draggable detail card', () => {
+  assert.match(PROFILE_CARDS_HTML, /<dialog id="profile-detail"/);
+  assert.match(PROFILE_CARDS_HTML, /openProfileDetail/);
+  assert.match(PROFILE_CARDS_HTML, /showModal/);
+  assert.match(PROFILE_CARDS_HTML, /setPointerCapture/);
+  assert.match(PROFILE_CARDS_HTML, /Drag to move/);
+  assert.match(PROFILE_CARDS_HTML, /Open full Vormex profile/);
 });
