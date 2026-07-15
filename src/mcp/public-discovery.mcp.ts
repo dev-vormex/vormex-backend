@@ -41,7 +41,7 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '2.1.0' },
+    { name: 'vormex-public-discovery', version: '2.5.0' },
     {
       instructions:
         'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. Use search_public_vormex for broad topical requests. Use a focused tool when the user specifically asks for people, posts, opportunities, or one record. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
@@ -71,10 +71,11 @@ function createPublicDiscoveryMcpServer(): McpServer {
                 'https://api.dicebear.com',
                 'https://lh3.googleusercontent.com',
                 'https://vormex.b-cdn.net',
+                'https://www.vormex.in',
               ],
             },
           },
-          'openai/widgetDescription': 'Shows Vormex members as public profile cards with profile pictures, skills, match evidence, and profile links.',
+          'openai/widgetDescription': 'Shows eligible public Vormex member profiles with cover images, profile pictures, bios, skills, interests, connection totals, and profile links.',
           'openai/widgetPrefersBorder': true,
           'openai/widgetCSP': {
             connect_domains: [],
@@ -82,6 +83,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
               'https://api.dicebear.com',
               'https://lh3.googleusercontent.com',
               'https://vormex.b-cdn.net',
+              'https://www.vormex.in',
             ],
           },
           'openai/widgetDomain': 'https://www.vormex.in',

@@ -108,12 +108,14 @@ function hasMagic(buffer: Buffer, mimeType: string): boolean {
   return false;
 }
 
-function fileNameIsSafe(fileName: string): boolean {
-  const base = (fileName || '').split(/[\\/]/).pop() || '';
+export function fileNameIsSafe(fileName: string): boolean {
+  const raw = fileName || '';
+  if (raw.includes('/') || raw.includes('\\')) return false;
+  const base = raw;
   return base.length > 0
     && base.length <= 180
     && !base.includes('..')
-    && /^[a-zA-Z0-9._ ()@-]+$/.test(base);
+    && /^[a-zA-Z0-9._ (),@-]+$/.test(base);
 }
 
 function validateFile(file: Express.Multer.File, rule: UploadFieldRule): string | null {

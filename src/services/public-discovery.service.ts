@@ -33,6 +33,7 @@ export interface PublicPersonResult {
 
 export interface PublicProfileResult extends Omit<PublicPersonResult, 'matchScore' | 'matchScoreBand' | 'matchReasons'> {
   bannerImage: string | null;
+  connectionsCount: number;
   college: string | null;
   branch: string | null;
   degree: string | null;
@@ -371,7 +372,16 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
         orderBy: { createdAt: 'desc' }, take: 20,
         select: { id: true, content: true, likesCount: true, commentsCount: true, sharesCount: true, createdAt: true },
       },
-      _count: { select: { experiences: true, educationHistory: true, projects: true, certificates: true, achievements: true, posts: { where: { visibility: 'public', isActive: true, type: 'text', content: { not: '' } } } } },
+      _count: { select: {
+        experiences: true,
+        educationHistory: true,
+        projects: true,
+        certificates: true,
+        achievements: true,
+        posts: { where: { visibility: 'public', isActive: true, type: 'text', content: { not: '' } } },
+        connections_connections_requesterIdTousers: { where: { status: 'accepted' } },
+        connections_connections_addresseeIdTousers: { where: { status: 'accepted' } },
+      } },
     },
   });
   if (!user || !isPublicUserEligible(user, channel)) return null;
@@ -384,6 +394,8 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
     profileUrl: `${WEB_BASE_URL}/people/${encodeURIComponent(user.username)}`, verified: user.isVerified,
     openToOpportunities: user.isOpenToOpportunities,
     bannerImage: user.bannerImageUrl,
+    connectionsCount: user._count.connections_connections_requesterIdTousers
+      + user._count.connections_connections_addresseeIdTousers,
     college: user.college,
     branch: user.branch,
     degree: user.degree,

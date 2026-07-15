@@ -169,10 +169,11 @@ export function publicDiscoveryOpenApi(_req: AuthenticatedRequest, res: Response
   };
   const profileSchema = {
     type: 'object', additionalProperties: false,
-    required: [...personSchema.required, 'experiences', 'education', 'projects', 'certificates', 'achievements', 'publicTextPosts', 'sectionCounts'],
+    required: [...personSchema.required, 'connectionsCount', 'experiences', 'education', 'projects', 'certificates', 'achievements', 'publicTextPosts', 'sectionCounts'],
     properties: {
       ...personSchema.properties,
       bannerImage: { type: ['string', 'null'] }, college: { type: ['string', 'null'] }, branch: { type: ['string', 'null'] },
+      connectionsCount: { type: 'integer', minimum: 0 },
       degree: { type: ['string', 'null'] }, graduationYear: { type: ['integer', 'null'] },
       portfolioUrl: { type: ['string', 'null'] }, linkedinUrl: { type: ['string', 'null'] }, githubProfileUrl: { type: ['string', 'null'] },
       otherSocialUrls: {},
