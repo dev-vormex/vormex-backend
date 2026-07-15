@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   isPublicUserEligible,
+  filterPublicProjectsForDiscovery,
   normalizeDiscoveryList,
   normalizeDiscoveryText,
   tokenizeDiscoveryIntent,
@@ -47,4 +48,13 @@ test('public post discovery expands broad hackathon and coding requests', () => 
   const codingTokens = tokenizePublicPostQuery('I want coding posts');
   assert.ok(codingTokens.includes('programming'));
   assert.ok(codingTokens.includes('developer'));
+});
+
+test('public discovery removes corrupted and exact duplicate projects', () => {
+  const projects = filterPublicProjectsForDiscovery([
+    { name: 'CreatorCircle', description: 'A collaboration platform for creators.', projectUrl: 'https://example.com/creator-circle' },
+    { name: 'CreatorCircle', description: 'A collaboration platform for creators.', projectUrl: 'https://example.com/creator-circle' },
+    { name: 'Vormex', description: "Explore Sanjay Baba's board '8k wallpaper' on Pinterest. See more ideas about studio background images.", projectUrl: 'https://pinterest.com/example' },
+  ]);
+  assert.deepEqual(projects.map((project) => project.name), ['CreatorCircle']);
 });

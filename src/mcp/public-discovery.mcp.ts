@@ -41,10 +41,10 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '2.6.0' },
+    { name: 'vormex-public-discovery', version: '2.7.0' },
     {
       instructions:
-        'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. Use search_public_vormex for broad topical requests. Use a focused tool when the user specifically asks for people, posts, opportunities, or one record. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
+        'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. For every request to find, show, suggest, recommend, or compare people, members, mentors, learners, or collaborators, always call find_public_people_for_goal directly with a limit from 3 to 10; do not use search_public_vormex and do not fetch every returned profile again. The people tool already returns full eligible profiles and a visual card carousel, so keep the written response brief instead of restating every card. Use search_public_vormex only for broad content requests that are not specifically asking for people. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
     }
   );
 
@@ -97,7 +97,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
     {
       title: 'Search all public Vormex content',
       description:
-        'Search across eligible public Vormex members, text posts, jobs, learning resources, groups, events, and hackathons for a topic or goal. Use this first for broad requests such as hackathons, coding communities, projects, mentors, or what Vormex has about a subject.',
+        'Search across eligible public Vormex text posts, jobs, learning resources, groups, events, and hackathons for a broad topic. Do not use this tool when the user asks to find, show, suggest, recommend, or compare people, members, mentors, learners, or collaborators; use find_public_people_for_goal for those requests.',
       inputSchema: {
         query: z.string().min(2).max(240).describe('The topic, question, skill, goal, event, or opportunity to find on Vormex'),
         sources: z.array(z.enum(['people', 'posts', 'job', 'learning', 'group', 'event', 'hackathon'])).max(7).optional(),
@@ -126,27 +126,28 @@ function createPublicDiscoveryMcpServer(): McpServer {
     {
       title: 'Find public Vormex people for a goal',
       description:
-        'Find public Vormex members relevant to a learning, mentoring, project, startup, skill, or collaboration goal. Use when a user wants people to learn from or build with.',
+        'Required tool for any request to find, show, suggest, recommend, or compare Vormex people, members, mentors, learners, teammates, or collaborators. Returns 3 to 10 full eligible public profiles in a visual card carousel. Do not call get_public_vormex_profile for every result because this tool already returns the complete card data.',
       inputSchema: {
         goal: z.string().min(2).max(240).describe('What the user wants to learn, build, teach, or collaborate on'),
         skills: z.array(z.string().min(1).max(48)).max(10).optional(),
         interests: z.array(z.string().min(1).max(48)).max(10).optional(),
         location: z.string().max(80).optional().describe('Optional city, state, country, or college'),
-        limit: z.number().int().min(1).max(10).optional(),
+        limit: z.number().int().min(3).max(10).optional().describe('Number of people cards to show; defaults to 5 and must be from 3 to 10'),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
       _meta: profileCardsToolMeta,
     },
     async (input) => {
-      const people = await searchPublicPeople(input);
+      const requestedLimit = Math.min(10, Math.max(3, Number(input.limit) || 5));
+      const people = await searchPublicPeople({ ...input, limit: requestedLimit });
       const profiles = (await Promise.all(people.map((person) => getPublicProfile(person.username, 'ai'))))
         .filter((profile) => profile !== null);
       return {
-        structuredContent: { people, profiles, count: people.length, goal: input.goal },
+        structuredContent: { people, profiles, count: profiles.length, goal: input.goal, display: 'profile-card-carousel' },
         content: [{
           type: 'text' as const,
           text: people.length
-            ? `Found ${people.length} public Vormex ${people.length === 1 ? 'member' : 'members'} relevant to "${input.goal}".`
+            ? `Showing ${profiles.length} public Vormex ${profiles.length === 1 ? 'member' : 'members'} relevant to "${input.goal}" in the profile card carousel.`
             : `No eligible public Vormex profiles matched "${input.goal}" yet.`,
         }],
       };

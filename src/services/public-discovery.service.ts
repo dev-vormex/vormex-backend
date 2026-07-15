@@ -99,6 +99,22 @@ export function normalizeDiscoveryList(value: unknown): string[] {
     .slice(0, MAX_LIST_VALUES);
 }
 
+const CORRUPTED_PUBLIC_PROJECT_PATTERN = /(?:pinterest|explore\s+.+?\s+board|wallpaper|see more ideas about|photoshop digital background)/i;
+
+export function filterPublicProjectsForDiscovery<T extends { name: string; description: string; projectUrl: string | null }>(projects: T[]): T[] {
+  const seen = new Set<string>();
+  return projects.filter((project) => {
+    const title = normalizeDiscoveryText(project.name, 160);
+    const description = normalizeDiscoveryText(project.description, 2_000);
+    const url = normalizeDiscoveryText(project.projectUrl, 500);
+    if (!title || CORRUPTED_PUBLIC_PROJECT_PATTERN.test(`${description} ${url}`)) return false;
+    const key = `${title.toLowerCase()}|${description.toLowerCase()}|${url.toLowerCase()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 const INTENT_SYNONYMS: Record<string, string[]> = {
   code: ['coding', 'programming', 'developer', 'software'],
   coding: ['code', 'programming', 'developer', 'software'],
@@ -385,6 +401,7 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
     },
   });
   if (!user || !isPublicUserEligible(user, channel)) return null;
+  const publicProjects = filterPublicProjectsForDiscovery(user.projects);
   const location = user.shareLocationPublic === true
     ? [user.currentCity, user.currentState, user.currentCountry].map((part) => normalizeDiscoveryText(part, 80)).filter(Boolean).filter((part, index, all) => all.indexOf(part) === index).join(', ') || null
     : null;
@@ -410,7 +427,7 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
     education: user.educationHistory.map((entry) => ({ school: entry.school, degree: entry.degree, fieldOfStudy: entry.fieldOfStudy,
       startDate: entry.startDate.toISOString(), endDate: entry.endDate?.toISOString() || null, current: entry.isCurrent,
       grade: entry.grade, activities: entry.activities, description: entry.description, logo: entry.logo })),
-    projects: user.projects.map((entry) => ({ id: entry.id, title: entry.name, description: entry.description,
+    projects: publicProjects.map((entry) => ({ id: entry.id, title: entry.name, description: entry.description,
       url: entry.projectUrl, role: entry.role,
       techStack: entry.techStack, startDate: entry.startDate.toISOString(), endDate: entry.endDate?.toISOString() || null,
       current: entry.isCurrent, projectUrl: entry.projectUrl, githubUrl: entry.githubUrl, otherLinks: entry.otherLinks,
@@ -424,9 +441,9 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
       url: `${WEB_BASE_URL}/post/${post.id}`, likesCount: post.likesCount, commentsCount: post.commentsCount,
       sharesCount: post.sharesCount, createdAt: post.createdAt.toISOString() })),
     sectionCounts: { experiences: user._count.experiences, education: user._count.educationHistory,
-      projects: user._count.projects, certificates: user._count.certificates, achievements: user._count.achievements,
+      projects: publicProjects.length, certificates: user._count.certificates, achievements: user._count.achievements,
       publicTextPosts: user._count.posts },
-    indexable: user.webDiscoveryEnabled && Boolean(user.headline || user.bio || user.interests.length || user.skills.length || user.projects.length),
+    indexable: user.webDiscoveryEnabled && Boolean(user.headline || user.bio || user.interests.length || user.skills.length || publicProjects.length),
     updatedAt: user.updatedAt.toISOString(),
   };
 }
