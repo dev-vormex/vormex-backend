@@ -14,11 +14,22 @@ import {
   searchAllPublicVormex,
   searchPublicPosts,
 } from '../services/public-content-discovery.service';
+import {
+  MCP_APP_MIME_TYPE,
+  PROFILE_CARDS_HTML,
+  PROFILE_CARDS_RESOURCE_URI,
+} from './profile-cards.widget';
 
 const MCP_PATH = '/mcp';
 const mcpRateLimit = createRateLimitMiddleware(() => [
   { keyPrefix: 'mcp:search:ip', limit: 60, windowSeconds: 60, code: 'MCP_RATE_LIMITED' },
 ]);
+const profileCardsToolMeta = {
+  ui: { resourceUri: PROFILE_CARDS_RESOURCE_URI },
+  'openai/outputTemplate': PROFILE_CARDS_RESOURCE_URI,
+  'openai/toolInvocation/invoking': 'Finding public Vormex profiles',
+  'openai/toolInvocation/invoked': 'Vormex profiles ready',
+};
 
 export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -30,11 +41,53 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '2.0.0' },
+    { name: 'vormex-public-discovery', version: '2.1.0' },
     {
       instructions:
         'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. Use search_public_vormex for broad topical requests. Use a focused tool when the user specifically asks for people, posts, opportunities, or one record. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
     }
+  );
+
+  server.registerResource(
+    'vormex-profile-cards',
+    PROFILE_CARDS_RESOURCE_URI,
+    {
+      title: 'Vormex public profile cards',
+      description: 'Visual cards for eligible public Vormex member results.',
+      mimeType: MCP_APP_MIME_TYPE,
+    },
+    async () => ({
+      contents: [{
+        uri: PROFILE_CARDS_RESOURCE_URI,
+        mimeType: MCP_APP_MIME_TYPE,
+        text: PROFILE_CARDS_HTML,
+        _meta: {
+          ui: {
+            prefersBorder: true,
+            domain: 'https://www.vormex.in',
+            csp: {
+              connectDomains: [],
+              resourceDomains: [
+                'https://api.dicebear.com',
+                'https://lh3.googleusercontent.com',
+                'https://vormex.b-cdn.net',
+              ],
+            },
+          },
+          'openai/widgetDescription': 'Shows Vormex members as public profile cards with profile pictures, skills, match evidence, and profile links.',
+          'openai/widgetPrefersBorder': true,
+          'openai/widgetCSP': {
+            connect_domains: [],
+            resource_domains: [
+              'https://api.dicebear.com',
+              'https://lh3.googleusercontent.com',
+              'https://vormex.b-cdn.net',
+            ],
+          },
+          'openai/widgetDomain': 'https://www.vormex.in',
+        },
+      }],
+    })
   );
 
   server.registerTool(
@@ -80,11 +133,14 @@ function createPublicDiscoveryMcpServer(): McpServer {
         limit: z.number().int().min(1).max(10).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      _meta: profileCardsToolMeta,
     },
     async (input) => {
       const people = await searchPublicPeople(input);
+      const profiles = (await Promise.all(people.map((person) => getPublicProfile(person.username, 'ai'))))
+        .filter((profile) => profile !== null);
       return {
-        structuredContent: { people, count: people.length, goal: input.goal },
+        structuredContent: { people, profiles, count: people.length, goal: input.goal },
         content: [{
           type: 'text' as const,
           text: people.length
@@ -102,6 +158,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
       description: 'Get an eligible member\'s comprehensive public Vormex profile: identity, headline, bio, skills, interests, coarse public location, education, experience, projects, certificates, achievements, and recent public text posts. It never returns chats, contact details, precise location, or private data.',
       inputSchema: { username: z.string().min(1).max(40).describe('Vormex username, with or without @') },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      _meta: profileCardsToolMeta,
     },
     async ({ username }) => {
       const profile = await getPublicProfile(username, 'ai');

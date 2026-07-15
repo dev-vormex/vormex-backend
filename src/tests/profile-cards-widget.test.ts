@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  MCP_APP_MIME_TYPE,
+  PROFILE_CARDS_HTML,
+  PROFILE_CARDS_RESOURCE_URI,
+} from '../mcp/profile-cards.widget';
+
+test('profile card widget uses the MCP Apps resource contract', () => {
+  assert.equal(MCP_APP_MIME_TYPE, 'text/html;profile=mcp-app');
+  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v1.html');
+  assert.match(PROFILE_CARDS_HTML, /ui\/initialize/);
+  assert.match(PROFILE_CARDS_HTML, /ui\/notifications\/tool-result/);
+});
+
+test('profile card widget renders profile fields without injecting raw HTML', () => {
+  assert.match(PROFILE_CARDS_HTML, /document\.createElement\('img'\)/);
+  assert.match(PROFILE_CARDS_HTML, /image\.src = profile\.avatar/);
+  assert.match(PROFILE_CARDS_HTML, /textContent = value/);
+  assert.doesNotMatch(PROFILE_CARDS_HTML, /innerHTML/);
+  assert.doesNotMatch(PROFILE_CARDS_HTML, /document\.write/);
+});
