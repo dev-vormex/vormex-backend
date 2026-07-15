@@ -6,6 +6,7 @@ import { queueMatchAvailabilityNotifications } from '../services/match-availabil
 import { getProfileProjectLimitState } from '../services/tier-limits.service';
 import { cacheService } from '../services/cache.service';
 import { ensureString } from '../utils/request.util';
+import { reindexPublicProfile } from '../services/public-discovery.service';
 
 /**
  * Validation helpers
@@ -112,6 +113,7 @@ export const addSkill = async (
     if (!existingUserSkill) {
       queueMatchAvailabilityNotifications(userId, 'skill_add');
     }
+    void reindexPublicProfile(userId).catch(() => undefined);
 
     res.status(201).json(userSkill);
   } catch (error) {
@@ -215,6 +217,7 @@ export const deleteSkill = async (
     await prisma.userSkill.delete({
       where: { id },
     });
+    void reindexPublicProfile(userId).catch(() => undefined);
 
     res.status(200).json({ message: 'Skill removed successfully' });
   } catch (error) {
