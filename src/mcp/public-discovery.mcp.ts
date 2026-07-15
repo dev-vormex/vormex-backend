@@ -31,6 +31,16 @@ const profileCardsToolMeta = {
   'openai/toolInvocation/invoked': 'Vormex profiles ready',
 };
 
+async function resolvePublicProfile(identifier: string) {
+  const direct = await getPublicProfile(identifier, 'ai');
+  if (direct) return direct;
+  const normalized = identifier.replace(/^@/, '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (!normalized) return null;
+  const candidates = await searchPublicPeople({ goal: identifier, limit: 10 });
+  const exact = candidates.find((candidate) => candidate.username.toLowerCase() === normalized || candidate.name.trim().replace(/\s+/g, ' ').toLowerCase() === normalized);
+  return exact ? getPublicProfile(exact.username, 'ai') : null;
+}
+
 export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS');
@@ -41,10 +51,10 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '2.9.0' },
+    { name: 'vormex-public-discovery', version: '3.0.0' },
     {
       instructions:
-        'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. For every request to find, show, suggest, recommend, or compare people, members, mentors, learners, or collaborators, always call find_public_people_for_goal directly with a limit from 3 to 10; do not use search_public_vormex and do not fetch every returned profile again. The people tool already returns full eligible profiles and a visual card carousel, so keep the written response brief instead of restating every card. Use search_public_vormex only for broad content requests that are not specifically asking for people. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
+        'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. When the user names one particular person or username and asks for that profile, always call get_public_vormex_profile and return exactly that one profile card. For recommendations or discovery of multiple people, call find_public_people_for_goal and respect an explicitly requested count from 1 to 10; use 5 only when no count is requested. Do not fetch every recommendation again because the people tool already returns full eligible profiles and a card carousel. Keep written responses brief instead of restating every card. Use search_public_vormex only for broad content requests that are not specifically asking for people. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields.',
     }
   );
 
@@ -128,19 +138,19 @@ function createPublicDiscoveryMcpServer(): McpServer {
     {
       title: 'Find public Vormex people for a goal',
       description:
-        'Required tool for any request to find, show, suggest, recommend, or compare Vormex people, members, mentors, learners, teammates, or collaborators. Returns 3 to 10 full eligible public profiles in a visual card carousel. Do not call get_public_vormex_profile for every result because this tool already returns the complete card data.',
+        'Use for recommendations or discovery of multiple Vormex people, members, mentors, learners, teammates, or collaborators. Respect the number requested by the user from 1 to 10, defaulting to 5 only when no count is stated. For one specifically named person or username, use get_public_vormex_profile instead. Returns complete eligible public profile cards, so do not fetch every result again.',
       inputSchema: {
         goal: z.string().min(2).max(240).describe('What the user wants to learn, build, teach, or collaborate on'),
         skills: z.array(z.string().min(1).max(48)).max(10).optional(),
         interests: z.array(z.string().min(1).max(48)).max(10).optional(),
         location: z.string().max(80).optional().describe('Optional city, state, country, or college'),
-        limit: z.number().int().min(3).max(10).optional().describe('Number of people cards to show; defaults to 5 and must be from 3 to 10'),
+        limit: z.number().int().min(1).max(10).optional().describe('Number of people cards requested by the user; defaults to 5 when unspecified'),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
       _meta: profileCardsToolMeta,
     },
     async (input) => {
-      const requestedLimit = Math.min(10, Math.max(3, Number(input.limit) || 5));
+      const requestedLimit = Math.min(10, Math.max(1, Number(input.limit) || 5));
       const people = await searchPublicPeople({ ...input, limit: requestedLimit });
       const profiles = (await Promise.all(people.map((person) => getPublicProfile(person.username, 'ai'))))
         .filter((profile) => profile !== null);
@@ -160,13 +170,13 @@ function createPublicDiscoveryMcpServer(): McpServer {
     'get_public_vormex_profile',
     {
       title: 'Get a public Vormex profile',
-      description: 'Get an eligible member\'s comprehensive public Vormex profile: identity, headline, bio, skills, interests, coarse public location, education, experience, projects, certificates, achievements, and recent public text posts. It never returns chats, contact details, precise location, or private data.',
-      inputSchema: { username: z.string().min(1).max(40).describe('Vormex username, with or without @') },
+      description: 'Use whenever the user asks for one specifically named Vormex person or username. Resolves an exact public display name or username and returns exactly one comprehensive eligible profile card. It never returns chats, contact details, precise location, or private data.',
+      inputSchema: { username: z.string().min(1).max(80).describe('Exact Vormex username, with or without @, or exact public display name') },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
       _meta: profileCardsToolMeta,
     },
     async ({ username }) => {
-      const profile = await getPublicProfile(username, 'ai');
+      const profile = await resolvePublicProfile(username);
       return {
         structuredContent: { profile },
         content: [{ type: 'text' as const, text: profile ? `Public Vormex profile for @${profile.username}.` : 'That profile is not available for public AI discovery.' }],

@@ -1,4 +1,4 @@
-export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v9.html';
+export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v10.html';
 export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
 
 export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
@@ -25,7 +25,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     @keyframes card-glow { to { --glow-angle: 360deg; } }
     @keyframes border-horizontal { to { transform: translateX(500%); } }
     @keyframes border-vertical { to { transform: translateY(500%); } }
-    .card { min-width: 0; overflow: hidden; display: flex; flex-direction: column; background: #fff; cursor: pointer; }
+    .card { min-width: 0; overflow: hidden; display: flex; flex-direction: column; background: #fff; }
     .cover { position: relative; height: 92px; flex: 0 0 92px; overflow: hidden; background: #e8edf5; }
     .cover-image { width: 100%; height: 100%; object-fit: cover; display: block; }
     .vormex-logo { position: absolute; top: 12px; right: 16px; width: 40px; height: 40px; object-fit: contain; }
@@ -56,24 +56,6 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     .open-avatar { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
     .open-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .empty { flex: 1 0 100%; padding: 18px; border: 1px dashed #cbd5e1; border-radius: 16px; color: #64748b; text-align: center; }
-    .profile-dialog { position: fixed; inset: 0; width: min(540px, calc(100vw - 24px)); max-width: none; max-height: calc(100vh - 24px); margin: auto; padding: 0; overflow: visible; border: 0; background: transparent; color: inherit; }
-    .profile-dialog::backdrop { background: rgba(15,23,42,.48); backdrop-filter: blur(3px); }
-    .detail-card { max-height: calc(100vh - 24px); overflow: auto; border: 1px solid #cbd5e1; background: #fff; box-shadow: 0 28px 80px rgba(15,23,42,.28); }
-    .detail-drag-handle { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; background: rgba(255,255,255,.96); cursor: move; touch-action: none; user-select: none; }
-    .detail-drag-label { color: #64748b; font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
-    .detail-close { width: 30px; height: 30px; border: 0; border-radius: 50%; background: #f1f5f9; color: #0f172a; font-size: 20px; line-height: 1; cursor: pointer; }
-    .detail-cover { position: relative; height: 118px; overflow: hidden; background: #e8edf5; }
-    .detail-cover img { width: 100%; height: 100%; display: block; object-fit: cover; }
-    .detail-body { position: relative; padding: 0 20px 20px; }
-    .detail-avatar { position: relative; width: 82px; height: 82px; margin-top: -41px; overflow: hidden; display: grid; place-items: center; border: 4px solid #fff; border-radius: 50%; background: linear-gradient(135deg,#6d28d9,#2563eb); color: #fff; font-size: 24px; font-weight: 800; box-shadow: 0 6px 18px rgba(15,23,42,.18); }
-    .detail-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-    .detail-title-row { display: flex; align-items: center; gap: 7px; margin-top: 14px; }
-    .detail-title { margin: 0; color: #0f172a; font-size: 23px; line-height: 1.2; font-weight: 850; }
-    .detail-text { margin: 10px 0 0; color: #475569; font-size: 13px; line-height: 1.6; }
-    .detail-tags { display: flex; flex-wrap: wrap; gap: 7px 13px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #eef2f7; }
-    .detail-tag { color: #334155; font-size: 12px; font-weight: 700; }
-    .detail-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 16px; color: #64748b; font-size: 12px; }
-    .detail-link { display: inline-flex; align-items: center; margin-top: 18px; padding: 9px 13px; background: #111827; color: #fff; font-size: 12px; font-weight: 750; text-decoration: none; }
     @media (prefers-color-scheme: dark) {
       body { color: #e2e8f0; }
       .glow-card { background: #334155; box-shadow: none; }
@@ -85,15 +67,6 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       .marquee { color: #cbd5e1; }
       .footer { border-color: #273449; }
       .open { background: #f8fafc; color: #111827; }
-      .detail-card { border-color: #334155; background: #111827; }
-      .detail-drag-handle { border-color: #334155; background: rgba(17,24,39,.96); }
-      .detail-close { background: #1e293b; color: #f8fafc; }
-      .detail-avatar { border-color: #111827; }
-      .detail-title { color: #f8fafc; }
-      .detail-text, .detail-stats { color: #cbd5e1; }
-      .detail-tags { border-color: #273449; }
-      .detail-tag { color: #e2e8f0; }
-      .detail-link { background: #f8fafc; color: #111827; }
     }
     @media (max-width: 420px) { .card-canvas { flex-basis: min(88vw, 340px); } }
     @media (prefers-reduced-motion: reduce) { .border-element, .marquee-track { animation: none; } }
@@ -101,13 +74,8 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
 </head>
 <body>
   <main id="profiles" aria-live="polite" aria-label="Vormex profile card carousel"><div class="empty">Loading Vormex profiles...</div></main>
-  <dialog id="profile-detail" class="profile-dialog" aria-label="Expanded Vormex profile card">
-    <article id="profile-detail-card" class="detail-card"></article>
-  </dialog>
   <script type="module">
     const root = document.querySelector('#profiles');
-    const detailDialog = document.querySelector('#profile-detail');
-    const detailCard = document.querySelector('#profile-detail-card');
     const fallbackBanner = 'https://www.vormex.in/vormex-profile-cover.png';
     const backendOrigin = 'https://vormex-backend.onrender.com';
     const text = (value) => typeof value === 'string' ? value.trim() : '';
@@ -222,15 +190,13 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
         addText(meta, 'meta-line connections', count.toLocaleString() + ' connections');
       }
       footer.appendChild(meta);
-      if (text(profile.username)) {
-        const link = document.createElement('button');
+      if (text(profile.profileUrl)) {
+        const link = document.createElement('a');
         link.className = 'open';
-        link.type = 'button';
-        link.setAttribute('aria-label', 'Show @' + profile.username + ' profile card');
-        link.addEventListener('click', (event) => {
-          event.stopPropagation();
-          openProfileDetail(profile);
-        });
+        link.href = profile.profileUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.setAttribute('aria-label', 'Open @' + profile.username + ' on Vormex');
         const miniAvatar = document.createElement('span');
         miniAvatar.className = 'open-avatar-wrap';
         miniAvatar.textContent = initials(profile.name);
@@ -265,134 +231,8 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       cardContent.appendChild(card);
       glowCard.appendChild(cardContent);
       canvas.appendChild(glowCard);
-      canvas.tabIndex = 0;
-      canvas.setAttribute('role', 'button');
-      canvas.setAttribute('aria-label', 'Show ' + (text(profile.name) || text(profile.username)) + ' expanded profile card');
-      canvas.addEventListener('click', () => openProfileDetail(profile));
-      canvas.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          openProfileDetail(profile);
-        }
-      });
       return canvas;
     }
-
-    function addDetailStat(parent, label, value) {
-      const count = Array.isArray(value) ? value.length : Number(value);
-      if (!Number.isFinite(count) || count <= 0) return;
-      addText(parent, 'detail-stat', count + ' ' + label + (count === 1 ? '' : 's'), 'span');
-    }
-
-    function openProfileDetail(profile) {
-      detailCard.replaceChildren();
-      detailDialog.style.transform = 'translate(0px, 0px)';
-
-      const handle = document.createElement('header');
-      handle.className = 'detail-drag-handle';
-      addText(handle, 'detail-drag-label', 'Drag to move', 'span');
-      const close = document.createElement('button');
-      close.className = 'detail-close';
-      close.type = 'button';
-      close.setAttribute('aria-label', 'Close expanded profile card');
-      close.textContent = '×';
-      close.addEventListener('click', () => detailDialog.close());
-      handle.appendChild(close);
-      detailCard.appendChild(handle);
-
-      const cover = document.createElement('div');
-      cover.className = 'detail-cover';
-      const coverImage = document.createElement('img');
-      coverImage.src = mediaUrl(profile.bannerImage, fallbackBanner);
-      coverImage.alt = '';
-      coverImage.referrerPolicy = 'no-referrer';
-      coverImage.addEventListener('error', () => { if (coverImage.src !== fallbackBanner) coverImage.src = fallbackBanner; });
-      cover.appendChild(coverImage);
-      detailCard.appendChild(cover);
-
-      const body = document.createElement('div');
-      body.className = 'detail-body';
-      const avatar = document.createElement('div');
-      avatar.className = 'detail-avatar';
-      avatar.textContent = initials(profile.name);
-      if (text(profile.avatar)) {
-        const avatarImage = document.createElement('img');
-        avatarImage.src = mediaUrl(profile.avatar);
-        avatarImage.alt = text(profile.name) + ' profile picture';
-        avatarImage.referrerPolicy = 'no-referrer';
-        avatarImage.addEventListener('error', () => avatarImage.remove(), { once: true });
-        avatar.appendChild(avatarImage);
-      }
-      body.appendChild(avatar);
-
-      const titleRow = document.createElement('div');
-      titleRow.className = 'detail-title-row';
-      addText(titleRow, 'detail-title', text(profile.name) || text(profile.username) || 'Vormex member', 'h2');
-      if (profile.verified) addText(titleRow, 'verified', '✓', 'span');
-      body.appendChild(titleRow);
-      addText(body, 'username', text(profile.username) ? '@' + profile.username : '');
-      addText(body, 'headline', profile.headline, 'p');
-      addText(body, 'detail-text', profile.bio, 'p');
-
-      const tags = Array.from(new Set([...list(profile.skills), ...list(profile.interests)].map((item) => text(item)).filter(Boolean))).slice(0, 20);
-      if (tags.length) {
-        const tagList = document.createElement('div');
-        tagList.className = 'detail-tags';
-        for (const tag of tags) addText(tagList, 'detail-tag', tag, 'span');
-        body.appendChild(tagList);
-      }
-
-      const stats = document.createElement('div');
-      stats.className = 'detail-stats';
-      if (text(profile.college)) addText(stats, 'detail-stat', profile.college, 'span');
-      if (Number.isFinite(Number(profile.connectionsCount))) addText(stats, 'detail-stat', Math.max(0, Math.trunc(Number(profile.connectionsCount))).toLocaleString() + ' connections', 'span');
-      addDetailStat(stats, 'experience', profile.experiences);
-      addDetailStat(stats, 'project', profile.projects);
-      addDetailStat(stats, 'achievement', profile.achievements);
-      body.appendChild(stats);
-
-      if (text(profile.profileUrl)) {
-        const fullProfile = document.createElement('a');
-        fullProfile.className = 'detail-link';
-        fullProfile.href = profile.profileUrl;
-        fullProfile.target = '_blank';
-        fullProfile.rel = 'noopener noreferrer';
-        fullProfile.textContent = 'Open full Vormex profile ↗';
-        body.appendChild(fullProfile);
-      }
-      detailCard.appendChild(body);
-      detailDialog.showModal();
-      enableDetailDragging(handle);
-    }
-
-    function enableDetailDragging(handle) {
-      let activePointer = null;
-      let startX = 0;
-      let startY = 0;
-      let originX = 0;
-      let originY = 0;
-      handle.onpointerdown = (event) => {
-        if (event.target.closest('button')) return;
-        activePointer = event.pointerId;
-        startX = event.clientX;
-        startY = event.clientY;
-        const match = detailDialog.style.transform.match(/translate\((-?[\d.]+)px,\s*(-?[\d.]+)px\)/);
-        originX = match ? Number(match[1]) : 0;
-        originY = match ? Number(match[2]) : 0;
-        handle.setPointerCapture(event.pointerId);
-      };
-      handle.onpointermove = (event) => {
-        if (event.pointerId !== activePointer) return;
-        detailDialog.style.transform = 'translate(' + (originX + event.clientX - startX) + 'px, ' + (originY + event.clientY - startY) + 'px)';
-      };
-      handle.onpointerup = handle.onpointercancel = (event) => {
-        if (event.pointerId === activePointer) activePointer = null;
-      };
-    }
-
-    detailDialog.addEventListener('click', (event) => {
-      if (event.target === detailDialog) detailDialog.close();
-    });
 
     function profilesFrom(result) {
       const data = result?.structuredContent || result || {};
@@ -440,7 +280,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       if (message.method === 'ui/notifications/tool-result') render(message.params);
     }, { passive: true });
     request('ui/initialize', {
-      appInfo: { name: 'vormex-profile-cards', version: '9.0.0' },
+      appInfo: { name: 'vormex-profile-cards', version: '10.0.0' },
       appCapabilities: {},
       protocolVersion: '2026-01-26'
     }).then(() => notify('ui/notifications/initialized', {})).catch(() => {});
