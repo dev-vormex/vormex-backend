@@ -1,4 +1,4 @@
-export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v7.html';
+export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v8.html';
 export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
 
 export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
@@ -11,16 +11,10 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     @property --glow-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 8px; background: transparent; color: #172033; }
-    .carousel-toolbar { display: flex; justify-content: flex-end; gap: 6px; min-height: 34px; margin-bottom: 8px; }
-    .carousel-toolbar[hidden] { display: none; }
-    .carousel-control { width: 34px; height: 34px; border: 1px solid #d7dee9; border-radius: 50%; background: #fff; color: #172033; display: grid; place-items: center; font: 700 20px/1 system-ui, sans-serif; cursor: pointer; }
-    .carousel-control:hover { border-color: #94a3b8; background: #f8fafc; }
-    .carousel-control:disabled { cursor: default; opacity: .35; }
-    #profiles { display: flex; align-items: flex-start; gap: 14px; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 8px; scroll-behavior: smooth; scroll-snap-type: x mandatory; scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
-    .card-canvas { position: relative; flex: 0 0 clamp(290px, 82vw, 380px); min-width: 0; align-self: start; padding: 1px; isolation: isolate; scroll-snap-align: start; }
-    .card-backdrop { position: absolute; inset: -18px; z-index: -2; opacity: 0; filter: blur(24px); background: conic-gradient(from var(--glow-angle), transparent 0 16%, rgba(59,130,246,.28), transparent 35% 62%, rgba(139,92,246,.22), transparent 82%); transition: opacity .3s ease; animation: card-glow 7s linear infinite; pointer-events: none; }
-    .card-canvas:hover .card-backdrop, .card-canvas:focus-within .card-backdrop { opacity: 1; }
+    body { margin: 0; padding: 0; overflow: hidden; background: transparent; color: #172033; }
+    #profiles { display: flex; align-items: flex-start; gap: 12px; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 0; scroll-behavior: smooth; scroll-snap-type: x mandatory; scrollbar-width: none; }
+    #profiles::-webkit-scrollbar { display: none; }
+    .card-canvas { position: relative; flex: 0 0 clamp(290px, 82vw, 380px); min-width: 0; align-self: start; padding: 0; isolation: isolate; scroll-snap-align: start; }
     .glow-card { position: relative; min-width: 0; height: auto; padding: 1px; overflow: hidden; background: #cbd5e1; box-shadow: 0 16px 45px rgba(15,23,42,.08); }
     .card-content { position: relative; z-index: 1; height: auto; }
     .border-element { position: absolute; z-index: 2; display: block; pointer-events: none; opacity: .78; }
@@ -73,24 +67,15 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       .marquee { color: #cbd5e1; }
       .footer { border-color: #273449; }
       .open { background: #f8fafc; color: #111827; }
-      .carousel-control { border-color: #334155; background: #111827; color: #f8fafc; }
-      .carousel-control:hover { border-color: #64748b; background: #1e293b; }
     }
-    @media (max-width: 420px) { body { padding: 6px; } .card-canvas { flex-basis: min(88vw, 340px); } }
-    @media (prefers-reduced-motion: reduce) { .card-backdrop, .border-element, .marquee-track { animation: none; } }
+    @media (max-width: 420px) { .card-canvas { flex-basis: min(88vw, 340px); } }
+    @media (prefers-reduced-motion: reduce) { .border-element, .marquee-track { animation: none; } }
   </style>
 </head>
 <body>
-  <div id="carousel-controls" class="carousel-toolbar" hidden>
-    <button id="carousel-previous" class="carousel-control" type="button" aria-label="Show previous Vormex profiles">&#8249;</button>
-    <button id="carousel-next" class="carousel-control" type="button" aria-label="Show next Vormex profiles">&#8250;</button>
-  </div>
   <main id="profiles" aria-live="polite" aria-label="Vormex profile card carousel"><div class="empty">Loading Vormex profiles...</div></main>
   <script type="module">
     const root = document.querySelector('#profiles');
-    const controls = document.querySelector('#carousel-controls');
-    const previousButton = document.querySelector('#carousel-previous');
-    const nextButton = document.querySelector('#carousel-next');
     const fallbackBanner = 'https://www.vormex.in/vormex-profile-cover.png';
     const text = (value) => typeof value === 'string' ? value.trim() : '';
     const list = (value) => Array.isArray(value) ? value : [];
@@ -224,10 +209,6 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
 
       const canvas = document.createElement('div');
       canvas.className = 'card-canvas';
-      const backdrop = document.createElement('div');
-      backdrop.className = 'card-backdrop';
-      backdrop.setAttribute('aria-hidden', 'true');
-      canvas.appendChild(backdrop);
       const glowCard = document.createElement('div');
       glowCard.className = 'glow-card';
       for (const side of ['top', 'right', 'bottom', 'left']) {
@@ -262,30 +243,10 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
         empty.className = 'empty';
         empty.textContent = 'No eligible public Vormex profiles matched this request.';
         root.appendChild(empty);
-        controls.hidden = true;
         return;
       }
       for (const profile of profiles) root.appendChild(profileCard(profile));
-      requestAnimationFrame(updateCarouselControls);
     }
-
-    function updateCarouselControls() {
-      const hasOverflow = root.scrollWidth > root.clientWidth + 2;
-      controls.hidden = !hasOverflow;
-      previousButton.disabled = root.scrollLeft <= 2;
-      nextButton.disabled = root.scrollLeft + root.clientWidth >= root.scrollWidth - 2;
-    }
-
-    function scrollCarousel(direction) {
-      const card = root.querySelector('.card-canvas');
-      const distance = card ? card.getBoundingClientRect().width + 14 : Math.max(280, root.clientWidth * .8);
-      root.scrollBy({ left: direction * distance, behavior: 'smooth' });
-    }
-
-    previousButton.addEventListener('click', () => scrollCarousel(-1));
-    nextButton.addEventListener('click', () => scrollCarousel(1));
-    root.addEventListener('scroll', updateCarouselControls, { passive: true });
-    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(updateCarouselControls).observe(root);
 
     if (window.openai?.toolOutput) render(window.openai.toolOutput);
 
@@ -310,7 +271,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       if (message.method === 'ui/notifications/tool-result') render(message.params);
     }, { passive: true });
     request('ui/initialize', {
-      appInfo: { name: 'vormex-profile-cards', version: '7.0.0' },
+      appInfo: { name: 'vormex-profile-cards', version: '8.0.0' },
       appCapabilities: {},
       protocolVersion: '2026-01-26'
     }).then(() => notify('ui/notifications/initialized', {})).catch(() => {});

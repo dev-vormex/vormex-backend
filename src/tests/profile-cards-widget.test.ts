@@ -8,7 +8,7 @@ import {
 
 test('profile card widget uses the MCP Apps resource contract', () => {
   assert.equal(MCP_APP_MIME_TYPE, 'text/html;profile=mcp-app');
-  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v7.html');
+  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v8.html');
   assert.match(PROFILE_CARDS_HTML, /ui\/initialize/);
   assert.match(PROFILE_CARDS_HTML, /ui\/notifications\/tool-result/);
 });
@@ -26,8 +26,9 @@ test('profile card widget renders profile fields without injecting raw HTML', ()
 
 test('profile card widget provides an accessible horizontal carousel', () => {
   assert.match(PROFILE_CARDS_HTML, /scroll-snap-type:\s*x mandatory/);
-  assert.match(PROFILE_CARDS_HTML, /carousel-previous/);
-  assert.match(PROFILE_CARDS_HTML, /carousel-next/);
-  assert.match(PROFILE_CARDS_HTML, /scrollBy/);
+  assert.match(PROFILE_CARDS_HTML, /scrollbar-width:\s*none/);
+  assert.doesNotMatch(PROFILE_CARDS_HTML, /carousel-previous/);
+  assert.doesNotMatch(PROFILE_CARDS_HTML, /carousel-next/);
+  assert.doesNotMatch(PROFILE_CARDS_HTML, /card-backdrop/);
   assert.match(PROFILE_CARDS_HTML, /profile card carousel/i);
 });

@@ -41,7 +41,7 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '2.7.0' },
+    { name: 'vormex-public-discovery', version: '2.8.0' },
     {
       instructions:
         'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. For every request to find, show, suggest, recommend, or compare people, members, mentors, learners, or collaborators, always call find_public_people_for_goal directly with a limit from 3 to 10; do not use search_public_vormex and do not fetch every returned profile again. The people tool already returns full eligible profiles and a visual card carousel, so keep the written response brief instead of restating every card. Use search_public_vormex only for broad content requests that are not specifically asking for people. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
@@ -63,7 +63,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
         text: PROFILE_CARDS_HTML,
         _meta: {
           ui: {
-            prefersBorder: true,
+            prefersBorder: false,
             domain: 'https://www.vormex.in',
             csp: {
               connectDomains: [],
@@ -76,7 +76,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
             },
           },
           'openai/widgetDescription': 'Shows eligible public Vormex member profiles with cover images, profile pictures, bios, skills, interests, connection totals, and profile links.',
-          'openai/widgetPrefersBorder': true,
+          'openai/widgetPrefersBorder': false,
           'openai/widgetCSP': {
             connect_domains: [],
             resource_domains: [
