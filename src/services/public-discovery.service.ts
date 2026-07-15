@@ -32,13 +32,22 @@ export interface PublicPersonResult {
 }
 
 export interface PublicProfileResult extends Omit<PublicPersonResult, 'matchScore' | 'matchScoreBand' | 'matchReasons'> {
+  bannerImage: string | null;
   college: string | null;
   branch: string | null;
   degree: string | null;
+  graduationYear: number | null;
   portfolioUrl: string | null;
   linkedinUrl: string | null;
   githubProfileUrl: string | null;
-  projects: Array<{ id: string; title: string; description: string | null; url: string | null }>;
+  otherSocialUrls: unknown | null;
+  experiences: Array<{ title: string; company: string; type: string; location: string | null; startDate: string; endDate: string | null; current: boolean; description: string | null; skills: string[]; logo: string | null }>;
+  education: Array<{ school: string; degree: string; fieldOfStudy: string; startDate: string; endDate: string | null; current: boolean; grade: string | null; activities: string | null; description: string | null; logo: string | null }>;
+  projects: Array<{ id: string; title: string; description: string; url: string | null; role: string | null; techStack: string[]; startDate: string; endDate: string | null; current: boolean; projectUrl: string | null; githubUrl: string | null; otherLinks: unknown | null; images: string[]; featured: boolean }>;
+  certificates: Array<{ name: string; issuingOrganization: string; issueDate: string; expiryDate: string | null; doesNotExpire: boolean; credentialId: string | null; credentialUrl: string | null }>;
+  achievements: Array<{ title: string; type: string; organization: string; date: string; description: string | null; certificateUrl: string | null }>;
+  publicTextPosts: Array<{ id: string; content: string; url: string; likesCount: number; commentsCount: number; sharesCount: number; createdAt: string }>;
+  sectionCounts: { experiences: number; education: number; projects: number; certificates: number; achievements: number; publicTextPosts: number };
   indexable: boolean;
   updatedAt: string;
 }
@@ -342,26 +351,70 @@ export async function getPublicProfile(username: string, channel: DiscoveryChann
   if (channel === 'ai' && process.env.PUBLIC_AI_DISCOVERY_ENABLED === 'false') return null;
   const normalized = normalizeDiscoveryText(username.replace(/^@/, ''), 40).toLowerCase();
   if (!normalized) return null;
-  const users = await loadPeopleCandidates({ goal: normalized, limit: 10 });
-  const user = users.find((candidate) => candidate.username.toLowerCase() === normalized);
+  const user = await prismaRead.user.findFirst({
+    where: { username: { equals: normalized, mode: 'insensitive' } },
+    select: {
+      id: true, username: true, name: true, profileImage: true, bannerImageUrl: true, headline: true, bio: true, interests: true,
+      college: true, branch: true, degree: true, graduationYear: true, portfolioUrl: true, linkedinUrl: true,
+      githubProfileUrl: true, otherSocialUrls: true,
+      isVerified: true, isOpenToOpportunities: true, isBanned: true, safetyRestrictedUntil: true,
+      safetySuspendedUntil: true, webDiscoveryEnabled: true, aiDiscoveryEnabled: true, shareLocationPublic: true,
+      currentCity: true, currentState: true, currentCountry: true, lastActiveAt: true, updatedAt: true,
+      skills: { select: { skill: { select: { name: true } } }, take: 50 },
+      experiences: { orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }] },
+      educationHistory: { orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }] },
+      projects: { orderBy: [{ featured: 'desc' }, { startDate: 'desc' }] },
+      certificates: { orderBy: { issueDate: 'desc' } },
+      achievements: { orderBy: { date: 'desc' } },
+      posts: {
+        where: { visibility: 'public', isActive: true, type: 'text', content: { not: '' } },
+        orderBy: { createdAt: 'desc' }, take: 20,
+        select: { id: true, content: true, likesCount: true, commentsCount: true, sharesCount: true, createdAt: true },
+      },
+      _count: { select: { experiences: true, educationHistory: true, projects: true, certificates: true, achievements: true, posts: { where: { visibility: 'public', isActive: true, type: 'text', content: { not: '' } } } } },
+    },
+  });
   if (!user || !isPublicUserEligible(user, channel)) return null;
-  const publicPerson = toPersonResult(user, 0, []);
-  const { matchScore: _score, matchScoreBand: _band, matchReasons: _reasons, ...person } = publicPerson;
+  const location = user.shareLocationPublic === true
+    ? [user.currentCity, user.currentState, user.currentCountry].map((part) => normalizeDiscoveryText(part, 80)).filter(Boolean).filter((part, index, all) => all.indexOf(part) === index).join(', ') || null
+    : null;
   return {
-    ...person,
+    username: user.username, name: user.name, headline: user.headline, bio: user.bio, avatar: user.profileImage,
+    skills: user.skills.map((entry) => entry.skill.name), interests: user.interests, location,
+    profileUrl: `${WEB_BASE_URL}/people/${encodeURIComponent(user.username)}`, verified: user.isVerified,
+    openToOpportunities: user.isOpenToOpportunities,
+    bannerImage: user.bannerImageUrl,
     college: user.college,
     branch: user.branch,
     degree: user.degree,
+    graduationYear: user.graduationYear,
     portfolioUrl: user.portfolioUrl,
     linkedinUrl: user.linkedinUrl,
     githubProfileUrl: user.githubProfileUrl,
-    projects: user.projects.map((project) => ({
-      id: project.id,
-      title: project.name,
-      description: project.description,
-      url: project.projectUrl,
-    })),
-    indexable: user.webDiscoveryEnabled && hasIndexableProfileContent(user),
+    otherSocialUrls: user.otherSocialUrls,
+    experiences: user.experiences.map((entry) => ({ title: entry.title, company: entry.company, type: entry.type,
+      location: entry.location, startDate: entry.startDate.toISOString(), endDate: entry.endDate?.toISOString() || null,
+      current: entry.isCurrent, description: entry.description, skills: entry.skills, logo: entry.logo })),
+    education: user.educationHistory.map((entry) => ({ school: entry.school, degree: entry.degree, fieldOfStudy: entry.fieldOfStudy,
+      startDate: entry.startDate.toISOString(), endDate: entry.endDate?.toISOString() || null, current: entry.isCurrent,
+      grade: entry.grade, activities: entry.activities, description: entry.description, logo: entry.logo })),
+    projects: user.projects.map((entry) => ({ id: entry.id, title: entry.name, description: entry.description,
+      url: entry.projectUrl, role: entry.role,
+      techStack: entry.techStack, startDate: entry.startDate.toISOString(), endDate: entry.endDate?.toISOString() || null,
+      current: entry.isCurrent, projectUrl: entry.projectUrl, githubUrl: entry.githubUrl, otherLinks: entry.otherLinks,
+      images: entry.images, featured: entry.featured })),
+    certificates: user.certificates.map((entry) => ({ name: entry.name, issuingOrganization: entry.issuingOrg,
+      issueDate: entry.issueDate.toISOString(), expiryDate: entry.expiryDate?.toISOString() || null,
+      doesNotExpire: entry.doesNotExpire, credentialId: entry.credentialId, credentialUrl: entry.credentialUrl })),
+    achievements: user.achievements.map((entry) => ({ title: entry.title, type: entry.type, organization: entry.organization,
+      date: entry.date.toISOString(), description: entry.description, certificateUrl: entry.certificateUrl })),
+    publicTextPosts: user.posts.map((post) => ({ id: post.id, content: post.content.slice(0, 4_000),
+      url: `${WEB_BASE_URL}/post/${post.id}`, likesCount: post.likesCount, commentsCount: post.commentsCount,
+      sharesCount: post.sharesCount, createdAt: post.createdAt.toISOString() })),
+    sectionCounts: { experiences: user._count.experiences, education: user._count.educationHistory,
+      projects: user._count.projects, certificates: user._count.certificates, achievements: user._count.achievements,
+      publicTextPosts: user._count.posts },
+    indexable: user.webDiscoveryEnabled && Boolean(user.headline || user.bio || user.interests.length || user.skills.length || user.projects.length),
     updatedAt: user.updatedAt.toISOString(),
   };
 }

@@ -6,6 +6,7 @@ import {
   normalizeDiscoveryText,
   tokenizeDiscoveryIntent,
 } from '../services/public-discovery.service';
+import { tokenizePublicPostQuery } from '../services/public-content-discovery.service';
 
 const eligibleUser = {
   isBanned: false,
@@ -35,4 +36,15 @@ test('discovery input is bounded, normalized, and expands goal intent', () => {
   const tokens = tokenizeDiscoveryIntent({ goal: 'I want to learn coding' });
   assert.ok(tokens.includes('programming'));
   assert.ok(tokens.includes('mentor'));
+});
+
+test('public post discovery expands broad hackathon and coding requests', () => {
+  const hackathonTokens = tokenizePublicPostQuery('Show me upcoming hackathons');
+  assert.ok(hackathonTokens.includes('hackathon'));
+  assert.ok(hackathonTokens.includes('team'));
+  assert.ok(hackathonTokens.includes('devfolio'));
+
+  const codingTokens = tokenizePublicPostQuery('I want coding posts');
+  assert.ok(codingTokens.includes('programming'));
+  assert.ok(codingTokens.includes('developer'));
 });

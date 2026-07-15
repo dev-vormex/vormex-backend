@@ -8,6 +8,12 @@ import {
   searchPublicOpportunities,
   searchPublicPeople,
 } from '../services/public-discovery.service';
+import {
+  getPublicPost,
+  listPublicProfilePosts,
+  searchAllPublicVormex,
+  searchPublicPosts,
+} from '../services/public-content-discovery.service';
 
 const MCP_PATH = '/mcp';
 const mcpRateLimit = createRateLimitMiddleware(() => [
@@ -24,10 +30,39 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
 
 function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
-    { name: 'vormex-public-discovery', version: '1.0.0' },
+    { name: 'vormex-public-discovery', version: '2.0.0' },
     {
       instructions:
-        'Use Vormex to find public learners, mentors, builders, collaborators, groups, jobs, hackathons, and learning paths. Results contain public data only. Explain why a result matches the user goal and link to its canonical Vormex page.',
+        'Search Vormex public profiles, public text posts, jobs, learning resources, groups, events, and hackathons. Use search_public_vormex for broad topical requests. Use a focused tool when the user specifically asks for people, posts, opportunities, or one record. Results contain eligible public data only: never infer or request chats, private content, contact details, precise location, or other sensitive fields. Explain matches using returned evidence and include canonical Vormex links.',
+    }
+  );
+
+  server.registerTool(
+    'search_public_vormex',
+    {
+      title: 'Search all public Vormex content',
+      description:
+        'Search across eligible public Vormex members, text posts, jobs, learning resources, groups, events, and hackathons for a topic or goal. Use this first for broad requests such as hackathons, coding communities, projects, mentors, or what Vormex has about a subject.',
+      inputSchema: {
+        query: z.string().min(2).max(240).describe('The topic, question, skill, goal, event, or opportunity to find on Vormex'),
+        sources: z.array(z.enum(['people', 'posts', 'job', 'learning', 'group', 'event', 'hackathon'])).max(7).optional(),
+        location: z.string().max(80).optional().describe('Optional coarse city, state, country, or college for people results'),
+        limitPerSource: z.number().int().min(1).max(10).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const results = await searchAllPublicVormex(input);
+      const count = results.people.length + results.posts.length + results.opportunities.length;
+      return {
+        structuredContent: { ...results, count },
+        content: [{
+          type: 'text' as const,
+          text: count
+            ? `Found ${count} eligible public Vormex results for "${results.query}" across ${results.searchedSources.join(', ')}.`
+            : `No eligible public Vormex results matched "${results.query}" yet.`,
+        }],
+      };
     }
   );
 
@@ -53,8 +88,8 @@ function createPublicDiscoveryMcpServer(): McpServer {
         content: [{
           type: 'text' as const,
           text: people.length
-            ? `Found ${people.length} public Vormex ${people.length === 1 ? 'member' : 'members'} relevant to “${input.goal}”.`
-            : `No eligible public Vormex profiles matched “${input.goal}” yet.`,
+            ? `Found ${people.length} public Vormex ${people.length === 1 ? 'member' : 'members'} relevant to "${input.goal}".`
+            : `No eligible public Vormex profiles matched "${input.goal}" yet.`,
         }],
       };
     }
@@ -64,7 +99,7 @@ function createPublicDiscoveryMcpServer(): McpServer {
     'get_public_vormex_profile',
     {
       title: 'Get a public Vormex profile',
-      description: 'Retrieve the safe public fields of one Vormex member by username after the user asks for more detail.',
+      description: 'Get an eligible member\'s comprehensive public Vormex profile: identity, headline, bio, skills, interests, coarse public location, education, experience, projects, certificates, achievements, and recent public text posts. It never returns chats, contact details, precise location, or private data.',
       inputSchema: { username: z.string().min(1).max(40).describe('Vormex username, with or without @') },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -79,10 +114,69 @@ function createPublicDiscoveryMcpServer(): McpServer {
   );
 
   server.registerTool(
+    'search_public_vormex_posts',
+    {
+      title: 'Search public Vormex text posts',
+      description: 'Find eligible public Vormex text posts about a topic such as a hackathon, project, technology, learning goal, announcement, or collaboration request.',
+      inputSchema: {
+        query: z.string().min(2).max(240),
+        limit: z.number().int().min(1).max(10).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ query, limit }) => {
+      const posts = await searchPublicPosts(query, limit);
+      return {
+        structuredContent: { query, posts, count: posts.length },
+        content: [{ type: 'text' as const, text: `Found ${posts.length} eligible public Vormex text posts for "${query}".` }],
+      };
+    }
+  );
+
+  server.registerTool(
+    'list_public_vormex_profile_posts',
+    {
+      title: 'List a member\'s public Vormex posts',
+      description: 'Page through all eligible public text posts belonging to one AI-discoverable Vormex member. Use the returned nextCursor to request another page.',
+      inputSchema: {
+        username: z.string().min(1).max(40).describe('Vormex username, with or without @'),
+        limit: z.number().int().min(1).max(20).optional(),
+        cursor: z.string().min(1).max(80).optional().describe('nextCursor returned by the previous call'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ username, limit, cursor }) => {
+      const page = await listPublicProfilePosts(username, limit, cursor);
+      return {
+        structuredContent: { username: username.replace(/^@/, ''), ...page, count: page.posts.length },
+        content: [{ type: 'text' as const, text: `Found ${page.posts.length} eligible public Vormex posts for @${username.replace(/^@/, '')}.` }],
+      };
+    }
+  );
+
+  server.registerTool(
+    'get_public_vormex_post',
+    {
+      title: 'Get a public Vormex text post',
+      description: 'Retrieve one eligible public Vormex text post and its public author summary by post ID after a search result needs more detail.',
+      inputSchema: { postId: z.string().min(1).max(80).describe('Vormex post ID returned by a search tool') },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ postId }) => {
+      const post = await getPublicPost(postId);
+      return {
+        structuredContent: { post },
+        content: [{ type: 'text' as const, text: post ? `Public Vormex post by @${post.author.username}.` : 'That post is not available for public AI discovery.' }],
+        isError: !post,
+      };
+    }
+  );
+
+  server.registerTool(
     'find_public_vormex_opportunities',
     {
       title: 'Find public Vormex opportunities',
-      description: 'Find public Vormex jobs, learning paths, groups, events, and hackathons relevant to a stated goal or skill.',
+      description: 'Find eligible public Vormex jobs, learning paths, groups, events, and hackathons relevant to a stated goal or skill. Also returns related public text posts so community announcements and discussions are not missed.',
       inputSchema: {
         query: z.string().min(1).max(240),
         types: z.array(z.enum(['job', 'learning', 'group', 'event', 'hackathon'])).max(5).optional(),
@@ -91,10 +185,13 @@ function createPublicDiscoveryMcpServer(): McpServer {
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ query, types, limit }) => {
-      const opportunities = await searchPublicOpportunities(query, types, limit);
+      const [opportunities, relatedPosts] = await Promise.all([
+        searchPublicOpportunities(query, types, limit),
+        searchPublicPosts(query, limit),
+      ]);
       return {
-        structuredContent: { opportunities, count: opportunities.length, query },
-        content: [{ type: 'text' as const, text: `Found ${opportunities.length} public Vormex opportunities for “${query}”.` }],
+        structuredContent: { opportunities, relatedPosts, count: opportunities.length + relatedPosts.length, query },
+        content: [{ type: 'text' as const, text: `Found ${opportunities.length} public Vormex opportunities and ${relatedPosts.length} related public posts for "${query}".` }],
       };
     }
   );
