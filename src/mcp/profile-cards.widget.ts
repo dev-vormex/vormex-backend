@@ -1,4 +1,4 @@
-export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v5.html';
+export const PROFILE_CARDS_RESOURCE_URI = 'ui://vormex/profile-cards-v6.html';
 export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
 
 export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
@@ -11,13 +11,13 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     @property --glow-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 12px; background: transparent; color: #172033; }
-    #profiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
-    .card-canvas { position: relative; min-width: 0; padding: 1px; isolation: isolate; }
+    body { margin: 0; padding: 8px; background: transparent; color: #172033; }
+    #profiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 480px)); justify-content: center; align-items: start; gap: 14px; }
+    .card-canvas { position: relative; min-width: 0; align-self: start; padding: 1px; isolation: isolate; }
     .card-backdrop { position: absolute; inset: -18px; z-index: -2; opacity: 0; filter: blur(24px); background: conic-gradient(from var(--glow-angle), transparent 0 16%, rgba(59,130,246,.28), transparent 35% 62%, rgba(139,92,246,.22), transparent 82%); transition: opacity .3s ease; animation: card-glow 7s linear infinite; pointer-events: none; }
     .card-canvas:hover .card-backdrop, .card-canvas:focus-within .card-backdrop { opacity: 1; }
-    .glow-card { position: relative; min-width: 0; height: 100%; padding: 1px; overflow: hidden; background: #cbd5e1; box-shadow: 0 16px 45px rgba(15,23,42,.08); }
-    .card-content { position: relative; z-index: 1; height: 100%; }
+    .glow-card { position: relative; min-width: 0; height: auto; padding: 1px; overflow: hidden; background: #cbd5e1; box-shadow: 0 16px 45px rgba(15,23,42,.08); }
+    .card-content { position: relative; z-index: 1; height: auto; }
     .border-element { position: absolute; z-index: 2; display: block; pointer-events: none; opacity: .78; }
     .border-top, .border-bottom { left: -35%; width: 34%; height: 1px; background: linear-gradient(90deg, transparent, #fff, #60a5fa, transparent); animation: border-horizontal 5.5s linear infinite; }
     .border-top { top: 0; } .border-bottom { bottom: 0; animation-delay: -2.75s; }
@@ -26,7 +26,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     @keyframes card-glow { to { --glow-angle: 360deg; } }
     @keyframes border-horizontal { to { transform: translateX(500%); } }
     @keyframes border-vertical { to { transform: translateY(500%); } }
-    .card { min-width: 0; height: 100%; aspect-ratio: 1 / 1; overflow: hidden; display: flex; flex-direction: column; background: #fff; }
+    .card { min-width: 0; overflow: hidden; display: flex; flex-direction: column; background: #fff; }
     .cover { position: relative; height: 92px; flex: 0 0 92px; overflow: hidden; background: #e8edf5; }
     .cover-image { width: 100%; height: 100%; object-fit: cover; display: block; }
     .vormex-logo { position: absolute; top: 12px; right: 16px; width: 40px; height: 40px; object-fit: contain; }
@@ -47,7 +47,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
     .marquee-item { display: inline-flex; align-items: center; color: inherit; font-size: 12px; font-weight: 650; }
     .marquee-item::after { content: "·"; margin: 0 12px; opacity: .35; }
     @keyframes profile-marquee { from { transform: translateX(0); } to { transform: translateX(-50%); } }
-    .footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: auto; padding-top: 12px; border-top: 1px solid #eef2f7; }
+    .footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: 18px; padding-top: 12px; border-top: 1px solid #eef2f7; }
     .meta { min-width: 0; color: #475569; font-size: 11px; line-height: 1.5; }
     .meta-line { overflow-wrap: anywhere; }
     .availability { color: #059669; }
@@ -69,7 +69,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       .footer { border-color: #273449; }
       .open { background: #f8fafc; color: #111827; }
     }
-    @media (max-width: 420px) { body { padding: 8px; } #profiles { grid-template-columns: 1fr; } .card { aspect-ratio: auto; min-height: 380px; } }
+    @media (max-width: 420px) { body { padding: 6px; } #profiles { grid-template-columns: minmax(0, 1fr); } }
     @media (prefers-reduced-motion: reduce) { .card-backdrop, .border-element, .marquee-track { animation: none; } }
   </style>
 </head>
@@ -276,7 +276,7 @@ export const PROFILE_CARDS_HTML = String.raw`<!doctype html>
       if (message.method === 'ui/notifications/tool-result') render(message.params);
     }, { passive: true });
     request('ui/initialize', {
-      appInfo: { name: 'vormex-profile-cards', version: '5.0.0' },
+      appInfo: { name: 'vormex-profile-cards', version: '6.0.0' },
       appCapabilities: {},
       protocolVersion: '2026-01-26'
     }).then(() => notify('ui/notifications/initialized', {})).catch(() => {});

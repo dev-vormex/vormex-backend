@@ -8,7 +8,7 @@ import {
 
 test('profile card widget uses the MCP Apps resource contract', () => {
   assert.equal(MCP_APP_MIME_TYPE, 'text/html;profile=mcp-app');
-  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v5.html');
+  assert.equal(PROFILE_CARDS_RESOURCE_URI, 'ui://vormex/profile-cards-v6.html');
   assert.match(PROFILE_CARDS_HTML, /ui\/initialize/);
   assert.match(PROFILE_CARDS_HTML, /ui\/notifications\/tool-result/);
 });
