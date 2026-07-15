@@ -34,6 +34,7 @@
     "docs:generate": "swagger-cli bundle -o src/openapi.json src/openapi.yaml",
     "docs:validate": "swagger-cli validate src/openapi.yaml",
     "docs:serve": "npm run docs:generate && npm start",
+    "discovery:backfill": "npm run build && node dist/scripts/backfill-public-discovery.js",
     "verify": "npm run build && npm run docs:validate"
   },
   "keywords": [
@@ -47,6 +48,7 @@
   "license": "ISC",
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@prisma/client": "^5.22.0",
     "@socket.io/redis-adapter": "^8.3.0",
     "@types/bcryptjs": "^2.4.6",

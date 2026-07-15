@@ -19,6 +19,7 @@ import {
   ensurePremiumFeatureAccess,
   getPremiumProfileCustomizationFields,
 } from '../services/premium-feature-gates.service';
+import { reindexPublicProfile } from '../services/public-discovery.service';
 
 const PROFILE_BADGE_STYLES = new Set(['student', 'professional']);
 
@@ -566,6 +567,12 @@ export const updateProfile = async (
 
     if (shouldTriggerMatchNotifications) {
       queueMatchAvailabilityNotifications(userId, 'profile_update');
+    }
+
+    if (affectsPeopleCards) {
+      void reindexPublicProfile(userId).catch((error) => {
+        console.warn('Failed to refresh public discovery profile index', error instanceof Error ? error.message : error);
+      });
     }
 
     res.status(200).json({

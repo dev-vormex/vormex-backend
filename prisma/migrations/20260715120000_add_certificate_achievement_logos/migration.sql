@@ -1,0 +1,4 @@
+-- Intentionally left as a no-op.
+-- This migration directory was created before the certificate/achievement
+-- logo schema change was finalized. Keeping an explicit migration file
+-- preserves Prisma's migration ordering without altering existing data.

@@ -71,6 +71,7 @@ import audioRoutes from './routes/audio.routes';
 import adminRoutes from './routes/admin.routes';
 import managedAdsRoutes from './routes/managed-ads.routes';
 import dailyHooksRoutes from './routes/daily-hooks.routes';
+import publicDiscoveryRoutes from './routes/public-discovery.routes';
 import premiumRoutes from './routes/premium.routes';
 import { setupSwagger } from './swagger';
 import { setIO } from './sockets';
@@ -125,6 +126,7 @@ import {
 import { installProcessErrorHandlers } from './utils/process-error-handlers.util';
 import { connectProximityRedis, closeProximityRedis } from './infrastructure/proximity/redis-client';
 import { closeProximityQueues } from './infrastructure/proximity/queues';
+import { mcpCorsHeaders, registerPublicDiscoveryMcp } from './mcp/public-discovery.mcp';
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -2469,6 +2471,7 @@ const getRequestMaxBytes = (req: Request): number => {
   return DEFAULT_REQUEST_MAX_BYTES;
 };
 
+app.use('/mcp', mcpCorsHeaders);
 app.use(httpLogger);
 app.use(metricsMiddleware);
 app.use(helmet());
@@ -2654,6 +2657,9 @@ app.use('/api/audio', audioRoutes);
 app.use('/api/ads', managedAdsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/daily-hooks', dailyHooksRoutes);
+app.use('/api/public/discovery', publicDiscoveryRoutes);
+
+registerPublicDiscoveryMcp(app);
 
 // 404 handler for undefined routes
 app.use(notFoundHandler);
