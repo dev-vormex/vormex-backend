@@ -10,6 +10,7 @@ import {
   getConversationStatusWithUser,
   getConversation,
   getMessages,
+  syncChat,
   sendMessage,
   markAsRead,
   deleteMessage,
@@ -82,6 +83,7 @@ const handleChatUpload = (req: Request, res: Response, next: NextFunction): void
 router.use(authenticate);
 
 router.get('/conversations', getConversations);
+router.get('/sync', syncChat);
 router.post('/conversations', getOrCreateConversation);
 router.get('/users/:userId/status', getConversationStatusWithUser);
 router.get('/conversations/:conversationId', getConversation);

@@ -19,6 +19,11 @@ import { runMaintenanceJob, type MaintenanceJobName } from '../services/cron.ser
 import { dispatchOutboxBatch } from '../outbox/dispatcher';
 import { logger } from '../lib/logger';
 import { queueBacklogGauge } from '../infrastructure/metrics/registry';
+import {
+  CHAT_DELIVERY_RECONCILIATION_JOB,
+  enqueuePendingDeliveryReconciliation,
+  reconcilePendingMessageDeliveries,
+} from '../services/chat-delivery-reconciliation.service';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -196,6 +201,30 @@ async function processPeopleYouKnow() {
 async function processMaintenance(job: Job) {
   if (job.name === 'outbox_dispatch_tick') {
     return dispatchOutboxBatch();
+  }
+
+  if (job.name === CHAT_DELIVERY_RECONCILIATION_JOB) {
+    const userId = typeof job.data?.userId === 'string' ? job.data.userId : '';
+    if (!userId) throw new Error('chat delivery reconciliation requires userId');
+
+    const result = await reconcilePendingMessageDeliveries(userId);
+    await Promise.all(
+      result.groups.map((group) =>
+        publishRealtimeEnvelope({
+          event: 'chat:messages_delivered',
+          users: [group.senderId],
+          payload: {
+            conversationId: group.conversationId,
+            deliveredTo: userId,
+            deliveredAt: result.deliveredAt.toISOString(),
+          },
+        })
+      )
+    );
+    if (result.hasMore) {
+      await enqueuePendingDeliveryReconciliation(userId);
+    }
+    return result;
   }
 
   return runMaintenanceJob(job.name as MaintenanceJobName);

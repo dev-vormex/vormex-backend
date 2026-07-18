@@ -113,6 +113,21 @@ export function dateDescKeysetWhere(
   };
 }
 
+export function dateAscKeysetWhere(
+  cursor: KeysetCursor | null,
+  fieldName: string
+): Record<string, unknown> | null {
+  if (!cursor?.t) return null;
+  const cursorDate = new Date(cursor.t);
+  if (Number.isNaN(cursorDate.getTime())) return null;
+  return {
+    OR: [
+      { [fieldName]: { gt: cursorDate } },
+      { [fieldName]: cursorDate, id: { gt: cursor.id } },
+    ],
+  };
+}
+
 export function nullableDateDescIdAscWhere(
   cursor: KeysetCursor | null,
   fieldName: string

@@ -1205,8 +1205,8 @@ model conversations {
   @@index([lastMessageAt])
   @@index([participant1Id])
   @@index([participant2Id])
-  @@index([participant1Id, lastMessageAt, id])
-  @@index([participant2Id, lastMessageAt, id])
+  @@index([participant1Id, lastMessageAt(sort: Desc), id(sort: Asc)])
+  @@index([participant2Id, lastMessageAt(sort: Desc), id(sort: Asc)])
 }
 
 /// User-generated reports (posts, chats, users, comments, groups) for admin moderation.
@@ -1759,13 +1759,14 @@ model messages {
   messages          messages?           @relation("messagesTomessages", fields: [replyToId], references: [id])
   other_messages    messages[]          @relation("messagesTomessages")
 
-  @@unique([conversationId, senderId, clientMessageId])
+  @@unique([senderId, clientMessageId], map: "messages_senderId_clientMessageId_key")
   @@index([conversationId, createdAt])
   @@index([conversationId, createdAt, id])
   @@index([conversationId])
   @@index([receiverId])
   @@index([senderId])
   @@index([receiverId, status, createdAt])
+  @@index([conversationId, receiverId, status])
 }
 
 model notifications {
@@ -1865,7 +1866,7 @@ model OutboxEvent {
   aggregateId   String
   eventType     String
   queueName     String
-  idempotencyKey String?
+  idempotencyKey String?   @unique(map: "outbox_events_idempotencyKey_key")
   payload       Json
   status        String    @default("pending")
   attempts      Int       @default(0)
@@ -1878,7 +1879,6 @@ model OutboxEvent {
   @@index([status, availableAt, createdAt])
   @@index([queueName, status, createdAt])
   @@index([aggregateType, aggregateId, createdAt])
-  @@index([idempotencyKey])
   @@map("outbox_events")
 }
 

@@ -27,10 +27,48 @@ import {
 import {
   clampPageSize,
   createdAtDescKeysetWhere,
+  dateAscKeysetWhere,
   decodeKeysetCursor,
   decodeLegacyDateCursor,
   encodeKeysetCursor,
+  nullableDateDescIdAscWhere,
 } from '../utils/keyset-pagination.util';
+
+type ChatSyncSourceCursor = { t: string; id: string };
+type ChatSyncCursorState = {
+  messages: ChatSyncSourceCursor;
+  conversations: ChatSyncSourceCursor;
+};
+
+const CHAT_SYNC_SCOPE = 'chat.sync';
+const CHAT_SYNC_PAGE_SIZE = 200;
+
+function parseChatSyncState(cursor: ReturnType<typeof decodeKeysetCursor>): ChatSyncCursorState | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(cursor.id) as Partial<ChatSyncCursorState>;
+    const isSourceCursor = (value: unknown): value is ChatSyncSourceCursor => {
+      if (!value || typeof value !== 'object') return false;
+      const candidate = value as Partial<ChatSyncSourceCursor>;
+      return typeof candidate.t === 'string' && !Number.isNaN(new Date(candidate.t).getTime()) &&
+        typeof candidate.id === 'string';
+    };
+    if (!isSourceCursor(parsed.messages) || !isSourceCursor(parsed.conversations)) return null;
+    return { messages: parsed.messages, conversations: parsed.conversations };
+  } catch {
+    return null;
+  }
+}
+
+function encodeChatSyncState(state: ChatSyncCursorState): string {
+  const latestTimestamp = [state.messages.t, state.conversations.t]
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
+  return encodeKeysetCursor({
+    scope: CHAT_SYNC_SCOPE,
+    t: latestTimestamp,
+    id: JSON.stringify(state),
+  });
+}
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -229,14 +267,9 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
       ],
     };
 
-    if (cursor?.t) {
-      const cursorDate = new Date(cursor.t);
-      whereClause.AND = [{
-        OR: [
-          { lastMessageAt: { lt: cursorDate } },
-          { lastMessageAt: cursorDate, id: { lt: cursor.id } },
-        ],
-      }];
+    const keysetWhere = nullableDateDescIdAscWhere(cursor, 'lastMessageAt');
+    if (keysetWhere) {
+      whereClause.AND = [keysetWhere];
     } else if (legacyCursorDate) {
       whereClause.lastMessageAt = { lt: legacyCursorDate };
     }
@@ -259,7 +292,7 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
           },
         },
       },
-      orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'last' } }, { id: 'desc' }],
+      orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'last' } }, { id: 'asc' }],
       take: limit + 1,
     });
 
@@ -697,6 +730,203 @@ export const getConversation = async (req: AuthRequest, res: Response): Promise<
   } catch (error) {
     console.error('getConversation error:', error);
     res.status(500).json({ error: 'Failed to get conversation' });
+  }
+};
+
+export const syncChat = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const sinceValue = ensureString(req.query.since);
+    if (!sinceValue) {
+      const now = new Date().toISOString();
+      res.status(200).json({
+        messages: [],
+        statusChanges: [],
+        conversations: [],
+        cursor: encodeChatSyncState({
+          messages: { t: now, id: '' },
+          conversations: { t: now, id: '' },
+        }),
+        hasMore: false,
+      });
+      return;
+    }
+
+    const decodedCursor = decodeKeysetCursor(sinceValue, CHAT_SYNC_SCOPE);
+    const syncState = parseChatSyncState(decodedCursor);
+    if (!syncState) {
+      res.status(400).json({ error: 'Invalid chat sync cursor' });
+      return;
+    }
+
+    const messageCursorWhere = dateAscKeysetWhere(
+      { ...syncState.messages, scope: CHAT_SYNC_SCOPE },
+      'updatedAt'
+    );
+    const conversationCursorWhere = dateAscKeysetWhere(
+      { ...syncState.conversations, scope: CHAT_SYNC_SCOPE },
+      'updatedAt'
+    );
+
+    const [changedMessages, changedConversations] = await Promise.all([
+      prismaRead.messages.findMany({
+        where: {
+          AND: [
+            { OR: [{ senderId: userId }, { receiverId: userId }] },
+            ...(messageCursorWhere ? [messageCursorWhere] : []),
+          ],
+        },
+        include: {
+          message_reactions: true,
+          messages: {
+            select: { id: true, content: true, contentType: true, senderId: true },
+          },
+        },
+        orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+        take: CHAT_SYNC_PAGE_SIZE + 1,
+      }),
+      prismaRead.conversations.findMany({
+        where: {
+          AND: [
+            { OR: [{ participant1Id: userId }, { participant2Id: userId }] },
+            ...(conversationCursorWhere ? [conversationCursorWhere] : []),
+          ],
+        },
+        include: {
+          users_conversations_participant1IdTousers: { select: userSelect },
+          users_conversations_participant2IdTousers: { select: userSelect },
+          messages: {
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              content: true,
+              contentType: true,
+              senderId: true,
+              status: true,
+              createdAt: true,
+            },
+          },
+        },
+        orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+        take: CHAT_SYNC_PAGE_SIZE + 1,
+      }),
+    ]);
+
+    type SyncMarker = {
+      kind: 'message' | 'conversation';
+      id: string;
+      updatedAt: Date;
+      row: any;
+    };
+    const markers: SyncMarker[] = [
+      ...changedMessages.map((row) => ({ kind: 'message' as const, id: row.id, updatedAt: row.updatedAt, row })),
+      ...changedConversations.map((row) => ({ kind: 'conversation' as const, id: row.id, updatedAt: row.updatedAt, row })),
+    ].sort((left, right) =>
+      left.updatedAt.getTime() - right.updatedAt.getTime() ||
+      left.kind.localeCompare(right.kind) ||
+      left.id.localeCompare(right.id)
+    );
+
+    const selectedMarkers = markers.slice(0, CHAT_SYNC_PAGE_SIZE);
+    const selectedMessageRows = selectedMarkers
+      .filter((marker) => marker.kind === 'message')
+      .map((marker) => marker.row);
+    const selectedConversationRows = selectedMarkers
+      .filter((marker) => marker.kind === 'conversation')
+      .map((marker) => marker.row);
+    const viewerCanUseReadReceipts = await getReadReceiptVisibility(userId);
+    const senderLookup = await getChatUserLookup(
+      selectedMessageRows.map((message) => message.senderId)
+    );
+    const formattedChangedMessages = selectedMessageRows.map((message) =>
+      mapMessagePayload(
+        message,
+        senderLookup.get(message.senderId),
+        message.message_reactions,
+        { viewerUserId: userId, viewerCanUseReadReceipts }
+      )
+    );
+    const previousMessageTimestamp = Date.parse(syncState.messages.t);
+    const newMessages = formattedChangedMessages.filter(
+      (message) => Date.parse(message.createdAt) >= previousMessageTimestamp
+    );
+    const newMessageIds = new Set(newMessages.map((message) => message.id));
+    const statusChanges = formattedChangedMessages.filter((message) => !newMessageIds.has(message.id));
+
+    const conversationIds = selectedConversationRows.map((conversation) => conversation.id);
+    const unreadCounts = conversationIds.length
+      ? await prismaRead.messages.groupBy({
+          by: ['conversationId'],
+          where: {
+            conversationId: { in: conversationIds },
+            receiverId: userId,
+            status: { not: 'READ' },
+          },
+          _count: { _all: true },
+        })
+      : [];
+    const unreadCountMap = new Map(
+      unreadCounts.map((item) => [item.conversationId, item._count._all])
+    );
+    const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds(
+      selectedConversationRows.flatMap((conversation) => [conversation.participant1Id, conversation.participant2Id])
+    );
+    const formattedConversations = selectedConversationRows.map((conversation) => {
+      const participant1 = buildChatUserIdentity(
+        conversation.users_conversations_participant1IdTousers,
+        premiumVisibilityByUser
+      );
+      const participant2 = buildChatUserIdentity(
+        conversation.users_conversations_participant2IdTousers,
+        premiumVisibilityByUser
+      );
+      return {
+        id: conversation.id,
+        participant1Id: conversation.participant1Id,
+        participant2Id: conversation.participant2Id,
+        participant1,
+        participant2,
+        otherParticipant: conversation.participant1Id === userId ? participant2 : participant1,
+        lastMessage: maskLastMessagePayload(
+          conversation.messages[0],
+          userId,
+          viewerCanUseReadReceipts
+        ),
+        lastMessageAt: conversation.lastMessageAt?.toISOString() || null,
+        unreadCount: unreadCountMap.get(conversation.id) || 0,
+        createdAt: conversation.createdAt.toISOString(),
+        updatedAt: conversation.updatedAt.toISOString(),
+      };
+    });
+
+    const nextState: ChatSyncCursorState = {
+      messages: { ...syncState.messages },
+      conversations: { ...syncState.conversations },
+    };
+    selectedMarkers.forEach((marker) => {
+      const source = marker.kind === 'message' ? 'messages' : 'conversations';
+      nextState[source] = { t: marker.updatedAt.toISOString(), id: marker.id };
+    });
+    const hasMore = markers.length > CHAT_SYNC_PAGE_SIZE ||
+      changedMessages.length > CHAT_SYNC_PAGE_SIZE ||
+      changedConversations.length > CHAT_SYNC_PAGE_SIZE;
+
+    res.status(200).json({
+      messages: newMessages,
+      statusChanges,
+      conversations: formattedConversations,
+      cursor: encodeChatSyncState(nextState),
+      hasMore,
+    });
+  } catch (error) {
+    console.error('syncChat error:', error);
+    res.status(500).json({ error: 'Failed to synchronize chat changes' });
   }
 };
 

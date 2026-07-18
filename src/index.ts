@@ -83,6 +83,7 @@ import {
   getRedisHealth,
   isRedisEnabled,
   isRedisRequired,
+  redisCommand,
   redisPub,
   redisSub,
 } from './infrastructure/redis/client';
@@ -127,6 +128,10 @@ import { installProcessErrorHandlers } from './utils/process-error-handlers.util
 import { connectProximityRedis, closeProximityRedis } from './infrastructure/proximity/redis-client';
 import { closeProximityQueues } from './infrastructure/proximity/queues';
 import { mcpCorsHeaders, registerPublicDiscoveryMcp } from './mcp/public-discovery.mcp';
+import {
+  enqueuePendingDeliveryReconciliation,
+  reconcilePendingMessageDeliveries,
+} from './services/chat-delivery-reconciliation.service';
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -264,6 +269,131 @@ import { safetyErrorResponse } from './services/trust-safety.service';
 const userSockets = new Map<string, Set<string>>(); // userId -> Set of socketIds
 const socketUsers = new Map<string, string>(); // socketId -> userId
 const socketLocationUpdateTimestamps = new Map<string, number>();
+const chatPresenceRefreshTimers = new Map<string, NodeJS.Timeout>();
+const chatTypingBroadcastTimestamps = new Map<string, number>();
+const CHAT_PRESENCE_TTL_SECONDS = 90;
+const CHAT_TYPING_BROADCAST_INTERVAL_MS = 1_000;
+
+function chatPresenceKey(userId: string): string {
+  return `vormex:chat:presence:${userId}`;
+}
+
+async function registerSharedChatPresence(userId: string, socketId: string): Promise<boolean | null> {
+  if (!isRedisEnabled() || !redisCommand) return null;
+  const now = Date.now();
+  try {
+    const previousCount = await redisCommand.eval(
+      `redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+       local count = redis.call('ZCARD', KEYS[1])
+       redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+       redis.call('EXPIRE', KEYS[1], ARGV[4])
+       return count`,
+      1,
+      chatPresenceKey(userId),
+      now,
+      now + CHAT_PRESENCE_TTL_SECONDS * 1_000,
+      socketId,
+      CHAT_PRESENCE_TTL_SECONDS
+    );
+    return Number(previousCount) === 0;
+  } catch (error) {
+    logger.warn({ event: 'chat.presence.register_failed', userId, message: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
+}
+
+async function refreshSharedChatPresence(userId: string, socketId: string): Promise<void> {
+  if (!isRedisEnabled() || !redisCommand) return;
+  const now = Date.now();
+  await redisCommand
+    .multi()
+    .zadd(chatPresenceKey(userId), now + CHAT_PRESENCE_TTL_SECONDS * 1_000, socketId)
+    .expire(chatPresenceKey(userId), CHAT_PRESENCE_TTL_SECONDS)
+    .exec();
+}
+
+function startChatPresenceRefresh(userId: string, socketId: string): void {
+  if (!isRedisEnabled() || !redisCommand) return;
+  const existing = chatPresenceRefreshTimers.get(socketId);
+  if (existing) clearInterval(existing);
+  const timer = setInterval(() => {
+    void refreshSharedChatPresence(userId, socketId).catch((error) => {
+      logger.warn({ event: 'chat.presence.refresh_failed', userId, message: error instanceof Error ? error.message : String(error) });
+    });
+  }, (CHAT_PRESENCE_TTL_SECONDS * 1_000) / 3);
+  timer.unref();
+  chatPresenceRefreshTimers.set(socketId, timer);
+}
+
+async function unregisterSharedChatPresence(userId: string, socketId: string): Promise<boolean | null> {
+  const timer = chatPresenceRefreshTimers.get(socketId);
+  if (timer) clearInterval(timer);
+  chatPresenceRefreshTimers.delete(socketId);
+  if (!isRedisEnabled() || !redisCommand) return null;
+
+  try {
+    const remainingCount = await redisCommand.eval(
+      `redis.call('ZREM', KEYS[1], ARGV[1])
+       redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+       local count = redis.call('ZCARD', KEYS[1])
+       if count == 0 then redis.call('DEL', KEYS[1]) end
+       return count`,
+      1,
+      chatPresenceKey(userId),
+      socketId,
+      Date.now()
+    );
+    return Number(remainingCount) === 0;
+  } catch (error) {
+    logger.warn({ event: 'chat.presence.unregister_failed', userId, message: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
+}
+
+async function getSharedChatPresence(userId: string): Promise<boolean | null> {
+  if (!isRedisEnabled() || !redisCommand) return null;
+  try {
+    const count = await redisCommand.eval(
+      `redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+       return redis.call('ZCARD', KEYS[1])`,
+      1,
+      chatPresenceKey(userId),
+      Date.now()
+    );
+    return Number(count) > 0;
+  } catch {
+    return null;
+  }
+}
+
+async function allowChatTypingBroadcast(userId: string, conversationId: string): Promise<boolean> {
+  if (isRedisEnabled() && redisCommand) {
+    try {
+      const result = await redisCommand.set(
+        `vormex:chat:typing-rate:${userId}:${conversationId}`,
+        '1',
+        'PX',
+        CHAT_TYPING_BROADCAST_INTERVAL_MS,
+        'NX'
+      );
+      return result === 'OK';
+    } catch {
+      // Fall through to the bounded per-process limiter.
+    }
+  }
+
+  const key = `${userId}:${conversationId}`;
+  const now = Date.now();
+  const previous = chatTypingBroadcastTimestamps.get(key) || 0;
+  if (now - previous < CHAT_TYPING_BROADCAST_INTERVAL_MS) return false;
+  chatTypingBroadcastTimestamps.set(key, now);
+  if (chatTypingBroadcastTimestamps.size > 10_000) {
+    for (const [entryKey, timestamp] of chatTypingBroadcastTimestamps) {
+      if (now - timestamp > 60_000) chatTypingBroadcastTimestamps.delete(entryKey);
+    }
+  }
+  return true;
+}
 
 // Group chat online membership. Module-scoped so all sockets on this instance
 // share one view (it was previously declared per-connection, which made every
@@ -424,24 +554,16 @@ async function emitChatPresence(userId: string, isOnline: boolean): Promise<void
 // Mark every pending message to this user as delivered (WhatsApp-style double tick)
 // and tell each sender. Runs when the recipient's device comes online.
 async function markPendingMessagesDelivered(userId: string): Promise<void> {
-  const pending = await prisma.messages.groupBy({
-    by: ['conversationId', 'senderId'],
-    where: { receiverId: userId, status: 'SENT', isDeleted: false },
-  });
-  if (pending.length === 0) return;
-
-  const now = new Date();
-  await prisma.messages.updateMany({
-    where: { receiverId: userId, status: 'SENT', isDeleted: false },
-    data: { status: 'DELIVERED', deliveredAt: now, updatedAt: now },
-  });
-
-  for (const group of pending) {
+  const result = await reconcilePendingMessageDeliveries(userId);
+  for (const group of result.groups) {
     emitToUser(group.senderId, 'chat:messages_delivered', {
       conversationId: group.conversationId,
       deliveredTo: userId,
-      deliveredAt: now,
+      deliveredAt: result.deliveredAt,
     });
+  }
+  if (result.hasMore) {
+    await enqueuePendingDeliveryReconciliation(userId);
   }
 }
 
@@ -1143,11 +1265,14 @@ io.on('connection', async (socket) => {
   const userId = socket.data?.userId ? String(socket.data.userId) : null;
   if (userId) {
     socketUsers.set(socket.id, userId);
-    const wasOffline = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
+    const wasLocallyOffline = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
     if (!userSockets.has(userId)) {
       userSockets.set(userId, new Set());
     }
     userSockets.get(userId)!.add(socket.id);
+    const sharedWasOffline = await registerSharedChatPresence(userId, socket.id);
+    const wasOffline = sharedWasOffline ?? wasLocallyOffline;
+    startChatPresenceRefresh(userId, socket.id);
 
     // Join user's personal room for notifications
       socket.join(`user:${userId}`);
@@ -1633,6 +1758,7 @@ io.on('connection', async (socket) => {
     try {
       const peerId = await getConversationPeerId(targetConversationId, userId);
       if (!peerId) return;
+      if (!(await allowChatTypingBroadcast(userId, targetConversationId))) return;
 
       const payload = {
         conversationId: targetConversationId,
@@ -1641,8 +1767,11 @@ io.on('connection', async (socket) => {
         serverEmittedAtMs: Date.now(),
       };
 
-      socket.to(`chat:${targetConversationId}`).emit('chat:user_typing', payload);
-      emitToUser(peerId, 'chat:user_typing', payload);
+      // Socket.IO treats an array of rooms as a union, so a recipient joined
+      // to both the chat room and their personal room receives this once.
+      io.to([`chat:${targetConversationId}`, `user:${peerId}`])
+        .except(socket.id)
+        .emit('chat:user_typing', payload);
       logger.debug({
         event: 'chat.typing.emit',
         socketId: socket.id,
@@ -1917,9 +2046,11 @@ io.on('connection', async (socket) => {
       });
       if (!targetUser) return;
 
+      const sharedPresence = await getSharedChatPresence(targetUserId);
+
       socket.emit('user:status', {
         userId: targetUser.id,
-        isOnline: Boolean(targetUser.isOnline),
+        isOnline: sharedPresence ?? Boolean(targetUser.isOnline),
         lastActiveAt: targetUser.lastActiveAt ? targetUser.lastActiveAt.toISOString() : null,
       });
     } catch (error) {
@@ -2395,9 +2526,13 @@ io.on('connection', async (socket) => {
     if (userId) {
       // Remove from user sockets
       userSockets.get(userId)?.delete(socket.id);
-      if (userSockets.get(userId)?.size === 0) {
+      const isLocallyOffline = userSockets.get(userId)?.size === 0;
+      if (isLocallyOffline) {
         userSockets.delete(userId);
         socketLocationUpdateTimestamps.delete(userId);
+      }
+      void unregisterSharedChatPresence(userId, socket.id).then((isSharedOffline) => {
+        if (!(isSharedOffline ?? isLocallyOffline)) return;
         prisma.user.update({
           where: { id: userId },
           data: { isOnline: false, lastActiveAt: new Date() },
@@ -2410,7 +2545,7 @@ io.on('connection', async (socket) => {
         emitChatPresence(userId, false).catch((error) => {
           console.error('Failed to emit chat presence offline:', error);
         });
-      }
+      });
       socketUsers.delete(socket.id);
 
       // Update online counts for any groups
