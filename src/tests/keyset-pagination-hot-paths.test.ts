@@ -47,6 +47,11 @@ test('notifications and feed latest return signed keyset cursors without hot cou
   const feedBlock = functionBlock(postController, 'getFeed');
 
   assert.match(notificationListBlock, /decodeKeysetCursor\(cursorValue, 'notifications'\)/);
+  assert.match(notificationListBlock, /decodeKeysetCursor\(afterCursorValue, 'notifications'\)/);
+  assert.match(notificationListBlock, /dateAscKeysetWhere\(afterCursor, 'createdAt'\)/);
+  assert.match(notificationListBlock, /latestCursor: results\.length > 0/);
+  assert.match(notificationListBlock, /orderBy: isIncrementalRequest/);
+  assert.match(notificationListBlock, /hasMoreNewer: isIncrementalRequest && hasMore/);
   assert.match(notificationListBlock, /take: rawTake/);
   assert.match(notificationListBlock, /encodeKeysetCursor\(\{\s*scope: 'notifications'/s);
   assert.doesNotMatch(notificationListBlock, /\.count\(/);

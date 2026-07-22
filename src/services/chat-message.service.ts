@@ -1,14 +1,17 @@
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { prisma, prismaRead } from '../config/prisma';
-import { enqueueOutboxEvents } from '../outbox/service';
+import type { OutboxEventInput } from '../outbox/types';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
 import { TtlMemo } from '../infrastructure/cache/ttl-memo';
+import { logger } from '../lib/logger';
 import { getConversationPeerIdCached } from './chat-conversation-cache.service';
+import { pushNotificationService } from './push-notification.service';
 import {
-  assertUsersCanInteract,
+  assertUsersCanMessageCached,
   enforceTrustTierLimit,
+  getIdentityTrustLevelCached,
   publicTrustFields,
   safetyErrorResponse,
   trustLevelRank,
@@ -160,6 +163,25 @@ export const normalizeClientMessageId = (clientMessageId: unknown): string | nul
   return normalized ? normalized.slice(0, 128) : null;
 };
 
+export type ChatPushDeliveryMode = 'direct' | 'outbox';
+
+/**
+ * Local development commonly runs only the API process, without Redis-backed
+ * workers. Deliver chat pushes directly there so background notifications keep
+ * working. Production keeps the transactional outbox as the durable default.
+ */
+export function resolveChatPushDeliveryMode(
+  configuredMode = process.env.CHAT_PUSH_DELIVERY_MODE,
+  nodeEnv = process.env.NODE_ENV
+): ChatPushDeliveryMode {
+  const normalizedMode = configuredMode?.trim().toLowerCase();
+  if (normalizedMode === 'direct' || normalizedMode === 'outbox') {
+    return normalizedMode;
+  }
+
+  return nodeEnv === 'production' ? 'outbox' : 'direct';
+}
+
 function normalizeOptionalString(value: unknown): string | null {
   if (value === undefined || value === null) {
     return null;
@@ -246,6 +268,23 @@ export async function getReadReceiptVisibilityCached(userId: string): Promise<bo
 
 export async function getChatSenderPayloadCached(senderId: string): Promise<ChatSenderPayload | null> {
   return senderPayloadMemo.get(senderId, () => getSenderPayload(senderId));
+}
+
+/**
+ * Warm remote-DB lookups while a user is already reading/typing in the chat,
+ * before the send button is pressed. The send path still awaits and enforces
+ * every check; it simply reuses the same short-lived promises/results.
+ */
+export async function warmChatSendPath(conversationId: string, senderId: string): Promise<void> {
+  const receiverId = await getConversationPeerIdCached(conversationId, senderId);
+  if (!receiverId) return;
+
+  await Promise.all([
+    assertUsersCanMessageCached(senderId, receiverId),
+    getIdentityTrustLevelCached(senderId),
+    getChatSenderPayloadCached(senderId),
+    getReadReceiptVisibilityCached(senderId),
+  ]);
 }
 
 export function invalidateChatIdentityCache(userId: string): void {
@@ -431,7 +470,7 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
   // high-latency DB link that alone added seconds. Safety checks stay live,
   // identity/premium lookups are memoized, and everything runs concurrently.
   const [, , sender, viewerCanUseReadReceipts, replyToMessage] = await Promise.all([
-    assertUsersCanInteract(senderId, receiverId, 'message'),
+    assertUsersCanMessageCached(senderId, receiverId),
     enforceTrustTierLimit(senderId, 'dm'),
     getChatSenderPayloadCached(senderId),
     getReadReceiptVisibilityCached(senderId),
@@ -463,128 +502,222 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Send
       ? normalizedContent.substring(0, 97) + '...'
       : normalizedContent
     : 'Sent you a message';
+  const pushDeliveryMode = resolveChatPushDeliveryMode();
+
+  const message = mapChatMessagePayload({
+    message: {
+      id: messageId,
+      clientMessageId,
+      conversationId,
+      senderId,
+      receiverId,
+      content: normalizedContent,
+      contentType: normalizedContentType,
+      mediaUrl: normalizedMediaUrl,
+      mediaType: normalizedMediaType,
+      fileName: normalizedFileName,
+      fileSize: normalizedFileSize,
+      status: 'SENT',
+      deliveredAt: null,
+      readAt: null,
+      editedAt: null,
+      isDeleted: false,
+      replyToId: replyToMessageId,
+      messages: replyToMessage,
+      createdAt: now,
+      updatedAt: now,
+    },
+    sender,
+    viewerUserId: senderId,
+    viewerCanUseReadReceipts,
+  });
+
+  const realtimeEnvelopes = buildRealtimeEnvelopes({
+    conversationId,
+    message,
+    receiverId,
+    sender,
+    senderId,
+  });
+  const cacheTags = conversationCacheTags(conversationId, senderId, receiverId);
+
+  const outboxEvents: OutboxEventInput[] = [
+    {
+      aggregateType: 'message',
+      aggregateId: messageId,
+      eventType: 'chat.message.created',
+      queueName: queueNames.realtimeFanout,
+      idempotencyKey: `chat:realtime:${messageId}`,
+      payload: { envelopes: realtimeEnvelopes },
+    },
+  ];
+
+  if (pushDeliveryMode === 'outbox') {
+    outboxEvents.push({
+      aggregateType: 'message',
+      aggregateId: messageId,
+      eventType: 'chat.message.push',
+      queueName: queueNames.notificationDelivery,
+      idempotencyKey: `chat:push:${messageId}`,
+      payload: {
+        kind: 'new_message',
+        userId: receiverId,
+        title: sender?.name || sender?.username || 'Someone',
+        body: preview,
+        conversationId,
+        senderId,
+        senderName: sender?.name || sender?.username || 'Someone',
+        senderImage: sender?.profileImage || undefined,
+        messageId,
+        clientMessageId: clientMessageId || undefined,
+        messageContent: normalizedContent,
+        contentType: normalizedContentType,
+        mediaUrl: normalizedMediaUrl || undefined,
+        mediaType: normalizedMediaType || undefined,
+        fileName: normalizedFileName || undefined,
+        fileSize: normalizedFileSize || undefined,
+        messageCreatedAt: now.toISOString(),
+        messageUpdatedAt: now.toISOString(),
+      },
+    });
+  }
+
+  outboxEvents.push({
+    aggregateType: 'conversation',
+    aggregateId: conversationId,
+    eventType: 'chat.cache.invalidate',
+    queueName: queueNames.cacheInvalidation,
+    idempotencyKey: `chat:cache:${messageId}`,
+    payload: { tags: cacheTags },
+  });
 
   try {
-    return await prisma.$transaction(async (tx) => {
-      await tx.messages.create({
-        data: {
-          id: messageId,
-          clientMessageId,
-          conversationId,
-          senderId,
-          receiverId,
-          content: normalizedContent,
-          contentType: normalizedContentType,
-          mediaUrl: normalizedMediaUrl,
-          mediaType: normalizedMediaType,
-          fileName: normalizedFileName,
-          fileSize: normalizedFileSize,
-          replyToId: replyToMessageId,
-          status: 'SENT',
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
+    const outboxRows = outboxEvents.map((event) => Prisma.sql`(
+      ${randomUUID()},
+      ${event.aggregateType},
+      ${event.aggregateId},
+      ${event.eventType},
+      ${event.queueName},
+      ${event.idempotencyKey || null},
+      ${JSON.stringify(event.payload)}::jsonb,
+      ${event.availableAt || now},
+      ${now}
+    )`);
 
-      await tx.conversations.update({
-        where: { id: conversationId },
-        data: { lastMessageAt: now, updatedAt: now },
-      });
+    // One data-modifying CTE is one atomic PostgreSQL statement. This keeps
+    // the durability guarantee of the previous interactive transaction while
+    // avoiding several serial network round-trips to a remote database.
+    await prisma.$executeRaw(Prisma.sql`
+      WITH inserted_message AS (
+        INSERT INTO "messages" (
+          "id",
+          "clientMessageId",
+          "conversationId",
+          "senderId",
+          "receiverId",
+          "content",
+          "contentType",
+          "mediaUrl",
+          "mediaType",
+          "fileName",
+          "fileSize",
+          "status",
+          "replyToId",
+          "createdAt",
+          "updatedAt"
+        ) VALUES (
+          ${messageId},
+          ${clientMessageId},
+          ${conversationId},
+          ${senderId},
+          ${receiverId},
+          ${normalizedContent},
+          ${normalizedContentType},
+          ${normalizedMediaUrl},
+          ${normalizedMediaType},
+          ${normalizedFileName},
+          ${normalizedFileSize},
+          'SENT',
+          ${replyToMessageId},
+          ${now},
+          ${now}
+        )
+        RETURNING "id"
+      ),
+      inserted_outbox AS (
+        INSERT INTO "outbox_events" (
+          "id",
+          "aggregateType",
+          "aggregateId",
+          "eventType",
+          "queueName",
+          "idempotencyKey",
+          "payload",
+          "availableAt",
+          "updatedAt"
+        )
+        VALUES ${Prisma.join(outboxRows)}
+        ON CONFLICT ("idempotencyKey")
+        WHERE "idempotencyKey" IS NOT NULL
+        DO NOTHING
+        RETURNING "id"
+      )
+      UPDATE "conversations"
+      SET "lastMessageAt" = ${now}, "updatedAt" = ${now}
+      WHERE "id" = ${conversationId}
+        AND EXISTS (SELECT 1 FROM inserted_message)
+        AND (SELECT COUNT(*) FROM inserted_outbox) >= 0
+    `);
 
-      const message = mapChatMessagePayload({
-        message: {
-          id: messageId,
-          clientMessageId,
-          conversationId,
-          senderId,
-          receiverId,
-          content: normalizedContent,
-          contentType: normalizedContentType,
-          mediaUrl: normalizedMediaUrl,
-          mediaType: normalizedMediaType,
-          fileName: normalizedFileName,
-          fileSize: normalizedFileSize,
-          status: 'SENT',
-          deliveredAt: null,
-          readAt: null,
-          editedAt: null,
-          isDeleted: false,
-          replyToId: replyToMessageId,
-          messages: replyToMessage,
-          createdAt: now,
-          updatedAt: now,
-        },
-        sender,
-        viewerUserId: senderId,
-        viewerCanUseReadReceipts,
-      });
+    const result = {
+      conversationId,
+      receiverId,
+      message,
+      realtimeEnvelopes,
+      wasDuplicate: false,
+    };
 
-      const realtimeEnvelopes = buildRealtimeEnvelopes({
-        conversationId,
-        message,
-        receiverId,
-        sender,
-        senderId,
-      });
-      const cacheTags = conversationCacheTags(conversationId, senderId, receiverId);
-
-      await enqueueOutboxEvents(tx, [
+    if (pushDeliveryMode === 'direct') {
+      void pushNotificationService.pushNewMessage(
+        result.receiverId,
+        result.message.sender.name || result.message.sender.username || 'Someone',
+        preview,
+        result.conversationId,
+        result.message.senderId,
+        result.message.sender.profileImage || undefined,
         {
-          aggregateType: 'message',
-          aggregateId: messageId,
-          eventType: 'chat.message.created',
-          queueName: queueNames.realtimeFanout,
-          idempotencyKey: `chat:realtime:${messageId}`,
-          payload: { envelopes: realtimeEnvelopes },
-        },
-        {
-          aggregateType: 'message',
-          aggregateId: messageId,
-          eventType: 'chat.message.push',
-          queueName: queueNames.notificationDelivery,
-          idempotencyKey: `chat:push:${messageId}`,
-          payload: {
-            kind: 'new_message',
-            userId: receiverId,
-            title: sender?.name || sender?.username || 'Someone',
-            body: preview,
-            conversationId,
-            senderId,
-            senderName: sender?.name || sender?.username || 'Someone',
-            senderImage: sender?.profileImage || undefined,
-            messageId,
-            clientMessageId: clientMessageId || undefined,
-            messageContent: normalizedContent,
-            contentType: normalizedContentType,
-            mediaUrl: normalizedMediaUrl || undefined,
-            mediaType: normalizedMediaType || undefined,
-            fileName: normalizedFileName || undefined,
-            fileSize: normalizedFileSize || undefined,
-            messageCreatedAt: now.toISOString(),
-            messageUpdatedAt: now.toISOString(),
-          },
-        },
-        {
-          aggregateType: 'conversation',
-          aggregateId: conversationId,
-          eventType: 'chat.cache.invalidate',
-          queueName: queueNames.cacheInvalidation,
-          idempotencyKey: `chat:cache:${messageId}`,
-          payload: { tags: cacheTags },
-        },
-      ]);
+          id: result.message.id,
+          clientMessageId: result.message.clientMessageId,
+          content: result.message.content,
+          contentType: result.message.contentType,
+          mediaUrl: result.message.mediaUrl,
+          mediaType: result.message.mediaType,
+          fileName: result.message.fileName,
+          fileSize: result.message.fileSize,
+          createdAt: result.message.createdAt,
+          updatedAt: result.message.updatedAt,
+        }
+      ).then((sent) => {
+        if (!sent) {
+          logger.warn({
+            event: 'chat.message.direct_push_failed',
+            messageId: result.message.id,
+            conversationId: result.conversationId,
+            receiverId: result.receiverId,
+          });
+        }
+      }).catch((error) => {
+        logger.error({
+          event: 'chat.message.direct_push_error',
+          messageId: result.message.id,
+          conversationId: result.conversationId,
+          receiverId: result.receiverId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
 
-      return {
-        conversationId,
-        receiverId,
-        message,
-        realtimeEnvelopes,
-        wasDuplicate: false,
-      };
-    }, {
-      maxWait: 15_000,
-      timeout: 15_000,
-    });
+    return result;
   } catch (error) {
     if (clientMessageId && isPrismaUniqueViolation(error)) {
       const existing = await getExistingMessageResult({

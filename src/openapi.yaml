@@ -66,6 +66,10 @@ tags:
     description: System health and status
   - name: Crossed Paths
     description: Privacy-safe Event Mode, foreground presence, live discovery, and seven-day encounter history
+  - name: Recommendations
+    description: Server-owned ranking sessions, qualified viewport telemetry, feedback, and privacy preferences
+  - name: Premium Post Boosts
+    description: Premium creator post-boost credits, campaigns, and analytics
 
 components:
   securitySchemes:
@@ -131,6 +135,55 @@ components:
       properties:
         message:
           type: string
+
+    RecommendationEvent:
+      type: object
+      additionalProperties: false
+      required: [eventId, eventType, recommendationSessionId, surface, entityType, entityId, occurredAt]
+      properties:
+        eventId: { type: string, format: uuid }
+        eventType: { type: string, enum: [VISIBILITY, PLAYBACK, STORY_VIEW, EXPAND, DETAIL_OPEN, PROFILE_OPEN, SKIP] }
+        recommendationSessionId: { type: string, format: uuid }
+        requestId: { type: string, format: uuid }
+        surface: { type: string, enum: [HOME, REELS, STORIES, PEOPLE, JOBS, EVENTS] }
+        entityType: { type: string, enum: [POST, REEL, STORY, PERSON, JOB, EVENT] }
+        entityId: { type: string }
+        reportedPosition: { type: integer, minimum: 1, description: Integrity comparison only; canonical position comes from the server snapshot. }
+        maxVisibleFraction: { type: number, minimum: 0, maximum: 1 }
+        visibleTimeMs: { type: integer, minimum: 0 }
+        playbackTimeMs: { type: integer, minimum: 0 }
+        mediaDurationMs: { type: integer, minimum: 0 }
+        occurredAt: { type: string, format: date-time }
+
+    RecommendationPreferences:
+      type: object
+      properties:
+        personalizedRecommendationsEnabled: { type: boolean, default: true }
+        activityRecommendationsEnabled: { type: boolean, default: true }
+
+    RecommendationFeedback:
+      type: object
+      required: [action, entityType, entityId]
+      properties:
+        action: { type: string, enum: [NOT_INTERESTED, HIDE_AUTHOR, UNDO] }
+        entityType: { type: string, enum: [POST, REEL, STORY, PERSON, JOB, EVENT] }
+        entityId: { type: string }
+        authorId: { type: string }
+        feedbackType: { type: string, enum: [NOT_INTERESTED, HIDE_AUTHOR], description: Required by UNDO when undoing hidden-author feedback. }
+
+    PostBoostCampaign:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        postId: { type: string, format: uuid }
+        status: { type: string, enum: [active, paused, completed, cancelled] }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        impressions: { type: integer, minimum: 0 }
+        clicks: { type: integer, minimum: 0 }
+        meaningfulActions: { type: integer, minimum: 0 }
+        negativeFeedback: { type: integer, minimum: 0 }
+        pauseReason: { type: [string, 'null'] }
 
     User:
       type: object
@@ -602,6 +655,144 @@ components:
           nullable: true
 
 paths:
+  /discovery/events:
+    post:
+      tags: [Recommendations]
+      summary: Ingest idempotent recommendation viewport events
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items: { $ref: '#/components/schemas/RecommendationEvent' }
+      responses:
+        '202':
+          description: Batch processed; invalid events are counted rather than retried.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer, minimum: 0 }
+                  duplicate: { type: integer, minimum: 0 }
+                  rejected: { type: integer, minimum: 0 }
+        '400': { description: Invalid batch, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /discovery/feedback:
+    post:
+      tags: [Recommendations]
+      summary: Exclude an item or author, or undo feedback
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecommendationFeedback' }
+      responses:
+        '200':
+          description: Feedback state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+                  feedbackType: { type: string }
+
+  /discovery/preferences:
+    get:
+      tags: [Recommendations]
+      summary: Read recommendation and public-activity preferences
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Current preferences
+          content: { application/json: { schema: { $ref: '#/components/schemas/RecommendationPreferences' } } }
+    patch:
+      tags: [Recommendations]
+      summary: Update one or both recommendation preferences
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RecommendationPreferences' } } }
+      responses:
+        '200':
+          description: Updated preferences
+          content: { application/json: { schema: { $ref: '#/components/schemas/RecommendationPreferences' } } }
+
+  /premium/post-boosts/credits:
+    get:
+      tags: [Premium Post Boosts]
+      summary: Get the current non-rollover Premium credit window
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Credit balance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  creditsGranted: { type: integer }
+                  creditsConsumed: { type: integer }
+                  creditsRemaining: { type: integer }
+                  windowStartsAt: { type: string, format: date-time }
+                  windowEndsAt: { type: string, format: date-time }
+
+  /premium/post-boosts:
+    get:
+      tags: [Premium Post Boosts]
+      summary: List the creator's boost campaigns and analytics
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Campaigns
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaigns: { type: array, items: { $ref: '#/components/schemas/PostBoostCampaign' } }
+    post:
+      tags: [Premium Post Boosts]
+      summary: Atomically consume a credit and start a 24-hour post boost
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [postId]
+              properties: { postId: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Campaign created
+          content: { application/json: { schema: { $ref: '#/components/schemas/PostBoostCampaign' } } }
+
+  /premium/post-boosts/{campaignId}/cancel:
+    post:
+      tags: [Premium Post Boosts]
+      summary: Cancel an active campaign without refund after delivery begins
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: campaignId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Cancelled campaign
+          content: { application/json: { schema: { $ref: '#/components/schemas/PostBoostCampaign' } } }
+
   /proximity/v1/capabilities:
     get:
       tags: [Crossed Paths]

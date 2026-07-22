@@ -12,6 +12,7 @@ import {
   saveJob,
   unsaveJob,
   getSavedJobs,
+  getRecommendedJobs,
 } from '../controllers/jobs.controller';
 
 const router = Router();
@@ -26,6 +27,7 @@ router.get('/types', getJobTypes);
 // Protected routes
 router.get('/applications/me', authenticate, getMyApplications);
 router.get('/saved', authenticate, getSavedJobs);
+router.get('/recommended', authenticate, getRecommendedJobs);
 
 router.get('/:slug', getJob);
 

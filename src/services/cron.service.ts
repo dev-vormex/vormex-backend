@@ -8,8 +8,37 @@ import { socialProofService } from './social-proof.service';
 import { storyService } from './story.service';
 import { runSavedDiscoverySearchDigest } from './discovery-power.service';
 import { runHighQualityMatchDigest } from './match-availability-notification.service';
+import {
+  aggregateRecommendationEvents,
+  seedSocialCascadeAudiences,
+  trainRecommendationModels,
+  updateCascadeStates,
+} from './recommendation-learning.service';
+import { reindexRecommendationDocuments } from './recommendation-embedding.service';
+import { cleanupRecommendationData } from './recommendation-platform.service';
+import { maintainPostBoostCampaigns } from './premium-post-boost.service';
 
 export const maintenanceSchedules = [
+  {
+    schedulerId: 'recommendation_event_aggregation',
+    jobName: 'recommendation_event_aggregation',
+    pattern: '*/15 * * * *',
+  },
+  {
+    schedulerId: 'recommendation_embedding_reindex',
+    jobName: 'recommendation_embedding_reindex',
+    pattern: '7 */1 * * *',
+  },
+  {
+    schedulerId: 'recommendation_model_training',
+    jobName: 'recommendation_model_training',
+    pattern: '30 20 * * *',
+  },
+  {
+    schedulerId: 'recommendation_data_cleanup',
+    jobName: 'recommendation_data_cleanup',
+    pattern: '15 21 * * *',
+  },
   {
     schedulerId: 'reengagement_campaign_hourly',
     jobName: 'reengagement_campaign_hourly',
@@ -169,6 +198,22 @@ async function runStreakReminders(): Promise<{ sent: number }> {
 
 export async function runMaintenanceJob(jobName: MaintenanceJobName): Promise<unknown> {
   switch (jobName) {
+    case 'recommendation_event_aggregation':
+      await aggregateRecommendationEvents();
+      return {
+        socialCascade: await seedSocialCascadeAudiences(),
+        cascade: await updateCascadeStates(),
+        boosts: await maintainPostBoostCampaigns(),
+      };
+    case 'recommendation_embedding_reindex':
+      return reindexRecommendationDocuments();
+    case 'recommendation_model_training':
+      if (process.env.RECOMMENDATION_SHADOW_MODEL_ENABLED !== 'true') {
+        return { skipped: true, reason: 'recommendation_shadow_model_disabled' };
+      }
+      return trainRecommendationModels();
+    case 'recommendation_data_cleanup':
+      return cleanupRecommendationData();
     case 'reengagement_campaign_hourly':
       return runReengagementCampaign();
     case 'streak_freeze_processing':

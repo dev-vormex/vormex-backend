@@ -6,6 +6,7 @@ import { collapseInboxNotifications, notificationService } from '../services/not
 import {
   clampPageSize,
   createdAtDescKeysetWhere,
+  dateAscKeysetWhere,
   decodeKeysetCursor,
   decodeLegacyDateCursor,
   encodeKeysetCursor,
@@ -67,6 +68,8 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
 
     const cursorValue = ensureString(req.query.cursor);
     const cursor = decodeKeysetCursor(cursorValue, 'notifications');
+    const afterCursorValue = ensureString(req.query.afterCursor);
+    const afterCursor = decodeKeysetCursor(afterCursorValue, 'notifications');
     const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
     const limit = clampPageSize(req.query.limit, 20, 50);
     const unreadOnly = req.query.unreadOnly === 'true';
@@ -77,36 +80,51 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
       whereClause.isRead = false;
     }
     
+    const newerWhere = dateAscKeysetWhere(afterCursor, 'createdAt');
     const cursorWhere = createdAtDescKeysetWhere(cursor);
-    if (cursorWhere) {
+    if (newerWhere) {
+      whereClause.AND = [newerWhere];
+    } else if (cursorWhere) {
       whereClause.AND = [cursorWhere];
     } else if (legacyCursorDate) {
       whereClause.createdAt = { lt: legacyCursorDate };
     }
 
     const rawTake = Math.min(limit * 3, 150) + 1;
+    const isIncrementalRequest = !!newerWhere;
     const notifications = await prisma.notifications.findMany({
       where: whereClause,
       include: notificationInclude,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      orderBy: isIncrementalRequest
+        ? [{ createdAt: 'asc' }, { id: 'asc' }]
+        : [{ createdAt: 'desc' }, { id: 'desc' }],
       take: rawTake,
     });
 
     const collapsedNotifications = collapseInboxNotifications(notifications);
     const hasMore = collapsedNotifications.length > limit;
-    const results = hasMore ? collapsedNotifications.slice(0, limit) : collapsedNotifications;
+    const pageResults = hasMore ? collapsedNotifications.slice(0, limit) : collapsedNotifications;
+    const results = isIncrementalRequest ? pageResults.reverse() : pageResults;
     const formatted = results.map(formatNotification);
 
     res.json({
       notifications: formatted,
-      nextCursor: hasMore && results.length > 0
+      latestCursor: results.length > 0
+        ? encodeKeysetCursor({
+            scope: 'notifications',
+            t: results[0].createdAt.toISOString(),
+            id: results[0].id,
+          })
+        : null,
+      nextCursor: !isIncrementalRequest && hasMore && results.length > 0
         ? encodeKeysetCursor({
             scope: 'notifications',
             t: results[results.length - 1].createdAt.toISOString(),
             id: results[results.length - 1].id,
           })
         : null,
-      hasMore,
+      hasMore: !isIncrementalRequest && hasMore,
+      hasMoreNewer: isIncrementalRequest && hasMore,
     });
   } catch (error) {
     console.error('Failed to fetch notifications:', error);

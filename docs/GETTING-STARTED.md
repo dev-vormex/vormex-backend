@@ -43,7 +43,7 @@ JWT_SECRET="replace-with-at-least-32-random-bytes"
 AUTH_CSRF_SECRET="replace-with-a-different-32-byte-random-secret"
 AUTH_ACCESS_TOKEN_TTL="365d"
 AUTH_REFRESH_TOKEN_TTL_SECONDS=31536000
-AUTH_PASSWORD_MIN_LENGTH=12
+AUTH_PASSWORD_MIN_LENGTH=6
 
 # GitHub OAuth
 GITHUB_CLIENT_ID="your-github-client-id"

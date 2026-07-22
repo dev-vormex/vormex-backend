@@ -2563,6 +2563,229 @@ model trending_items {
   @@index([type, isActive])
 }
 
+model recommendation_events {
+  id                    String   @id @default(uuid())
+  eventId               String   @unique
+  userId                String
+  eventType             String
+  surface               String
+  entityType            String
+  entityId              String
+  requestId             String?
+  recommendationSessionId String?
+  reportedPosition      Int?
+  position              Int?
+  maxVisibleFraction    Float?
+  visibleTimeMs         Int?
+  playbackTimeMs        Int?
+  mediaDurationMs       Int?
+  occurredAt            DateTime
+  receivedAt            DateTime @default(now())
+  qualifiedExposure     Boolean  @default(false)
+  cascadeEngagement     Boolean  @default(false)
+  qualifiedPositive     Boolean  @default(false)
+  meaningfulOutcome     Boolean  @default(false)
+  isBoosted             Boolean  @default(false)
+  rankerVersion         String?
+  experimentVariant     String?
+  examinationPropensity Float?
+  metadata              Json?
+
+  @@index([userId, occurredAt])
+  @@index([recommendationSessionId, entityType, entityId])
+  @@index([surface, eventType, occurredAt])
+  @@index([entityType, entityId, occurredAt])
+  @@index([qualifiedExposure, isBoosted, occurredAt])
+  @@map("recommendation_events")
+}
+
+model recommendation_feedback {
+  id          String   @id @default(uuid())
+  userId      String
+  entityType  String
+  entityId    String
+  authorId    String?
+  feedbackType String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, entityType, entityId, feedbackType])
+  @@index([userId, isActive, updatedAt])
+  @@index([userId, authorId, isActive])
+  @@map("recommendation_feedback")
+}
+
+model recommendation_user_profiles {
+  id                                  String   @id @default(uuid())
+  userId                              String   @unique
+  personalizedRecommendationsEnabled Boolean  @default(true)
+  activityRecommendationsEnabled     Boolean  @default(true)
+  interactionCount                    Int      @default(0)
+  positiveVector                      Unsupported("vector(1536)")?
+  negativeVector                      Unsupported("vector(1536)")?
+  vectorContentHash                   String?
+  vectorUpdatedAt                     DateTime?
+  featureState                        Json?
+  createdAt                           DateTime @default(now())
+  updatedAt                           DateTime @updatedAt
+
+  @@index([vectorUpdatedAt])
+  @@map("recommendation_user_profiles")
+}
+
+model recommendation_item_daily_stats {
+  id                        String   @id @default(uuid())
+  day                       DateTime @db.Date
+  surface                   String
+  entityType                String
+  entityId                  String
+  organicImpressions        Int      @default(0)
+  organicCascadeEngagements Int      @default(0)
+  organicQualifiedPositives Int      @default(0)
+  organicMeaningfulOutcomes Int      @default(0)
+  organicNegativeFeedback   Int      @default(0)
+  boostedImpressions        Int      @default(0)
+  boostedClicks             Int      @default(0)
+  boostedMeaningfulOutcomes Int      @default(0)
+  trailingEngagementAlpha   Float    @default(0)
+  trailingEngagementBeta    Float    @default(0)
+  independentReactors       Int      @default(0)
+  updatedAt                 DateTime @updatedAt
+
+  @@unique([day, surface, entityType, entityId])
+  @@index([surface, day])
+  @@index([entityType, entityId, day])
+  @@map("recommendation_item_daily_stats")
+}
+
+model recommendation_models {
+  id                 String   @id @default(uuid())
+  surface            String
+  head               String
+  version            String
+  status             String   @default("shadow")
+  featureSchema      Json
+  coefficients       Json
+  priors             Json
+  thresholds         Json
+  trainingImpressions Int     @default(0)
+  positiveLabels     Int      @default(0)
+  trainedAt          DateTime?
+  activatedAt        DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([surface, head, version])
+  @@index([surface, head, status, createdAt])
+  @@map("recommendation_models")
+}
+
+model recommendation_sessions {
+  id                String   @id @default(uuid())
+  userId            String
+  surface           String
+  requestId         String
+  snapshotAt        DateTime
+  expiresAt         DateTime
+  validationUntil   DateTime
+  rankerVersion     String
+  experimentVariant String
+  orderedItems      Json
+  modulePlacements  Json?
+  createdAt         DateTime @default(now())
+
+  @@unique([requestId])
+  @@index([userId, surface, createdAt])
+  @@index([expiresAt])
+  @@index([validationUntil])
+  @@map("recommendation_sessions")
+}
+
+model recommendation_cascade_states {
+  id                         String   @id @default(uuid())
+  surface                    String
+  entityType                 String
+  entityId                   String
+  wave                       Int      @default(0)
+  qualifiedImpressions       Int      @default(0)
+  cascadeEngagements         Int      @default(0)
+  meaningfulOutcomes         Int      @default(0)
+  independentReactors        Int      @default(0)
+  releasedViewerCount        Int      @default(0)
+  trailingWeightedSuccesses  Float    @default(0)
+  trailingWeightedFailures   Float    @default(0)
+  lastImpressionSequence     Int      @default(0)
+  status                     String   @default("active")
+  stopReason                 String?
+  lastEvaluatedAt            DateTime?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  @@unique([surface, entityType, entityId])
+  @@index([status, updatedAt])
+  @@map("recommendation_cascade_states")
+}
+
+model recommendation_cascade_deliveries {
+  id            String   @id @default(uuid())
+  surface       String
+  entityType    String
+  entityId      String
+  viewerId      String
+  sourceActorId String?
+  wave          Int
+  batch         Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  @@unique([surface, entityType, entityId, viewerId])
+  @@index([viewerId, surface, createdAt])
+  @@index([surface, entityType, entityId, wave])
+  @@index([sourceActorId, createdAt])
+  @@map("recommendation_cascade_deliveries")
+}
+
+model premium_boost_credit_windows {
+  id              String   @id @default(uuid())
+  userId          String
+  entitlementKey  String
+  windowStartsAt  DateTime
+  windowEndsAt    DateTime
+  creditsGranted  Int      @default(2)
+  creditsConsumed Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([userId, entitlementKey])
+  @@index([userId, windowEndsAt])
+  @@map("premium_boost_credit_windows")
+}
+
+model premium_post_boost_campaigns {
+  id                       String   @id @default(uuid())
+  userId                   String
+  postId                   String
+  creditWindowId           String
+  status                   String   @default("active")
+  startsAt                 DateTime @default(now())
+  endsAt                   DateTime
+  targeting                Json?
+  impressionsCount         Int      @default(0)
+  clicksCount              Int      @default(0)
+  meaningfulActionsCount   Int      @default(0)
+  negativeFeedbackCount    Int      @default(0)
+  pauseReason              String?
+  deliveredFirstImpressionAt DateTime?
+  cancelledAt              DateTime?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@index([userId, status, endsAt])
+  @@index([postId, status, endsAt])
+  @@index([status, startsAt, endsAt])
+  @@map("premium_post_boost_campaigns")
+}
+
 model trivia_attempts {
   id            String   @id @default(uuid())
   userId        String

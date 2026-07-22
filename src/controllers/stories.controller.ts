@@ -15,6 +15,7 @@ import {
   enforceTrustTierLimit,
   safetyErrorResponse,
 } from '../services/trust-safety.service';
+import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -170,7 +171,23 @@ export const getStoriesFeed = async (req: AuthRequest, res: Response): Promise<v
         return new Date(b.lastStoryAt).getTime() - new Date(a.lastStoryAt).getTime();
       });
 
-    res.json({ storyGroups });
+    const decorated = await decorateSurfaceRecommendations({
+      userId: currentUserId,
+      surface: 'STORIES',
+      entityType: 'STORY',
+      items: storyGroups,
+      idOf: (group: any) => String(group.stories?.[0]?.id || group.user?.id),
+      authorIdOf: (group: any) => group.user?.id,
+      createdAtOf: (group: any) => group.lastStoryAt,
+      pageSize: storyGroups.length || 1,
+    });
+    res.json({
+      storyGroups: decorated.items,
+      recommendationSessionId: decorated.recommendationSessionId,
+      requestId: decorated.requestId,
+      rankerVersion: decorated.rankerVersion,
+      experimentVariant: decorated.experimentVariant,
+    });
   } catch (error) {
     console.error('getStoriesFeed error:', error);
     res.status(500).json({ error: 'Failed to fetch stories feed' });

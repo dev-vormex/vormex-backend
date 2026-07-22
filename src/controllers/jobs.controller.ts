@@ -12,6 +12,8 @@ import {
   queryText,
   routeParam,
 } from '../data/growth-hub.catalog';
+import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
+import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -142,6 +144,32 @@ export const getJobs = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
+export const getRecommendedJobs = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = String(req.user?.userId || '');
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    const limit = clampLimit(req.query.limit, 20, 50);
+    const decorated = await decorateSurfaceRecommendations({
+      userId,
+      surface: 'JOBS',
+      entityType: 'JOB',
+      items: filteredJobs(req).map(serializeJob),
+      pageSize: limit,
+    });
+    res.json({
+      jobs: decorated.items,
+      recommendationSessionId: decorated.recommendationSessionId,
+      requestId: decorated.requestId,
+      rankerVersion: decorated.rankerVersion,
+      experimentVariant: decorated.experimentVariant,
+      nextCursor: decorated.recommendationNextCursor,
+      hasMore: Boolean(decorated.recommendationNextCursor),
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch recommended jobs' });
+  }
+};
+
 export const getJob = async (req: Request, res: Response): Promise<void> => {
   try {
     const job = findJob(routeParam(req.params.slug));
@@ -192,6 +220,9 @@ export const applyToJob = async (req: AuthRequest, res: Response): Promise<void>
       sourceId: job.id,
       description: `Applied to ${job.title}`,
     });
+    void recordAuthoritativeRecommendationOutcome({
+      userId, entityType: 'JOB', entityId: job.id, eventType: 'APPLICATION', meaningfulOutcome: true,
+    }).catch(() => undefined);
 
     res.json({
       success: true,

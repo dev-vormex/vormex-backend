@@ -38,6 +38,7 @@ import {
 } from '../services/college-catalog.service';
 import { getBlockedUserIds } from '../services/trust-safety.service';
 import { getPeopleRelationshipCapabilities } from '../services/people-relationship.service';
+import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
 import {
   CoarseLocationDTO,
   serializeCoarseLocation,
@@ -799,8 +800,16 @@ export const getSuggestions = async (
       suggestions.map((suggestion) => suggestion.id),
       quota
     );
+    const decorated = await decorateSurfaceRecommendations({
+      userId,
+      surface: 'PEOPLE',
+      entityType: 'PERSON',
+      items: suggestions,
+      authorIdOf: (person) => person.id,
+      pageSize: suggestions.length || 1,
+    });
     const response = {
-      suggestions,
+      suggestions: decorated.items,
       total: skip + suggestions.length + (users.length === effectiveLimit ? 1 : 0),
       page,
       hasMore:
@@ -808,10 +817,14 @@ export const getSuggestions = async (
         (updatedQuota.isPremium || (updatedQuota.remaining ?? 0) > 0),
       quota: updatedQuota,
       canRewind,
+      recommendationSessionId: decorated.recommendationSessionId,
+      requestId: decorated.requestId,
+      rankerVersion: decorated.rankerVersion,
+      experimentVariant: decorated.experimentVariant,
     };
 
     res.setHeader('X-Vormex-Cache', 'BYPASS');
-    res.status(200).json(response);
+    res.status(200).json(response as any);
   } catch (error) {
     console.error('Error fetching suggestions:', error);
     res.status(500).json({ error: 'Failed to fetch suggestions' });

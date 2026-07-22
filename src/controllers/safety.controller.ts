@@ -3,6 +3,7 @@ import { prisma } from '../config/prisma';
 import { AuthenticatedRequest } from '../types/auth.types';
 import {
   createUserBlockWithDeviceScope,
+  invalidateMessageInteractionCache,
   publicTrustFields,
   recordSafetyEvent,
 } from '../services/trust-safety.service';
@@ -135,6 +136,7 @@ export const unblockUser = async (req: AuthenticatedRequest, res: Response): Pro
     });
 
     if (deleted.count > 0) {
+      invalidateMessageInteractionCache(userId, blockedId);
       await recordSafetyEvent({
         actorId: userId,
         targetUserId: blockedId,

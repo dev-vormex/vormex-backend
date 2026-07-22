@@ -25,6 +25,7 @@
     "dev:proximity-worker": "ts-node-dev --respawn --transpile-only src/proximity-worker.ts",
     "dev:proximity-scheduler": "ts-node-dev --respawn --transpile-only src/proximity-scheduler.ts",
     "load:proximity": "node scripts/load-proximity.js",
+    "load:recommendations": "node scripts/load-recommendations.js",
     "ai:smoke": "node scripts/ai-smoke.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

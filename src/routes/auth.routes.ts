@@ -36,34 +36,19 @@ const registerRateLimit = createRateLimitMiddleware((req) => {
 
   return [
     {
-      keyPrefix: 'rate:ip:auth:register',
-      limit: 6,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:ip:auth:register:v2',
+      limit: 10,
+      windowSeconds: 10 * 60,
       code: 'account_creation_rate_limited',
-      message: 'Too many account creation attempts. Please wait before trying again.',
+      message: 'Too many account creation attempts.',
     },
     {
-      keyPrefix: 'rate:ip:auth:register:sustained',
-      limit: 20,
-      windowSeconds: 60 * 60,
-      code: 'account_creation_rate_limited',
-      message: 'Too many account creation attempts. Please try again later.',
-    },
-    {
-      keyPrefix: 'rate:identifier:auth:register',
-      limit: 3,
-      windowSeconds: 60 * 60,
-      identifier: () => hashRateLimitIdentifier(email || 'unknown'),
-      code: 'account_creation_rate_limited',
-      message: 'Too many account creation attempts for this email. Please try again later.',
-    },
-    {
-      keyPrefix: 'rate:identifier:auth:register:day',
+      keyPrefix: 'rate:identifier:auth:register:v2',
       limit: 5,
-      windowSeconds: 24 * 60 * 60,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(email || 'unknown'),
       code: 'account_creation_rate_limited',
-      message: 'Too many account creation attempts for this email. Please try again tomorrow.',
+      message: 'Too many account creation attempts for this email.',
     },
   ];
 });
@@ -75,41 +60,26 @@ const loginRateLimit = createRateLimitMiddleware((req) => {
 
   return [
     {
-      keyPrefix: 'rate:ip:auth:login:burst',
-      limit: 5,
-      windowSeconds: 5 * 60,
+      keyPrefix: 'rate:ip:auth:login:burst:v2',
+      limit: 8,
+      windowSeconds: 2 * 60,
       code: 'login_rate_limited',
-      message: 'Too many login attempts. Please wait before trying again.',
+      message: 'Too many login attempts.',
     },
     {
-      keyPrefix: 'rate:ip:auth:login',
-      limit: 12,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:ip:auth:login:v2',
+      limit: 20,
+      windowSeconds: 10 * 60,
       code: 'login_rate_limited',
-      message: 'Too many login attempts. Please wait before trying again.',
+      message: 'Too many login attempts.',
     },
     {
-      keyPrefix: 'rate:ip:auth:login:sustained',
-      limit: 50,
-      windowSeconds: 60 * 60,
-      code: 'login_rate_limited',
-      message: 'Too many login attempts. Please try again later.',
-    },
-    {
-      keyPrefix: 'rate:identifier:auth:login',
-      limit: 5,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:identifier:auth:login:v2',
+      limit: 8,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(identifier || 'unknown'),
       code: 'login_rate_limited',
-      message: 'Too many login attempts for this account. Please wait before trying again.',
-    },
-    {
-      keyPrefix: 'rate:identifier:auth:login:sustained',
-      limit: 12,
-      windowSeconds: 60 * 60,
-      identifier: () => hashRateLimitIdentifier(identifier || 'unknown'),
-      code: 'login_rate_limited',
-      message: 'Too many login attempts for this account. Please try again later.',
+      message: 'Too many login attempts for this account.',
     },
   ];
 });

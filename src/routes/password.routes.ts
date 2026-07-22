@@ -8,19 +8,19 @@ const forgotPasswordRateLimit = createRateLimitMiddleware((req) => {
   const email = String(req.body?.email || 'unknown').trim().toLowerCase();
   return [
     {
-      keyPrefix: 'rate:ip:auth:forgot-password',
-      limit: 6,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:ip:auth:forgot-password:v2',
+      limit: 8,
+      windowSeconds: 10 * 60,
       code: 'password_reset_rate_limited',
-      message: 'Too many password reset requests. Please wait before trying again.',
+      message: 'Too many password reset requests.',
     },
     {
-      keyPrefix: 'rate:identifier:auth:forgot-password',
-      limit: 3,
-      windowSeconds: 60 * 60,
+      keyPrefix: 'rate:identifier:auth:forgot-password:v2',
+      limit: 4,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(email || 'unknown'),
       code: 'password_reset_rate_limited',
-      message: 'Too many password reset requests for this email. Please try again later.',
+      message: 'Too many password reset requests for this email.',
     },
   ];
 });
@@ -28,19 +28,19 @@ const resetPasswordRateLimit = createRateLimitMiddleware((req) => {
   const token = String(req.body?.token || req.query?.token || 'unknown').trim();
   return [
     {
-      keyPrefix: 'rate:ip:auth:reset-password',
+      keyPrefix: 'rate:ip:auth:reset-password:v2',
       limit: 12,
-      windowSeconds: 15 * 60,
+      windowSeconds: 10 * 60,
       code: 'password_reset_rate_limited',
-      message: 'Too many password reset attempts. Please wait before trying again.',
+      message: 'Too many password reset attempts.',
     },
     {
-      keyPrefix: 'rate:token:auth:reset-password',
+      keyPrefix: 'rate:token:auth:reset-password:v2',
       limit: 6,
-      windowSeconds: 15 * 60,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(token || 'unknown'),
       code: 'password_reset_rate_limited',
-      message: 'Too many password reset attempts for this token. Please wait before trying again.',
+      message: 'Too many password reset attempts for this token.',
     },
   ];
 });

@@ -310,12 +310,12 @@ class NotificationService {
   /**
    * Create a notification and enqueue real-time fanout/cache invalidation.
    */
-  async createNotification(params: CreateNotificationParams): Promise<void> {
+  async createNotification(params: CreateNotificationParams): Promise<boolean> {
     const { userId, type, title, body, actorId, postId, reelId, commentId, messageId, data } = params;
 
     // Don't notify yourself
     if (actorId && actorId === userId) {
-      return;
+      return false;
     }
 
     try {
@@ -339,8 +339,10 @@ class NotificationService {
         await enqueueNotificationCreatedEvents(tx, notification);
         await enqueueNotificationCacheInvalidation(tx, userId, notification.id);
       });
+      return true;
     } catch (error) {
       console.error('Failed to create notification:', error);
+      return false;
     }
   }
 
@@ -1120,7 +1122,7 @@ class NotificationService {
     commentId: string,
     commentPreview: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: postAuthorId,
       type: 'comment',
       title: '💬 New Comment',
@@ -1130,6 +1132,20 @@ class NotificationService {
       commentId,
       data: { commentPreview },
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(postAuthorId, {
+      title: 'New Comment',
+      body: `${commenterName} commented: "${commentPreview.slice(0, 50)}${commentPreview.length > 50 ? '...' : ''}"`,
+      data: {
+        type: 'comment',
+        screen: 'post',
+        actorId: commenterId,
+        postId,
+        commentId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1143,7 +1159,7 @@ class NotificationService {
     commentId: string,
     replyPreview: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: originalCommenterId,
       type: 'comment_reply',
       title: '↩️ New Reply',
@@ -1153,6 +1169,20 @@ class NotificationService {
       commentId,
       data: { replyPreview },
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(originalCommenterId, {
+      title: 'New Reply',
+      body: `${replierName} replied: "${replyPreview.slice(0, 50)}${replyPreview.length > 50 ? '...' : ''}"`,
+      data: {
+        type: 'comment_reply',
+        screen: 'post',
+        actorId: replierId,
+        postId,
+        commentId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1164,7 +1194,7 @@ class NotificationService {
     likerName: string,
     postId: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: postAuthorId,
       type: 'like',
       title: '❤️ New Like',
@@ -1172,6 +1202,19 @@ class NotificationService {
       actorId: likerId,
       postId,
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(postAuthorId, {
+      title: 'New Like',
+      body: `${likerName} liked your post`,
+      data: {
+        type: 'like',
+        screen: 'post',
+        actorId: likerId,
+        postId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1183,7 +1226,7 @@ class NotificationService {
     sharerName: string,
     postId: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: postAuthorId,
       type: 'post_share',
       title: '🔗 Post Shared',
@@ -1191,6 +1234,19 @@ class NotificationService {
       actorId: sharerId,
       postId,
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(postAuthorId, {
+      title: 'Post Shared',
+      body: `${sharerName} shared your post`,
+      data: {
+        type: 'post_share',
+        screen: 'post',
+        actorId: sharerId,
+        postId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1322,7 +1378,7 @@ class NotificationService {
     likerName: string,
     reelId: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: reelAuthorId,
       type: 'reel_like',
       title: '❤️ New Like on Reel',
@@ -1330,6 +1386,19 @@ class NotificationService {
       actorId: likerId,
       reelId,
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(reelAuthorId, {
+      title: 'New Like on Reel',
+      body: `${likerName} liked your reel`,
+      data: {
+        type: 'reel_like',
+        screen: 'reel',
+        actorId: likerId,
+        reelId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1425,7 +1494,7 @@ class NotificationService {
     sharerName: string,
     reelId: string
   ): Promise<void> {
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: reelAuthorId,
       type: 'reel_share',
       title: '🔗 Reel Shared',
@@ -1433,6 +1502,19 @@ class NotificationService {
       actorId: sharerId,
       reelId,
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(reelAuthorId, {
+      title: 'Reel Shared',
+      body: `${sharerName} shared your reel`,
+      data: {
+        type: 'reel_share',
+        screen: 'reel',
+        actorId: sharerId,
+        reelId,
+      },
+    }).catch(() => undefined);
   }
 
   /**
@@ -1449,7 +1531,7 @@ class NotificationService {
       ? `${(viewCount / 1000).toFixed(1)}K` 
       : viewCount.toString();
 
-    await this.createNotification({
+    const notificationCreated = await this.createNotification({
       userId: reelAuthorId,
       type: 'reel_view_milestone',
       title: '🎉 Milestone Reached!',
@@ -1457,6 +1539,19 @@ class NotificationService {
       reelId,
       data: { viewCount },
     });
+
+    if (!notificationCreated) return;
+
+    pushNotificationService.sendToUser(reelAuthorId, {
+      title: 'Milestone Reached!',
+      body: `Your reel reached ${milestoneText} views!`,
+      data: {
+        type: 'reel_view_milestone',
+        screen: 'reel',
+        reelId,
+        viewCount: String(viewCount),
+      },
+    }).catch(() => undefined);
   }
 
   // ============================================

@@ -1,6 +1,8 @@
 import { Response } from 'express';
 import { prisma } from '../config/prisma';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
+import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
+import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
 
 const EVENT_TYPES = new Set([
   'meetup',
@@ -211,12 +213,25 @@ export const listEvents = async (
       prisma.campus_events.count({ where }),
     ]);
 
+    const serialized = await serializeEvents(events, userId);
+    const decorated = userId ? await decorateSurfaceRecommendations({
+      userId,
+      surface: 'EVENTS',
+      entityType: 'EVENT',
+      items: serialized,
+      createdAtOf: (event) => event.startsAt,
+      pageSize: serialized.length || 1,
+    }) : { items: serialized };
     res.json({
-      events: await serializeEvents(events, userId),
+      events: decorated.items,
       total,
       page,
       totalPages: Math.max(1, Math.ceil(total / limit)),
-    });
+      recommendationSessionId: decorated.recommendationSessionId,
+      requestId: decorated.requestId,
+      rankerVersion: decorated.rankerVersion,
+      experimentVariant: decorated.experimentVariant,
+    } as any);
   } catch (error) {
     console.error('List events error:', error);
     res.status(500).json({ error: 'Failed to fetch events' });
@@ -245,7 +260,22 @@ export const getUpcomingEvents = async (
       include: eventInclude(),
     });
 
-    res.json({ events: await serializeEvents(events, userId) });
+    const serialized = await serializeEvents(events, userId);
+    const decorated = userId ? await decorateSurfaceRecommendations({
+      userId,
+      surface: 'EVENTS',
+      entityType: 'EVENT',
+      items: serialized,
+      createdAtOf: (event) => event.startsAt,
+      pageSize: serialized.length || 1,
+    }) : { items: serialized };
+    res.json({
+      events: decorated.items,
+      recommendationSessionId: decorated.recommendationSessionId,
+      requestId: decorated.requestId,
+      rankerVersion: decorated.rankerVersion,
+      experimentVariant: decorated.experimentVariant,
+    } as any);
   } catch (error) {
     console.error('Get upcoming events error:', error);
     res.status(500).json({ error: 'Failed to fetch upcoming events' });
@@ -546,6 +576,12 @@ export const rsvpToEvent = async (
     if (result.full) {
       res.status(409).json({ error: 'Event is full' });
       return;
+    }
+
+    if (status === 'going' || status === 'interested') {
+      void recordAuthoritativeRecommendationOutcome({
+        userId, entityType: 'EVENT', entityId: eventId, eventType: 'EVENT_JOIN', meaningfulOutcome: true,
+      }).catch(() => undefined);
     }
 
     res.json({

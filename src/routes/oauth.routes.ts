@@ -10,26 +10,19 @@ const googleSignInRateLimit = createRateLimitMiddleware((req) => {
 
   return [
     {
-      keyPrefix: 'rate:ip:auth:google',
-      limit: 12,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:ip:auth:google:v2',
+      limit: 20,
+      windowSeconds: 10 * 60,
       code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts. Please wait before trying again.',
+      message: 'Too many Google sign-in attempts.',
     },
     {
-      keyPrefix: 'rate:ip:auth:google:sustained',
-      limit: 40,
-      windowSeconds: 60 * 60,
-      code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts. Please try again later.',
-    },
-    {
-      keyPrefix: 'rate:token:auth:google',
+      keyPrefix: 'rate:token:auth:google:v2',
       limit: 6,
-      windowSeconds: 15 * 60,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(idToken.slice(0, 256) || 'unknown'),
       code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts for this token. Please wait before trying again.',
+      message: 'Too many Google sign-in attempts for this token.',
     },
   ];
 });
@@ -39,26 +32,19 @@ const googleCodeSignInRateLimit = createRateLimitMiddleware((req) => {
 
   return [
     {
-      keyPrefix: 'rate:ip:auth:google-code',
-      limit: 10,
-      windowSeconds: 15 * 60,
+      keyPrefix: 'rate:ip:auth:google-code:v2',
+      limit: 16,
+      windowSeconds: 10 * 60,
       code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts. Please wait before trying again.',
+      message: 'Too many Google sign-in attempts.',
     },
     {
-      keyPrefix: 'rate:ip:auth:google-code:sustained',
-      limit: 30,
-      windowSeconds: 60 * 60,
-      code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts. Please try again later.',
-    },
-    {
-      keyPrefix: 'rate:code:auth:google-code',
+      keyPrefix: 'rate:code:auth:google-code:v2',
       limit: 3,
-      windowSeconds: 15 * 60,
+      windowSeconds: 10 * 60,
       identifier: () => hashRateLimitIdentifier(code.slice(0, 256) || 'unknown'),
       code: 'oauth_rate_limited',
-      message: 'Too many Google sign-in attempts for this authorization code. Please wait before trying again.',
+      message: 'Too many Google sign-in attempts for this authorization code.',
     },
   ];
 });

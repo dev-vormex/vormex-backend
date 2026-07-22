@@ -19,22 +19,48 @@ function between(text: string, start: string, end: string): string {
   return text.slice(startIndex, endIndex);
 }
 
-test('sendChatMessage writes message, conversation metadata, and outbox rows in one transaction', () => {
+test('sendChatMessage writes message, conversation metadata, and outbox rows in one atomic statement', () => {
   const service = source('src/services/chat-message.service.ts');
-  const transactionBlock = between(
+  const atomicWriteBlock = between(
     service,
-    'return await prisma.$transaction(async (tx) => {',
-    '}, {\n      maxWait: 15_000,'
+    'await prisma.$executeRaw(Prisma.sql`',
+    '\n    const result = {'
   );
 
-  assert.match(transactionBlock, /await tx\.messages\.create/);
-  assert.match(transactionBlock, /await tx\.conversations\.update/);
-  // All three chat side effects ride one batched outbox insert inside the tx.
-  assert.match(transactionBlock, /await enqueueOutboxEvents\(tx, \[/);
-  assert.match(transactionBlock, /queueName: queueNames\.realtimeFanout/);
-  assert.match(transactionBlock, /queueName: queueNames\.notificationDelivery/);
-  assert.match(transactionBlock, /queueName: queueNames\.cacheInvalidation/);
-  assert.doesNotMatch(transactionBlock, /prisma\.(messages|conversations|outbox_events)/);
+  assert.match(atomicWriteBlock, /WITH inserted_message AS/);
+  assert.match(atomicWriteBlock, /INSERT INTO "messages"/);
+  assert.match(atomicWriteBlock, /inserted_outbox AS/);
+  assert.match(atomicWriteBlock, /INSERT INTO "outbox_events"/);
+  assert.match(atomicWriteBlock, /UPDATE "conversations"/);
+  assert.match(atomicWriteBlock, /ON CONFLICT \("idempotencyKey"\)/);
+  assert.doesNotMatch(atomicWriteBlock, /pushNotificationService/);
+
+  assert.match(service, /const outboxEvents: OutboxEventInput\[\]/);
+  assert.match(service, /queueName: queueNames\.realtimeFanout/);
+  assert.match(service, /queueName: queueNames\.notificationDelivery/);
+  assert.match(service, /queueName: queueNames\.cacheInvalidation/);
+  assert.match(service, /if \(pushDeliveryMode === 'outbox'\)/);
+});
+
+test('development sends chat push directly after commit while production defaults to outbox', () => {
+  const service = source('src/services/chat-message.service.ts');
+
+  assert.match(service, /return nodeEnv === 'production' \? 'outbox' : 'direct'/);
+  assert.match(service, /if \(pushDeliveryMode === 'direct'\)/);
+  assert.match(service, /pushNotificationService\.pushNewMessage/);
+
+  const directPushIndex = service.indexOf("if (pushDeliveryMode === 'direct')");
+  const atomicWriteEndIndex = service.indexOf('\n    const result = {', service.indexOf('await prisma.$executeRaw'));
+  assert.ok(directPushIndex > atomicWriteEndIndex, 'direct push must happen after the atomic write commits');
+});
+
+test('notification worker drops stale queued chat pushes before contacting Firebase', () => {
+  const worker = source('src/workers/index.ts');
+
+  assert.match(worker, /CHAT_PUSH_MAX_AGE_MS/);
+  assert.match(worker, /export function isStaleChatPush/);
+  assert.match(worker, /if \(isStaleChatPush\(payload\)\)/);
+  assert.match(worker, /event: 'chat\.message\.push_skipped_stale'/);
 });
 
 test('chat outbox events use deterministic idempotency keys only for chat side effects', () => {

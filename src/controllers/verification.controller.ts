@@ -1,6 +1,10 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { sendVerificationEmail } from '../utils/email.util';
+import {
+  ensureEmailServiceReady,
+  sendVerificationEmail,
+  toPublicEmailDeliveryFailure,
+} from '../utils/email.util';
 import {
   generateEmailOtpCode,
   hashOpaqueToken,
@@ -263,6 +267,17 @@ export const resendVerification = async (
       res.status(400).json({
         error: 'Invalid email format',
       });
+      return;
+    }
+
+    // Run this before the account lookup so provider failures do not reveal
+    // whether an email address is registered.
+    try {
+      await ensureEmailServiceReady();
+    } catch (emailError) {
+      console.error('Email service is unavailable during verification resend:', emailError);
+      const failure = toPublicEmailDeliveryFailure(emailError);
+      res.status(failure.statusCode).json(failure.body);
       return;
     }
 

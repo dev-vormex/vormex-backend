@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
-const DEFAULT_PASSWORD_MIN_LENGTH = 12;
+const DEFAULT_PASSWORD_MIN_LENGTH = 6;
+const MIN_PASSWORD_MIN_LENGTH = 6;
 const DEFAULT_PASSWORD_MAX_LENGTH = 128;
 const DEFAULT_BCRYPT_ROUNDS = 12;
 const MIN_BCRYPT_ROUNDS = 10;
@@ -16,7 +17,10 @@ function getNumberEnv(name: string, fallback: number): number {
 }
 
 export function getPasswordMinLength(): number {
-  return Math.max(8, getNumberEnv('AUTH_PASSWORD_MIN_LENGTH', DEFAULT_PASSWORD_MIN_LENGTH));
+  return Math.max(
+    MIN_PASSWORD_MIN_LENGTH,
+    getNumberEnv('AUTH_PASSWORD_MIN_LENGTH', DEFAULT_PASSWORD_MIN_LENGTH)
+  );
 }
 
 export function getPasswordMaxLength(): number {

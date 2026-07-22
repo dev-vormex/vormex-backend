@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import type { Request } from 'express';
 import type { PrismaClient } from '@prisma/client';
 import { prisma } from '../config/prisma';
+import { TtlMemo } from '../infrastructure/cache/ttl-memo';
 import { evaluateRateLimit } from './rate-limit.service';
 import { encryptToken } from '../utils/encryption.util';
 
@@ -27,6 +28,12 @@ const TRUST_LEVELS: IdentityTrustLevel[] = [
   'STUDENT_VERIFIED',
   'ID_VERIFIED',
 ];
+
+// Active-chat checks are warmed when the socket joins/types. A short TTL
+// removes a remote database round-trip from each send while explicit
+// block/unblock paths invalidate the pair immediately.
+const messageInteractionMemo = new TtlMemo<void>(5_000, 20_000);
+const identityTrustLevelMemo = new TtlMemo<IdentityTrustLevel>(30_000, 10_000);
 
 const INSTALL_ID_HEADER = 'x-vormex-install-id';
 const PLATFORM_HEADER = 'x-vormex-platform';
@@ -285,6 +292,9 @@ export async function recordUserDeviceFromRequest(
       })
     )
   );
+  existingBlocks.forEach((block) => {
+    invalidateMessageInteractionCache(block.blockerId, normalizedUserId);
+  });
 }
 
 export async function recordSafetyEvent(params: {
@@ -341,6 +351,7 @@ export async function recomputeIdentityTrustLevel(userId: string, tx?: PrismaCli
     where: { id: userId },
     data: { identityTrustLevel: level },
   });
+  identityTrustLevelMemo.delete(userId);
   return level;
 }
 
@@ -534,6 +545,8 @@ export async function createUserBlockWithDeviceScope(params: {
     })
   )));
 
+  invalidateMessageInteractionCache(params.blockerId, params.blockedId);
+
   return { block, deviceScopeCount: uniqueDevices.length };
 }
 
@@ -670,6 +683,25 @@ export async function assertUsersCanInteract(
   }
 }
 
+function messageInteractionKey(actorId: string, targetUserId: string): string {
+  return `${actorId}:${targetUserId}`;
+}
+
+export function invalidateMessageInteractionCache(userAId: string, userBId: string): void {
+  messageInteractionMemo.delete(messageInteractionKey(userAId, userBId));
+  messageInteractionMemo.delete(messageInteractionKey(userBId, userAId));
+}
+
+export async function assertUsersCanMessageCached(
+  actorId: string,
+  targetUserId: string
+): Promise<void> {
+  return messageInteractionMemo.get(
+    messageInteractionKey(actorId, targetUserId),
+    () => assertUsersCanInteract(actorId, targetUserId, 'message')
+  );
+}
+
 function trustLimitEnvName(action: TrustLimitedAction, level: IdentityTrustLevel): string {
   return `TRUST_LIMIT_${action.toUpperCase()}_${level}`;
 }
@@ -678,11 +710,7 @@ export async function enforceTrustTierLimit(
   userId: string,
   action: TrustLimitedAction
 ): Promise<void> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { identityTrustLevel: true },
-  });
-  const level = (user?.identityTrustLevel || 'BASIC') as IdentityTrustLevel;
+  const level = await getIdentityTrustLevelCached(userId);
   const configured = Number(process.env[trustLimitEnvName(action, level)]);
   const limit = Number.isFinite(configured) && configured > 0
     ? Math.floor(configured)
@@ -703,6 +731,16 @@ export async function enforceTrustTierLimit(
       result.retryAfterSeconds
     );
   }
+}
+
+export async function getIdentityTrustLevelCached(userId: string): Promise<IdentityTrustLevel> {
+  return identityTrustLevelMemo.get(userId, async () => {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { identityTrustLevel: true },
+    });
+    return (user?.identityTrustLevel || 'BASIC') as IdentityTrustLevel;
+  });
 }
 
 export function safetyErrorResponse(error: unknown): {

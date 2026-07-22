@@ -188,7 +188,7 @@ curl -X POST http://localhost:3000/api/auth/register \
 **400 - Password Too Short:**
 ```json
 {
-  "error": "Password must be at least 8 characters long"
+  "error": "Password must be at least 6 characters long"
 }
 ```
 
@@ -404,7 +404,7 @@ curl -X POST "http://localhost:3000/api/auth/reset-password?token=__EXAMPLE_RESE
 **400 - Password Too Short:**
 ```json
 {
-  "error": "Password must be at least 8 characters long"
+  "error": "Password must be at least 6 characters long"
 }
 ```
 
@@ -748,7 +748,7 @@ JWT_SECRET=replace-with-at-least-32-random-bytes
 AUTH_CSRF_SECRET=replace-with-a-different-32-byte-random-secret
 AUTH_ACCESS_TOKEN_TTL=365d
 AUTH_REFRESH_TOKEN_TTL_SECONDS=31536000
-AUTH_PASSWORD_MIN_LENGTH=12
+AUTH_PASSWORD_MIN_LENGTH=6
 
 # Google OAuth
 GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com

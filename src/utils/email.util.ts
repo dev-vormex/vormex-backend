@@ -28,6 +28,15 @@ type EmailAttachment = {
   contentId: string;
 };
 
+export type PublicEmailDeliveryFailure = {
+  statusCode: number;
+  body: {
+    error: string;
+    code: string;
+    retryAfterSeconds?: number;
+  };
+};
+
 let emailServiceCheckCache: EmailServiceCheckCache | null = null;
 
 function getResendResponseHeaders(response: unknown): ResendHeaders {
@@ -213,7 +222,7 @@ function buildCachedEmailServiceError(
   );
 }
 
-async function assertEmailServiceReady(): Promise<void> {
+export async function ensureEmailServiceReady(): Promise<void> {
   const { resendApiKey, emailFrom, senderDomain } = getEmailConfig();
   const cacheKey = getEmailServiceCacheKey(resendApiKey, emailFrom);
   const cachedResult = getCachedEmailServiceCheck(cacheKey);
@@ -334,6 +343,20 @@ async function assertEmailServiceReady(): Promise<void> {
   }
 }
 
+export function toPublicEmailDeliveryFailure(error: unknown): PublicEmailDeliveryFailure {
+  const retryAfterSeconds =
+    error instanceof EmailServiceUnavailableError ? error.retryAfterSeconds : undefined;
+
+  return {
+    statusCode: error instanceof EmailDeliveryError ? 502 : 503,
+    body: {
+      error: 'Email delivery is temporarily unavailable. Please try again.',
+      code: 'email_delivery_unavailable',
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    },
+  };
+}
+
 function normalizeResendSendError(
   error: { statusCode?: number; message?: string; name?: string },
   headers: ResendHeaders
@@ -441,7 +464,7 @@ async function sendEmail(params: {
   attachments?: EmailAttachment[];
 }): Promise<void> {
   const { emailFrom } = getEmailConfig();
-  await assertEmailServiceReady();
+  await ensureEmailServiceReady();
 
   try {
     const result = await executeWithCircuitBreaker(

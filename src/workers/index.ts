@@ -39,7 +39,23 @@ const FOLLOWER_FEED_INVALIDATION_BATCH_SIZE = parsePositiveInt(
   process.env.FOLLOWER_FEED_INVALIDATION_BATCH_SIZE,
   5_000
 );
+const CHAT_PUSH_MAX_AGE_MS = parsePositiveInt(
+  process.env.CHAT_PUSH_MAX_AGE_MS,
+  24 * 60 * 60 * 1_000
+);
 const workerErrorLastLoggedAt = new Map<string, number>();
+
+export function isStaleChatPush(
+  payload: NotificationDeliveryPayload,
+  nowMs = Date.now()
+): boolean {
+  if (payload.kind !== 'new_message' || !payload.messageCreatedAt) {
+    return false;
+  }
+
+  const createdAtMs = Date.parse(payload.messageCreatedAt);
+  return Number.isFinite(createdAtMs) && nowMs - createdAtMs > CHAT_PUSH_MAX_AGE_MS;
+}
 
 type CacheInvalidationJobData =
   | CacheInvalidationPayload
@@ -72,6 +88,16 @@ async function processRealtimeFanout(job: Job<{ event: { payload: RealtimeFanout
 async function processNotificationDelivery(job: Job<{ event: { payload: NotificationDeliveryPayload } }>) {
   const payload = job.data.event.payload;
   if (payload.kind === 'new_message') {
+    if (isStaleChatPush(payload)) {
+      logger.warn({
+        event: 'chat.message.push_skipped_stale',
+        messageId: payload.messageId,
+        conversationId: payload.conversationId,
+        messageCreatedAt: payload.messageCreatedAt,
+      });
+      return;
+    }
+
     await pushNotificationService.pushNewMessage(
       payload.userId,
       payload.senderName || payload.title,

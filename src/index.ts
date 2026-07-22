@@ -72,6 +72,7 @@ import adminRoutes from './routes/admin.routes';
 import managedAdsRoutes from './routes/managed-ads.routes';
 import dailyHooksRoutes from './routes/daily-hooks.routes';
 import publicDiscoveryRoutes from './routes/public-discovery.routes';
+import recommendationRoutes from './routes/recommendation.routes';
 import premiumRoutes from './routes/premium.routes';
 import { setupSwagger } from './swagger';
 import { setIO } from './sockets';
@@ -105,7 +106,7 @@ import { ACCESS_TOKEN_COOKIE, parseCookieHeader } from './utils/auth-cookie.util
 import { getPostMetadata, getReactionSummaries, mapPollOptionsForResponse, normalizeReactionType } from './utils/post.util';
 import { canViewPost, canViewReel, canViewStory } from './utils/access-control.util';
 import { pushNotificationService } from './services/push-notification.service';
-import { getReadReceiptVisibilityCached, sendChatMessage } from './services/chat-message.service';
+import { getReadReceiptVisibilityCached, sendChatMessage, warmChatSendPath } from './services/chat-message.service';
 import { getConversationPeerIdCached } from './services/chat-conversation-cache.service';
 import { TtlMemo } from './infrastructure/cache/ttl-memo';
 import { emitRealtimeEnvelopes } from './infrastructure/realtime/emitter';
@@ -1630,6 +1631,7 @@ io.on('connection', async (socket) => {
           transport: socket.conn.transport.name,
           rooms: Array.from(socket.rooms),
         });
+        void warmChatSendPath(conversationId, userId).catch(() => undefined);
       } catch (error) {
         console.error('chat:join error:', error);
         socket.emit('error', { message: 'Failed to join conversation' });
@@ -1758,6 +1760,7 @@ io.on('connection', async (socket) => {
     try {
       const peerId = await getConversationPeerId(targetConversationId, userId);
       if (!peerId) return;
+      void warmChatSendPath(targetConversationId, userId).catch(() => undefined);
       if (!(await allowChatTypingBroadcast(userId, targetConversationId))) return;
 
       const payload = {
@@ -2793,6 +2796,7 @@ app.use('/api/ads', managedAdsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/daily-hooks', dailyHooksRoutes);
 app.use('/api/public/discovery', publicDiscoveryRoutes);
+app.use('/api/discovery', recommendationRoutes);
 
 registerPublicDiscoveryMcp(app);
 

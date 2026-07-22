@@ -1,7 +1,11 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { generateAccessToken, getAccessTokenTtlSeconds } from '../utils/jwt.util';
-import { sendVerificationEmail } from '../utils/email.util';
+import {
+  ensureEmailServiceReady,
+  sendVerificationEmail,
+  toPublicEmailDeliveryFailure,
+} from '../utils/email.util';
 import {
   validateUsername,
   normalizeUsername,
@@ -216,6 +220,15 @@ export const register = async (
       return;
     }
 
+    try {
+      await ensureEmailServiceReady();
+    } catch (emailError) {
+      console.error('Email service is unavailable during registration:', emailError);
+      const failure = toPublicEmailDeliveryFailure(emailError);
+      res.status(failure.statusCode).json(failure.body);
+      return;
+    }
+
     const usernameResult = await resolveRegistrationUsername({
       username,
       displayName,
@@ -258,6 +271,9 @@ export const register = async (
         await sendVerificationEmail(normalizedEmail, verificationCode, displayName);
       } catch (emailError) {
         console.error('Failed to resend verification email:', emailError);
+        const failure = toPublicEmailDeliveryFailure(emailError);
+        res.status(failure.statusCode).json(failure.body);
+        return;
       }
 
       const userResponse = await buildUserResponse(user);
@@ -297,9 +313,10 @@ export const register = async (
     try {
       await sendVerificationEmail(normalizedEmail, verificationCode, displayName);
     } catch (emailError) {
-      // Log error but don't fail registration
       console.error('Failed to send verification email:', emailError);
-      // User can still use the app and request resend verification later
+      const failure = toPublicEmailDeliveryFailure(emailError);
+      res.status(failure.statusCode).json(failure.body);
+      return;
     }
 
     try {
@@ -445,8 +462,30 @@ export const login = async (
     // Check if email is verified (only for email/password users)
     // Google OAuth users are automatically verified, so they can login
     if (!user.isVerified) {
+      const verificationCode = generateEmailOtpCode();
+      const hashedVerificationToken = hashEmailOtp(user.email, verificationCode);
+      const verificationTokenExpiry = new Date(Date.now() + 10 * 60 * 1000);
+
+      try {
+        await ensureEmailServiceReady();
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            verificationToken: hashedVerificationToken,
+            verificationTokenExpiry,
+          },
+        });
+        await sendVerificationEmail(user.email, verificationCode, user.name);
+      } catch (emailError) {
+        console.error('Failed to send verification email during login:', emailError);
+        const failure = toPublicEmailDeliveryFailure(emailError);
+        res.status(failure.statusCode).json(failure.body);
+        return;
+      }
+
       res.status(403).json({
         error: 'Please verify your email before logging in. Enter the 6-digit code sent to your inbox.',
+        code: 'email_verification_required',
         requiresVerification: true,
       });
       return;

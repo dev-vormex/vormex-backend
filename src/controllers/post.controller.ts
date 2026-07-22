@@ -57,6 +57,18 @@ import {
   decodeKeysetCursor,
   encodeKeysetCursor,
 } from '../utils/keyset-pagination.util';
+import { assignRecommendationVariant } from '../services/recommendation-engine.service';
+import {
+  createRecommendationSession,
+  getRecommendationPreferences,
+  getRecommendationSessionPage,
+  type RecommendationSnapshotItem,
+} from '../services/recommendation-platform.service';
+import {
+  rankHomePostCandidates,
+  selectHomeRecommendationModules,
+} from '../services/home-recommendation.service';
+import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -640,11 +652,22 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     );
     const modeRaw = (ensureString(req.query.mode) || 'recommended').toLowerCase();
     const mode: 'latest' | 'recommended' = modeRaw === 'latest' ? 'latest' : 'recommended';
+    const experimentVariant = assignRecommendationVariant(currentUserId);
+    const recommendationEventsEnabled = process.env.RECOMMENDATION_EVENTS_ENABLED === 'true';
+    let unifiedRankingEnabled =
+      mode === 'recommended' &&
+      (experimentVariant === 'treatment' || experimentVariant === 'training_exploration');
+    if (unifiedRankingEnabled) {
+      const preferences = await getRecommendationPreferences(currentUserId).catch(() => ({
+        personalizedRecommendationsEnabled: true,
+      }));
+      unifiedRankingEnabled = preferences.personalizedRecommendationsEnabled;
+    }
     const adSessionId = ensureString(req.query.adSessionId);
     const requestedAdItemOffset = parseInt(ensureString(req.query.adItemOffset) || '0', 10);
     const adItemOffset = Math.min(Math.max(Number.isFinite(requestedAdItemOffset) ? requestedAdItemOffset : 0, 0), 10000);
     const recommendedCursorState =
-      mode === 'recommended'
+      mode === 'recommended' && !unifiedRankingEnabled
         ? decodeRecommendedFeedCursor(cursor, requestStartedAtMs)
         : null;
     const recommendationSessionStartedAtMs =
@@ -659,10 +682,12 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
         : null;
     const latestCursorWhere = createdAtDescKeysetWhere(latestCursor);
     const candidateLimit =
-      mode === 'recommended'
+      unifiedRankingEnabled
+        ? 500
+        : mode === 'recommended'
         ? recommendedFeedCandidateLimit(limit)
         : limit;
-    const bypassFeedCache = shouldBypassHomeFeedCache(req);
+    const bypassFeedCache = shouldBypassHomeFeedCache(req) || unifiedRankingEnabled || recommendationEventsEnabled;
     const cacheCursor =
       mode === 'recommended'
         ? cursor
@@ -675,6 +700,60 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     });
     const blockedUserIds = await getBlockedUserIds(currentUserId);
     const blockedUserIdSet = new Set(blockedUserIds);
+
+    const decoratePost = (post: any, item: RecommendationSnapshotItem | undefined) => item ? {
+      ...post,
+      reasonCode: item.reasonCode,
+      reasonText: item.reasonText,
+      source: item.source,
+      position: item.position,
+      isBoosted: Boolean(item.isBoosted),
+      socialActors: item.socialActors || [],
+    } : post;
+
+    if (unifiedRankingEnabled && cursor) {
+      const sessionPage = await getRecommendationSessionPage({
+        cursor,
+        userId: currentUserId,
+        surface: 'HOME',
+        pageSize: limit,
+      });
+      if (!sessionPage) {
+        res.status(400).json({ error: 'Invalid or expired recommendation cursor' });
+        return;
+      }
+      const ids = sessionPage.items.map((item) => item.entityId);
+      const posts = ids.length > 0 ? await prismaRead.post.findMany({
+        where: {
+          id: { in: ids },
+          isActive: true,
+          ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
+          ...(await buildPostVisibilityWhere(currentUserId)),
+        },
+        include: postResponseInclude(currentUserId, { authorProfileSignals: true }),
+      }) : [];
+      const postById = new Map(posts.map((post) => [post.id, post]));
+      const ordered = sessionPage.items.map((item) => postById.get(item.entityId)).filter(Boolean);
+      await attachReactionSummaries(prismaRead as any, ordered);
+      const authorVisibilityByUser = await getPremiumVisibilityByUserIds(ordered.map((post: any) => post.authorId));
+      const responsePosts = sessionPage.items.flatMap((item) => {
+        const post: any = postById.get(item.entityId);
+        if (!post) return [];
+        const withPremium = {
+          ...post,
+          author: post.author ? applyPremiumVisibilityToUser(post.author, authorVisibilityByUser) : post.author,
+        };
+        return [decoratePost(mapPostResponse(withPremium, currentUserId), item)];
+      });
+      res.json({
+        posts: responsePosts,
+        ...sessionPage.envelope,
+        hasMore: Boolean(sessionPage.envelope.nextCursor),
+        modulePlacements: [],
+        adPlacements: await selectHomeFeedAdPlacements(currentUserId, responsePosts.length, adItemOffset, sessionPage.snapshot.id),
+      });
+      return;
+    }
 
     const computeFeedPayload = async () => {
       const accessWhere = await buildPostVisibilityWhere(currentUserId);
@@ -748,7 +827,51 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
       let pageItems = chronologicalItems;
       let nextCursor: string | null = null;
       let hasMore = hasMoreChronological;
-      if (mode === 'recommended') {
+      let recommendationEnvelope: any = null;
+      let recommendationItems = new Map<string, RecommendationSnapshotItem>();
+      let modulePlacements: any[] = [];
+      if (unifiedRankingEnabled) {
+        const ranked = await rankHomePostCandidates({
+          userId: currentUserId,
+          posts: chronologicalItems,
+          recommendationContext,
+          seenAtByPostId,
+          nowMs: recommendationSessionStartedAtMs,
+          experimentVariant,
+        });
+        modulePlacements = await selectHomeRecommendationModules({
+          userId: currentUserId,
+          organicItemCount: ranked.length,
+          blockedAuthorIds: blockedUserIds,
+          recommendationContext,
+        });
+        const session = await createRecommendationSession({
+          userId: currentUserId,
+          surface: 'HOME',
+          orderedItems: ranked.map((item) => ({
+            entityType: 'POST',
+            entityId: item.id,
+            position: item.position,
+            authorId: item.authorId,
+            reasonCode: item.reasonCode,
+            reasonText: item.reasonText,
+            source: item.primarySource,
+            examinationPropensity: item.examinationPropensity,
+            features: item.features,
+            socialActors: item.socialActors,
+          })),
+          modulePlacements,
+          pageSize: limit,
+          snapshotAt: new Date(recommendationSessionStartedAtMs),
+          experimentVariant,
+        });
+        recommendationEnvelope = session.envelope;
+        recommendationItems = new Map(session.items.map((item) => [item.entityId, item]));
+        const postById = new Map(ranked.map((item) => [item.id, item.value]));
+        pageItems = session.items.map((item) => postById.get(item.entityId)).filter(Boolean);
+        nextCursor = session.envelope.nextCursor;
+        hasMore = Boolean(nextCursor);
+      } else if (mode === 'recommended') {
         try {
           const rankedPage = rankFeedPage(chronologicalItems, {
             ...(recommendationContext || {}),
@@ -782,11 +905,32 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
       }
 
       await attachReactionSummaries(prismaRead as any, pageItems);
+      let mappedPosts = pageItems.map((post) => decoratePost(
+        mapPostResponse(post, currentUserId),
+        recommendationItems.get(String(post.id))
+      ));
+      if (!unifiedRankingEnabled && recommendationEventsEnabled && mappedPosts.length > 0) {
+        const eventSession = await createRecommendationSession({
+          userId: currentUserId,
+          surface: 'HOME',
+          orderedItems: mappedPosts.map((post, index) => ({
+            entityType: 'POST', entityId: post.id, position: index + 1, authorId: post.authorId,
+            reasonCode: 'CURRENT_RANKER', reasonText: 'Recommended for you', source: 'CURRENT_RANKER',
+          })),
+          pageSize: mappedPosts.length,
+          experimentVariant,
+        });
+        recommendationEnvelope = { ...eventSession.envelope, nextCursor };
+        const eventItems = new Map(eventSession.items.map((item) => [item.entityId, item]));
+        mappedPosts = mappedPosts.map((post) => decoratePost(post, eventItems.get(post.id)));
+      }
 
       return {
-        posts: pageItems.map((post) => mapPostResponse(post, currentUserId)),
+        posts: mappedPosts,
         nextCursor,
         hasMore,
+        modulePlacements,
+        ...(recommendationEnvelope || {}),
       };
     };
 
@@ -820,9 +964,7 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     res.setHeader('X-Vormex-Cache', bypassFeedCache ? 'BYPASS' : 'MISS');
     res.json(responsePayload);
 
-    if (mode === 'recommended' && filteredPosts.length > 0) {
-      writeRecommendedFeedImpressions(currentUserId, filteredPosts.map((post) => post.id));
-    }
+    // Returned rows are candidates, not impressions. Android viewport events are authoritative.
   } catch (error) {
     console.error('getFeed error:', error);
     res.status(500).json({ error: 'Failed to fetch feed' });
@@ -1592,6 +1734,12 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
       ).catch(console.error);
     }
 
+    if (liked) {
+      void recordAuthoritativeRecommendationOutcome({
+        userId, entityType: 'POST', entityId: postId, eventType: 'REACTION', meaningfulOutcome: false,
+      }).catch(() => undefined);
+    }
+
     res.json({ liked, isLiked: liked, likesCount, reactionType, reactionSummary });
   } catch (error) {
     console.error('toggleLike error:', error);
@@ -2037,6 +2185,9 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
 
     // Record comment activity (non-blocking)
     recordActivity(userId, 'comment', 1, { sourceId: mapped.id }).catch(console.error);
+    void recordAuthoritativeRecommendationOutcome({
+      userId, entityType: 'POST', entityId: postId, eventType: 'COMMENT', meaningfulOutcome: true,
+    }).catch(() => undefined);
 
     res.status(201).json(mapped);
   } catch (error) {
@@ -2274,6 +2425,9 @@ export const sharePost = async (req: AuthRequest, res: Response): Promise<void> 
     });
 
     const frontendUrl = process.env.FRONTEND_URL || 'https://vormex.com';
+    void recordAuthoritativeRecommendationOutcome({
+      userId: String(req.user.userId), entityType: 'POST', entityId: postId, eventType: 'SHARE', meaningfulOutcome: true,
+    }).catch(() => undefined);
     res.status(200).json({
       message: 'Post shared successfully',
       sharesCount,

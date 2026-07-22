@@ -4,6 +4,7 @@ import { ensureString } from '../utils/request.util';
 import { attachReactionSummaries, mapPostResponse } from '../utils/post.util';
 import { canViewPost } from '../utils/access-control.util';
 import { cacheService } from '../services/cache.service';
+import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -187,6 +188,12 @@ export const toggleSave = async (req: AuthRequest, res: Response): Promise<void>
 
     const savesCount = await prisma.saved_posts.count({ where: { postId } });
     invalidateHomeFeedCache(userId);
+
+    if (saved) {
+      void recordAuthoritativeRecommendationOutcome({
+        userId, entityType: 'POST', entityId: postId, eventType: 'SAVE', meaningfulOutcome: true,
+      }).catch(() => undefined);
+    }
 
     res.json({
       message: saved ? 'Post saved' : 'Post unsaved',

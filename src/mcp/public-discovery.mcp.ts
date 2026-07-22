@@ -21,6 +21,8 @@ import {
 } from './profile-cards.widget';
 
 const MCP_PATH = '/mcp';
+export const OPENAI_APPS_CHALLENGE_PATH = '/.well-known/openai-apps-challenge';
+export const OPENAI_APPS_CHALLENGE_TOKEN = 'REMOVED_SECRET';
 const mcpRateLimit = createRateLimitMiddleware(() => [
   { keyPrefix: 'mcp:search:ip', limit: 60, windowSeconds: 60, code: 'MCP_RATE_LIMITED' },
 ]);
@@ -30,6 +32,164 @@ const profileCardsToolMeta = {
   'openai/toolInvocation/invoking': 'Finding public Vormex profiles',
   'openai/toolInvocation/invoked': 'Vormex profiles ready',
 };
+
+export const publicDiscoveryToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+const nullableString = z.string().nullable();
+const publicPersonSchema = z.object({
+  username: z.string(),
+  name: z.string(),
+  headline: nullableString,
+  bio: nullableString,
+  avatar: nullableString,
+  skills: z.array(z.string()),
+  interests: z.array(z.string()),
+  location: nullableString,
+  profileUrl: z.string(),
+  verified: z.boolean(),
+  openToOpportunities: z.boolean(),
+  matchScore: z.number(),
+  matchScoreBand: z.enum(['strong', 'good', 'related']),
+  matchReasons: z.array(z.string()),
+});
+
+const publicProfileSchema = z.object({
+  username: z.string(),
+  name: z.string(),
+  headline: nullableString,
+  bio: nullableString,
+  avatar: nullableString,
+  skills: z.array(z.string()),
+  interests: z.array(z.string()),
+  location: nullableString,
+  profileUrl: z.string(),
+  verified: z.boolean(),
+  openToOpportunities: z.boolean(),
+  bannerImage: nullableString,
+  connectionsCount: z.number().int().nonnegative(),
+  college: nullableString,
+  branch: nullableString,
+  degree: nullableString,
+  graduationYear: z.number().int().nullable(),
+  portfolioUrl: nullableString,
+  linkedinUrl: nullableString,
+  githubProfileUrl: nullableString,
+  otherSocialUrls: z.unknown().nullable(),
+  experiences: z.array(z.object({
+    title: z.string(),
+    company: z.string(),
+    type: z.string(),
+    location: nullableString,
+    startDate: z.string(),
+    endDate: nullableString,
+    current: z.boolean(),
+    description: nullableString,
+    skills: z.array(z.string()),
+    logo: nullableString,
+  })),
+  education: z.array(z.object({
+    school: z.string(),
+    degree: z.string(),
+    fieldOfStudy: z.string(),
+    startDate: z.string(),
+    endDate: nullableString,
+    current: z.boolean(),
+    grade: nullableString,
+    activities: nullableString,
+    description: nullableString,
+    logo: nullableString,
+  })),
+  projects: z.array(z.object({
+    id: z.string(),
+    title: z.string(),
+    description: z.string(),
+    url: nullableString,
+    role: nullableString,
+    techStack: z.array(z.string()),
+    startDate: z.string(),
+    endDate: nullableString,
+    current: z.boolean(),
+    projectUrl: nullableString,
+    githubUrl: nullableString,
+    otherLinks: z.unknown().nullable(),
+    images: z.array(z.string()),
+    featured: z.boolean(),
+  })),
+  certificates: z.array(z.object({
+    name: z.string(),
+    issuingOrganization: z.string(),
+    issueDate: z.string(),
+    expiryDate: nullableString,
+    doesNotExpire: z.boolean(),
+    credentialId: nullableString,
+    credentialUrl: nullableString,
+  })),
+  achievements: z.array(z.object({
+    title: z.string(),
+    type: z.string(),
+    organization: z.string(),
+    date: z.string(),
+    description: nullableString,
+    certificateUrl: nullableString,
+  })),
+  publicTextPosts: z.array(z.object({
+    id: z.string(),
+    content: z.string(),
+    url: z.string(),
+    likesCount: z.number().int().nonnegative(),
+    commentsCount: z.number().int().nonnegative(),
+    sharesCount: z.number().int().nonnegative(),
+    createdAt: z.string(),
+  })),
+  sectionCounts: z.object({
+    experiences: z.number().int().nonnegative(),
+    education: z.number().int().nonnegative(),
+    projects: z.number().int().nonnegative(),
+    certificates: z.number().int().nonnegative(),
+    achievements: z.number().int().nonnegative(),
+    publicTextPosts: z.number().int().nonnegative(),
+  }),
+  indexable: z.boolean(),
+  updatedAt: z.string(),
+});
+
+const publicPostSchema = z.object({
+  id: z.string(),
+  content: z.string(),
+  contentTruncated: z.boolean(),
+  url: z.string(),
+  author: z.object({
+    username: z.string(),
+    name: z.string(),
+    headline: nullableString,
+    avatar: nullableString,
+    profileUrl: z.string(),
+  }),
+  engagement: z.object({
+    likes: z.number().int().nonnegative(),
+    comments: z.number().int().nonnegative(),
+    shares: z.number().int().nonnegative(),
+  }),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  matchReasons: z.array(z.string()),
+});
+
+const publicOpportunitySchema = z.object({
+  id: z.string(),
+  type: z.enum(['job', 'learning', 'group', 'event', 'hackathon']),
+  title: z.string(),
+  description: z.string(),
+  url: z.string(),
+  location: nullableString,
+  skills: z.array(z.string()),
+  startsAt: nullableString.optional(),
+});
 
 async function resolvePublicProfile(identifier: string) {
   const direct = await getPublicProfile(identifier, 'ai');
@@ -49,7 +209,7 @@ export function mcpCorsHeaders(_req: Request, res: Response, next: NextFunction)
   next();
 }
 
-function createPublicDiscoveryMcpServer(): McpServer {
+export function createPublicDiscoveryMcpServer(): McpServer {
   const server = new McpServer(
     { name: 'vormex-public-discovery', version: '3.0.0' },
     {
@@ -116,7 +276,15 @@ function createPublicDiscoveryMcpServer(): McpServer {
         location: z.string().max(80).optional().describe('Optional coarse city, state, country, or college for people results'),
         limitPerSource: z.number().int().min(1).max(10).optional(),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: {
+        query: z.string(),
+        people: z.array(publicPersonSchema),
+        posts: z.array(publicPostSchema),
+        opportunities: z.array(publicOpportunitySchema),
+        searchedSources: z.array(z.string()),
+        count: z.number().int().nonnegative(),
+      },
+      annotations: publicDiscoveryToolAnnotations,
     },
     async (input) => {
       const results = await searchAllPublicVormex(input);
@@ -146,7 +314,14 @@ function createPublicDiscoveryMcpServer(): McpServer {
         location: z.string().max(80).optional().describe('Optional city, state, country, or college'),
         limit: z.number().int().min(1).max(10).optional().describe('Number of people cards requested by the user; defaults to 5 when unspecified'),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: {
+        people: z.array(publicPersonSchema),
+        profiles: z.array(publicProfileSchema),
+        count: z.number().int().nonnegative(),
+        goal: z.string(),
+        display: z.literal('profile-card-carousel'),
+      },
+      annotations: publicDiscoveryToolAnnotations,
       _meta: profileCardsToolMeta,
     },
     async (input) => {
@@ -172,7 +347,8 @@ function createPublicDiscoveryMcpServer(): McpServer {
       title: 'Get a public Vormex profile',
       description: 'Use whenever the user asks for one specifically named Vormex person or username. Resolves an exact public display name or username and returns exactly one comprehensive eligible profile card. It never returns chats, contact details, precise location, or private data.',
       inputSchema: { username: z.string().min(1).max(80).describe('Exact Vormex username, with or without @, or exact public display name') },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: { profile: publicProfileSchema.nullable() },
+      annotations: publicDiscoveryToolAnnotations,
       _meta: profileCardsToolMeta,
     },
     async ({ username }) => {
@@ -194,7 +370,12 @@ function createPublicDiscoveryMcpServer(): McpServer {
         query: z.string().min(2).max(240),
         limit: z.number().int().min(1).max(10).optional(),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: {
+        query: z.string(),
+        posts: z.array(publicPostSchema),
+        count: z.number().int().nonnegative(),
+      },
+      annotations: publicDiscoveryToolAnnotations,
     },
     async ({ query, limit }) => {
       const posts = await searchPublicPosts(query, limit);
@@ -215,7 +396,13 @@ function createPublicDiscoveryMcpServer(): McpServer {
         limit: z.number().int().min(1).max(20).optional(),
         cursor: z.string().min(1).max(80).optional().describe('nextCursor returned by the previous call'),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: {
+        username: z.string(),
+        posts: z.array(publicPostSchema),
+        nextCursor: nullableString,
+        count: z.number().int().nonnegative(),
+      },
+      annotations: publicDiscoveryToolAnnotations,
     },
     async ({ username, limit, cursor }) => {
       const page = await listPublicProfilePosts(username, limit, cursor);
@@ -232,7 +419,8 @@ function createPublicDiscoveryMcpServer(): McpServer {
       title: 'Get a public Vormex text post',
       description: 'Retrieve one eligible public Vormex text post and its public author summary by post ID after a search result needs more detail.',
       inputSchema: { postId: z.string().min(1).max(80).describe('Vormex post ID returned by a search tool') },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: { post: publicPostSchema.nullable() },
+      annotations: publicDiscoveryToolAnnotations,
     },
     async ({ postId }) => {
       const post = await getPublicPost(postId);
@@ -254,7 +442,13 @@ function createPublicDiscoveryMcpServer(): McpServer {
         types: z.array(z.enum(['job', 'learning', 'group', 'event', 'hackathon'])).max(5).optional(),
         limit: z.number().int().min(1).max(10).optional(),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      outputSchema: {
+        opportunities: z.array(publicOpportunitySchema),
+        relatedPosts: z.array(publicPostSchema),
+        count: z.number().int().nonnegative(),
+        query: z.string(),
+      },
+      annotations: publicDiscoveryToolAnnotations,
     },
     async ({ query, types, limit }) => {
       const [opportunities, relatedPosts] = await Promise.all([
@@ -272,6 +466,10 @@ function createPublicDiscoveryMcpServer(): McpServer {
 }
 
 export function registerPublicDiscoveryMcp(app: Express): void {
+  app.get(OPENAI_APPS_CHALLENGE_PATH, (_req: Request, res: Response): void => {
+    res.status(200).type('text/plain').send(OPENAI_APPS_CHALLENGE_TOKEN);
+  });
+
   app.all(MCP_PATH, mcpRateLimit, async (req: Request, res: Response): Promise<void> => {
     if (process.env.MCP_ENABLED === 'false') {
       res.status(404).send('Not Found');

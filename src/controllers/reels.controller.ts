@@ -24,6 +24,8 @@ import {
   decodeKeysetCursor,
   encodeKeysetCursor,
 } from '../utils/keyset-pagination.util';
+import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
+import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -394,6 +396,26 @@ export const getReelsFeed = async (req: AuthRequest, res: Response): Promise<voi
         })
       : await computeResponse();
 
+    if (currentUserId && mode !== 'following') {
+      const decorated = await decorateSurfaceRecommendations({
+        userId: currentUserId,
+        surface: 'REELS',
+        entityType: 'REEL',
+        items: response.reels,
+        authorIdOf: (reel: any) => reel.authorId || reel.author?.id,
+        createdAtOf: (reel: any) => reel.publishedAt || reel.createdAt,
+        pageSize: response.reels.length || 1,
+      });
+      res.json({
+        ...response,
+        reels: decorated.items,
+        recommendationSessionId: decorated.recommendationSessionId,
+        requestId: decorated.requestId,
+        rankerVersion: decorated.rankerVersion,
+        experimentVariant: decorated.experimentVariant,
+      });
+      return;
+    }
     res.json(response);
   } catch (error) {
     console.error('getReelsFeed error:', error);
@@ -1241,6 +1263,10 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
       );
     }
 
+    if (liked) void recordAuthoritativeRecommendationOutcome({
+      userId, entityType: 'REEL', entityId: reelId, eventType: 'REACTION', meaningfulOutcome: false,
+    }).catch(() => undefined);
+
     res.json({ liked, likesCount });
   } catch (error) {
     console.error('toggleLike error:', error);
@@ -1293,6 +1319,10 @@ export const toggleSave = async (req: AuthRequest, res: Response): Promise<void>
       where: { id: reelId },
       data: { savesCount },
     });
+
+    if (saved) void recordAuthoritativeRecommendationOutcome({
+      userId, entityType: 'REEL', entityId: reelId, eventType: 'SAVE', meaningfulOutcome: true,
+    }).catch(() => undefined);
 
     res.json({ saved, savesCount });
   } catch (error) {
@@ -1401,6 +1431,10 @@ export const shareReel = async (req: AuthRequest, res: Response): Promise<void> 
         reelId
       );
     }
+
+    if (createdShare) void recordAuthoritativeRecommendationOutcome({
+      userId, entityType: 'REEL', entityId: reelId, eventType: 'SHARE', meaningfulOutcome: true,
+    }).catch(() => undefined);
 
     res.json({ success: true, sharesCount });
   } catch (error) {

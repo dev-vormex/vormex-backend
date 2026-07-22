@@ -1,6 +1,10 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { sendPasswordResetEmail } from '../utils/email.util';
+import {
+  ensureEmailServiceReady,
+  sendPasswordResetEmail,
+  toPublicEmailDeliveryFailure,
+} from '../utils/email.util';
 import {
   generateOpaqueToken,
   hashOpaqueToken,
@@ -89,6 +93,18 @@ export const forgotPassword = async (
       res.status(400).json({
         error: 'Invalid email format',
       });
+      return;
+    }
+
+    // Check provider readiness before looking up the account. This prevents a
+    // broken email configuration from being reported as success while keeping
+    // the response independent of whether the address is registered.
+    try {
+      await ensureEmailServiceReady();
+    } catch (emailError) {
+      console.error('Email service is unavailable during password reset:', emailError);
+      const failure = toPublicEmailDeliveryFailure(emailError);
+      res.status(failure.statusCode).json(failure.body);
       return;
     }
 
