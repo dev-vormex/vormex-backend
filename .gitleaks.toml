@@ -21,3 +21,13 @@ regexes = [
   '''linkedinUrl''',
   '''githubProfileUrl''',
 ]
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Public OpenAI Apps domain-verification challenge"
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['''OPENAI_APPS_CHALLENGE_TOKEN''']
+  paths = ['''^src/mcp/public-discovery\.mcp\.ts$''']
