@@ -166,6 +166,58 @@ function isCookieCsrfValid(req: AuthenticatedRequest, decoded: JWTPayload): bool
   return verifyCsrfToken(csrfToken, decoded.sessionId);
 }
 
+async function resolveRequestAuth(req: AuthenticatedRequest): Promise<NonNullable<AuthenticatedRequest['authState']>> {
+  // Global optionalAuth resolves first; route middleware reuses this state verbatim.
+  if (req.authState) {
+    return req.authState;
+  }
+  if (req.user) {
+    req.authState = {
+      status: 'authenticated',
+      source: 'authorization',
+      user: req.user,
+    };
+    return req.authState;
+  }
+
+  const tokenResult = getAccessTokenFromRequest(req);
+  if (tokenResult.invalidAuthorizationHeader) {
+    req.authState = { status: 'anonymous', reason: 'invalid_format' };
+    return req.authState;
+  }
+  if (!tokenResult.token) {
+    req.authState = { status: 'anonymous', reason: 'missing' };
+    return req.authState;
+  }
+
+  try {
+    const decoded = await verifyAccessToken(tokenResult.token);
+    if (tokenResult.source === 'cookie' && !isCookieCsrfValid(req, decoded)) {
+      req.authState = { status: 'anonymous', reason: 'invalid_csrf' };
+      return req.authState;
+    }
+
+    const user = {
+      userId: decoded.userId,
+      sessionId: decoded.sessionId,
+    };
+    req.user = user;
+    req.authState = {
+      status: 'authenticated',
+      source: tokenResult.source === 'cookie' ? 'cookie' : 'authorization',
+      user,
+    };
+    return req.authState;
+  } catch (error) {
+    req.authState = {
+      status: 'anonymous',
+      reason: 'invalid_token',
+      errorMessage: error instanceof Error ? error.message : 'Token verification failed',
+    };
+    return req.authState;
+  }
+}
+
 /**
  * Authentication middleware
  * Verifies JWT token from Authorization header and attaches user to request
@@ -189,9 +241,15 @@ export const authenticate = async (
   };
 
   try {
-    const tokenResult = getAccessTokenFromRequest(req);
+    const authState = await resolveRequestAuth(req);
 
-    if (tokenResult.invalidAuthorizationHeader) {
+    if (authState.status === 'authenticated') {
+      req.user = authState.user;
+      next();
+      return;
+    }
+
+    if (authState.reason === 'invalid_format') {
       if (sendProximityAuthenticationError('Authentication is invalid or expired')) return;
       res.status(401).json({
         error: 'Invalid token format. Use "Bearer <token>".',
@@ -201,7 +259,7 @@ export const authenticate = async (
       return;
     }
 
-    if (!tokenResult.token) {
+    if (authState.reason === 'missing') {
       if (sendProximityAuthenticationError('Authentication is required')) return;
       res.status(401).json({
         error: 'No authentication token provided.',
@@ -211,85 +269,71 @@ export const authenticate = async (
       return;
     }
 
-    // Verify token
-    try {
-      const decoded = await verifyAccessToken(tokenResult.token);
-
-      if (tokenResult.source === 'cookie' && !isCookieCsrfValid(req, decoded)) {
-        res.status(403).json({
-          error: 'Invalid or missing CSRF token',
-          code: 'invalid_csrf',
-          requestId,
-        });
-        return;
-      }
-
-      // Attach user info to request
-      req.user = {
-        userId: decoded.userId,
-        sessionId: decoded.sessionId,
-      };
-
-      // Continue to next middleware/controller
-      next();
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Token verification failed';
-
-      if (errorMessage.includes('expired')) {
-        if (sendProximityAuthenticationError('Authentication has expired')) return;
-        res.status(401).json({
-          error: 'Token has expired. Please login again.',
-          code: 'token_expired',
-          requestId,
-        });
-        return;
-      }
-
-      if (errorMessage.includes('suspended')) {
-        res.status(403).json({
-          error: 'User account is temporarily suspended',
-          code: 'account_suspended',
-          requestId,
-        });
-        return;
-      }
-
-      if (errorMessage.includes('disabled or email verification required')) {
-        res.status(403).json({
-          error: 'User account is disabled or email verification is required',
-          code: 'auth_not_allowed',
-          requestId,
-        });
-        return;
-      }
-
-      if (errorMessage.includes('disabled')) {
-        res.status(403).json({
-          error: 'User account is disabled',
-          code: 'account_disabled',
-          requestId,
-        });
-        return;
-      }
-
-      if (errorMessage.includes('verification')) {
-        res.status(403).json({
-          error: 'Please verify your email before continuing.',
-          code: 'email_not_verified',
-          requestId,
-          requiresVerification: true,
-        });
-        return;
-      }
-
-      if (sendProximityAuthenticationError('Authentication is invalid or expired')) return;
-      res.status(401).json({
-        error: 'Invalid or malformed token',
-        code: 'unauthorized',
+    if (authState.reason === 'invalid_csrf') {
+      res.status(403).json({
+        error: 'Invalid or missing CSRF token',
+        code: 'invalid_csrf',
         requestId,
       });
       return;
     }
+
+    const errorMessage = authState.errorMessage || 'Token verification failed';
+
+    if (errorMessage.includes('expired')) {
+      if (sendProximityAuthenticationError('Authentication has expired')) return;
+      res.status(401).json({
+        error: 'Token has expired. Please login again.',
+        code: 'token_expired',
+        requestId,
+      });
+      return;
+    }
+
+    if (errorMessage.includes('suspended')) {
+      res.status(403).json({
+        error: 'User account is temporarily suspended',
+        code: 'account_suspended',
+        requestId,
+      });
+      return;
+    }
+
+    if (errorMessage.includes('disabled or email verification required')) {
+      res.status(403).json({
+        error: 'User account is disabled or email verification is required',
+        code: 'auth_not_allowed',
+        requestId,
+      });
+      return;
+    }
+
+    if (errorMessage.includes('disabled')) {
+      res.status(403).json({
+        error: 'User account is disabled',
+        code: 'account_disabled',
+        requestId,
+      });
+      return;
+    }
+
+    if (errorMessage.includes('verification')) {
+      res.status(403).json({
+        error: 'Please verify your email before continuing.',
+        code: 'email_not_verified',
+        requestId,
+        requiresVerification: true,
+      });
+      return;
+    }
+
+    if (sendProximityAuthenticationError('Authentication is invalid or expired')) return;
+    res.status(401).json({
+      error: 'Invalid or malformed token',
+      code: 'unauthorized',
+      requestId,
+    });
+    return;
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
     log.error({
@@ -318,29 +362,10 @@ export const optionalAuth = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const tokenResult = getAccessTokenFromRequest(req);
-
-    if (!tokenResult.token || tokenResult.invalidAuthorizationHeader) {
-      // No token provided, continue without user
-      next();
-      return;
+    const authState = await resolveRequestAuth(req);
+    if (authState.status === 'authenticated') {
+      req.user = authState.user;
     }
-
-    try {
-      const decoded = await verifyAccessToken(tokenResult.token);
-      if (tokenResult.source === 'cookie' && !isCookieCsrfValid(req, decoded)) {
-        next();
-        return;
-      }
-
-      req.user = {
-        userId: decoded.userId,
-        sessionId: decoded.sessionId,
-      };
-    } catch (error) {
-      // Token invalid, continue without user
-    }
-
     next();
   } catch (error) {
     console.error('Optional auth middleware error:', error);

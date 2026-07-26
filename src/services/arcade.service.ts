@@ -184,7 +184,13 @@ export async function withArcadeRoomLock<T>(roomId: string, fn: () => Promise<T>
 
   const key = lockKey(roomId);
   const token = crypto.randomUUID();
-  const acquired = await redisCommand.set(key, token, 'PX', 5_000, 'NX');
+  let acquired: string | null;
+  try {
+    acquired = await redisCommand.set(key, token, 'PX', 5_000, 'NX');
+  } catch {
+    // Readiness can change after the check; degrade to the local execution path.
+    return fn();
+  }
   if (!acquired) {
     throw Object.assign(new Error('Room is busy. Try again.'), { statusCode: 409 });
   }
@@ -197,14 +203,18 @@ export async function withArcadeRoomLock<T>(roomId: string, fn: () => Promise<T>
       1,
       key,
       token
-    );
+    ).catch(() => undefined);
   }
 }
 
 export async function getRuntimeState(roomId: string): Promise<ArcadeRuntimeState | null> {
   if (isRedisReady() && redisCommand) {
-    const raw = await redisCommand.get(stateKey(roomId));
-    return raw ? (JSON.parse(raw) as ArcadeRuntimeState) : null;
+    try {
+      const raw = await redisCommand.get(stateKey(roomId));
+      return raw ? (JSON.parse(raw) as ArcadeRuntimeState) : null;
+    } catch {
+      // Fall through to the per-process cache when Redis is unavailable/rate-limited.
+    }
   }
 
   return memoryRuntimeState.get(roomId) || null;
@@ -217,10 +227,15 @@ export async function saveRuntimeState(state: ArcadeRuntimeState): Promise<Arcad
   };
 
   if (isRedisReady() && redisCommand) {
-    await redisCommand.set(stateKey(state.roomId), JSON.stringify(nextState), 'EX', ROOM_TTL_SECONDS);
-  } else {
-    memoryRuntimeState.set(state.roomId, nextState);
+    try {
+      await redisCommand.set(stateKey(state.roomId), JSON.stringify(nextState), 'EX', ROOM_TTL_SECONDS);
+      return nextState;
+    } catch {
+      // Cache writes become best-effort and never fail the endpoint.
+    }
   }
+
+  memoryRuntimeState.set(state.roomId, nextState);
 
   return nextState;
 }

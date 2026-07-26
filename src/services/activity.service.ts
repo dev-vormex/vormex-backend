@@ -38,7 +38,7 @@ export async function recordActivity(
   userId: string,
   activityType: ActivityType,
   count: number = 1,
-  options: { sourceId?: string | null } = {}
+  options: { sourceId?: string | null; skipStatsUpdate?: boolean } = {}
 ): Promise<void> {
   try {
     const today = getTodayDateString();
@@ -139,10 +139,13 @@ export async function recordActivity(
 
     console.log(`Activity recorded: user ${userId}, type: ${activityType}, count: ${activityCount}`);
 
-    // Trigger stats update asynchronously (don't await)
-    updateUserStats(userId).catch((err) =>
-      console.error(`Failed to update stats for user ${userId}:`, err)
-    );
+    if (!options.skipStatsUpdate) {
+      // Existing callers retain fire-and-forget aggregation. Background connection
+      // processing skips it because it refreshes connection counts sequentially.
+      updateUserStats(userId).catch((err) =>
+        console.error(`Failed to update stats for user ${userId}:`, err)
+      );
+    }
   } catch (error) {
     console.error(`Failed to record activity for user ${userId}:`, error);
     // Don't throw - activity tracking is non-critical

@@ -15,7 +15,7 @@ const router = express.Router();
 /**
  * Profile Routes
  * 
- * GET /api/users/:userId/profile - Get full user profile (supports UUID, username, or "me", public, respects privacy)
+ * GET /api/users/:userId/profile - Get core profile; pass ?include=all for the legacy full bundle
  * GET /api/users/:userId/feed - Get user's content feed (supports UUID or username, public)
  * GET /api/users/:userId/activity - Get activity heatmap (supports UUID or username, public)
  * GET /api/users/:userId/activity/years - Get available years (supports UUID or username, public)

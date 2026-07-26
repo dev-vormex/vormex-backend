@@ -114,6 +114,21 @@ export interface AuthenticatedRequest extends Request {
     userId: string | number; // Supports both String (UUID) and Number (legacy) IDs
     sessionId?: string;
   };
+  /** Resolved once by global auth and reused by route-level auth middleware. */
+  authState?:
+    | {
+        status: 'authenticated';
+        source: 'authorization' | 'cookie';
+        user: {
+          userId: string | number;
+          sessionId?: string;
+        };
+      }
+    | {
+        status: 'anonymous';
+        reason: 'missing' | 'invalid_format' | 'invalid_csrf' | 'invalid_token';
+        errorMessage?: string;
+      };
 }
 
 /**

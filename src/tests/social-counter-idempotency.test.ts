@@ -17,8 +17,9 @@ function between(text: string, start: string, end: string): string {
   return text.slice(startIndex, endIndex);
 }
 
-test('connection accept guards pending transition and increments stats in the same transaction', () => {
+test('connection accept guards pending transition and enqueues idempotent stats side effects', () => {
   const controller = source('src/controllers/connection.controller.ts');
+  const sideEffects = source('src/services/connection-accepted-side-effects.service.ts');
   const handler = between(
     controller,
     'export const acceptConnectionRequest',
@@ -28,8 +29,13 @@ test('connection accept guards pending transition and increments stats in the sa
   assert.match(handler, /prisma\.\$transaction/);
   assert.match(handler, /tx\.connections\.updateMany\(\{\s*where: \{ id: connectionId, addresseeId: req\.user!\.userId, status: 'pending' \}/s);
   assert.match(handler, /if \(acceptResult\.count !== 1\)/);
-  assert.match(handler, /tx\.userStats\.upsert/);
+  assert.match(handler, /enqueueOutboxEvent\(tx/);
+  assert.match(handler, /idempotencyKey: `connection:\$\{connectionId\}:accepted:side-effects`/);
+  assert.doesNotMatch(handler, /userStats\.upsert/);
   assert.doesNotMatch(handler, /prisma\.userStats\.updateMany/);
+  assert.match(sideEffects, /connectionsCount = await prisma\.connections\.count/);
+  assert.match(sideEffects, /prisma\.userStats\.upsert/);
+  assert.match(sideEffects, /update: \{ connectionsCount \}/);
 });
 
 test('follow and unfollow mutate follow row and counters atomically without swallowed stats errors', () => {

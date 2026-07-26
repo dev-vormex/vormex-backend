@@ -4,11 +4,17 @@ import { prismaRead } from '../config/prisma';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import type { QueueName } from '../infrastructure/queue/queue-names';
 import { getQueue } from '../infrastructure/queue/queues';
-import { isRedisEnabled, isRedisRequired, redisCommand } from '../infrastructure/redis/client';
+import {
+  isRedisEnabled,
+  isRedisRequired,
+  redisCommand,
+  redisWorker,
+} from '../infrastructure/redis/client';
 import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
 import { claimEnvelopePublish, publishRealtimeEnvelope } from '../infrastructure/realtime/channels';
 import type {
   CacheInvalidationPayload,
+  ConnectionAcceptedSideEffectsPayload,
   NotificationDeliveryPayload,
   RealtimeFanoutPayload,
 } from '../outbox/types';
@@ -24,6 +30,7 @@ import {
   enqueuePendingDeliveryReconciliation,
   reconcilePendingMessageDeliveries,
 } from '../services/chat-delivery-reconciliation.service';
+import { processConnectionAcceptedSideEffects } from '../services/connection-accepted-side-effects.service';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -224,6 +231,12 @@ async function processPeopleYouKnow() {
   return flushPendingPeopleYouKnowNotifications();
 }
 
+async function processAcceptedConnection(
+  job: Job<{ event: { payload: ConnectionAcceptedSideEffectsPayload } }>
+) {
+  return processConnectionAcceptedSideEffects(job.data.event.payload);
+}
+
 async function processMaintenance(job: Job) {
   if (job.name === 'outbox_dispatch_tick') {
     return dispatchOutboxBatch();
@@ -256,10 +269,14 @@ async function processMaintenance(job: Job) {
   return runMaintenanceJob(job.name as MaintenanceJobName);
 }
 
-function createWorker<T>(name: string, processor: (job: Job<any>) => Promise<T>): Worker {
+function createWorker<T>(
+  name: string,
+  processor: (job: Job<any>) => Promise<T>,
+  concurrency = WORKER_CONCURRENCY
+): Worker {
   return new Worker(name, processor, {
-    connection: redisCommand!,
-    concurrency: WORKER_CONCURRENCY,
+    connection: redisWorker!,
+    concurrency,
   });
 }
 
@@ -296,6 +313,8 @@ function createWorkers(): Worker[] {
     createWorker(queueNames.mediaProcessing, processMediaProcessing),
     createWorker(queueNames.scheduledPublish, processScheduledPublish),
     createWorker(queueNames.peopleYouKnow, processPeopleYouKnow),
+    // Serial execution prevents accepted-connection side effects from flooding the DB pool.
+    createWorker(queueNames.connectionSideEffects, processAcceptedConnection, 1),
     createWorker(queueNames.maintenance, processMaintenance),
   ];
 
@@ -339,7 +358,7 @@ function createWorkers(): Worker[] {
 }
 
 export async function startWorkers(): Promise<boolean> {
-  if (!isRedisEnabled() || !redisCommand) {
+  if (!isRedisEnabled() || !redisCommand || !redisWorker) {
     if (isRedisRequired()) {
       throw new Error('Workers require Redis, but Redis is not connected');
     }

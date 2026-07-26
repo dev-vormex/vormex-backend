@@ -50,3 +50,29 @@ export interface NotificationDeliveryPayload {
 export interface RealtimeFanoutPayload {
   envelopes: RealtimeEnvelope[];
 }
+
+export interface ConnectionAcceptedSideEffectsPayload {
+  connectionId: string;
+  requesterId: string;
+  addresseeId: string;
+  requester: {
+    id: string;
+    username: string;
+    name: string;
+    profileImage: string | null;
+    headline: string | null;
+    college: string | null;
+    isVerified: boolean;
+    profileBadgeStyle: string | null;
+  };
+  addressee: {
+    id: string;
+    username: string;
+    name: string;
+    profileImage: string | null;
+    headline: string | null;
+    college: string | null;
+    isVerified: boolean;
+    profileBadgeStyle: string | null;
+  };
+}

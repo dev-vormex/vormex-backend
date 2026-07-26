@@ -2,13 +2,17 @@ import Redis from 'ioredis';
 import { logger } from '../../lib/logger';
 
 const REDIS_URL = process.env.REDIS_URL;
-const REDIS_REQUIRED =
-  process.env.REDIS_REQUIRED === 'true' ||
-  (process.env.NODE_ENV === 'production' && process.env.REDIS_REQUIRED !== 'false');
+// Redis-backed features degrade to local/DB fallbacks unless strict mode is explicit.
+const REDIS_REQUIRED = process.env.REDIS_REQUIRED === 'true';
 const REDIS_CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.REDIS_CONNECT_TIMEOUT_MS, 5_000);
+const REDIS_COMMAND_TIMEOUT_MS = parsePositiveInt(process.env.REDIS_COMMAND_TIMEOUT_MS, 1_000);
 const REDIS_OPTIONAL_RETRY_ATTEMPTS = parsePositiveInt(
   process.env.REDIS_OPTIONAL_RETRY_ATTEMPTS,
-  1
+  3
+);
+const REDIS_REQUIRED_RETRY_ATTEMPTS = parsePositiveInt(
+  process.env.REDIS_REQUIRED_RETRY_ATTEMPTS,
+  5
 );
 const REDIS_ERROR_LOG_THROTTLE_MS = parsePositiveInt(
   process.env.REDIS_ERROR_LOG_THROTTLE_MS,
@@ -33,26 +37,27 @@ function summarizeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function createRedisClient(label: string): Redis | null {
+function createRedisClient(label: string, blocking = false): Redis | null {
   if (!REDIS_URL) {
     return null;
   }
 
   const client = new Redis(REDIS_URL, {
     connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
-    maxRetriesPerRequest: null,
+    ...(blocking ? {} : { commandTimeout: REDIS_COMMAND_TIMEOUT_MS }),
+    // API commands fail quickly; the dedicated BullMQ connection must remain null.
+    maxRetriesPerRequest: blocking ? null : 1,
     enableReadyCheck: true,
     lazyConnect: true,
     retryStrategy(times) {
-      if (REDIS_REQUIRED) {
-        return Math.min(times * 500, 5_000);
-      }
-
-      if (times > REDIS_OPTIONAL_RETRY_ATTEMPTS) {
+      const maxAttempts = REDIS_REQUIRED
+        ? REDIS_REQUIRED_RETRY_ATTEMPTS
+        : REDIS_OPTIONAL_RETRY_ATTEMPTS;
+      if (times > maxAttempts) {
         return null;
       }
 
-      return Math.min(times * 250, 1_000);
+      return Math.min(250 * 2 ** Math.max(0, times - 1), 5_000);
     },
   });
 
@@ -61,7 +66,7 @@ function createRedisClient(label: string): Redis | null {
 
     const now = Date.now();
     const previous = redisErrorLastLoggedAt.get(label) || 0;
-    if (!REDIS_REQUIRED && now - previous < REDIS_ERROR_LOG_THROTTLE_MS) {
+    if (now - previous < REDIS_ERROR_LOG_THROTTLE_MS) {
       return;
     }
 
@@ -107,6 +112,8 @@ function createRedisClient(label: string): Redis | null {
 export const redisCommand = createRedisClient('command');
 export const redisPub = createRedisClient('pub');
 export const redisSub = createRedisClient('sub');
+// Lazy and worker-only, so API processes do not open an extra Redis connection.
+export const redisWorker = createRedisClient('worker', true);
 
 export function isRedisEnabled(): boolean {
   return Boolean(
@@ -169,7 +176,7 @@ export async function connectRedisClients(): Promise<void> {
 
 export async function disconnectRedisClients(): Promise<void> {
   await Promise.allSettled(
-    [redisCommand, redisPub, redisSub]
+    [redisCommand, redisPub, redisSub, redisWorker]
       .filter((client): client is Redis => Boolean(client))
       .map((client) => client.quit().catch(() => client.disconnect()))
   );

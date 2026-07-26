@@ -8,7 +8,7 @@ import * as profileService from '../services/profile.service';
 import { getActivityHeatmap, getContributionYears } from '../services/activity.service';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { isUUID } from '../utils/username.util';
-import type { FullProfileResponse, UnifiedFeedResponse } from '../types/profile.types';
+import type { ProfileResponse, UnifiedFeedResponse } from '../types/profile.types';
 import type { ActivityHeatmapResponse } from '../types/activity.types';
 import {
   isProfileThemeKey,
@@ -78,7 +78,7 @@ const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.fi
  */
 export const getProfile = async (
   req: AuthenticatedRequest,
-  res: Response<FullProfileResponse | ErrorResponse>
+  res: Response<ProfileResponse | ErrorResponse>
 ): Promise<void> => {
   try {
     let userId = ensureString(req.params.userId);
@@ -107,7 +107,14 @@ export const getProfile = async (
       userId = requestingUserId;
     }
 
-    const profile = await profileService.getFullProfile(requestingUserId, userId);
+    const includes = (ensureString(req.query.include) || '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    // Default to the 2-3 query core payload; explicit include=all preserves the legacy bundle.
+    const profile = includes.includes('all')
+      ? await profileService.getFullProfile(requestingUserId, userId)
+      : await profileService.getCoreProfile(requestingUserId, userId);
 
     res.status(200).json(profile);
   } catch (error) {

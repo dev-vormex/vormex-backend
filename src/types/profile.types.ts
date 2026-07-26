@@ -58,6 +58,51 @@ export interface UnifiedFeedResponse {
   nextCursor?: string;
 }
 
+export type ProfileConnectionStatus =
+  | 'none'
+  | 'pending_sent'
+  | 'pending_received'
+  | 'connected'
+  | 'blocked';
+
+/** Default lightweight profile payload; heavy collections are opt-in. */
+export interface CoreProfileResponse {
+  user: {
+    id: string;
+    username: string;
+    name: string;
+    email?: string;
+    avatar: string | null;
+    profileImage: string | null;
+    bannerImageUrl: string | null;
+    headline: string | null;
+    bio: string | null;
+    location: CoarseLocationDTO | null;
+    college: string;
+    degree: string | null;
+    branch: string;
+    currentYear: number | null;
+    graduationYear: number | null;
+    portfolioUrl: string | null;
+    linkedinUrl: string | null;
+    githubProfileUrl: string | null;
+    otherSocialUrls: any;
+    isOpenToOpportunities: boolean;
+    isOnline: boolean;
+    lastActiveAt: Date | null;
+    verified: boolean;
+    isVerified: boolean;
+    interests: string[];
+    createdAt: Date;
+  };
+  stats: FullProfileResponse['stats'];
+  viewerContext: {
+    connectionStatus: ProfileConnectionStatus;
+    connectionId: string | null;
+    direction?: 'sent' | 'received';
+  };
+}
+
 export interface FullProfileResponse {
   user: {
     id: string;
@@ -149,3 +194,5 @@ export interface FullProfileResponse {
     isProfileSaved: boolean;
   };
 }
+
+export type ProfileResponse = CoreProfileResponse | FullProfileResponse;

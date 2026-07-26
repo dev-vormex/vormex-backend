@@ -3,9 +3,6 @@ import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
-import { recordActivity } from '../services/activity.service';
-import { updateEngagementStreak } from './engagement.controller';
-import { getIO } from '../sockets';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
 import {
@@ -23,7 +20,8 @@ import {
   enforceTrustTierLimit,
   safetyErrorResponse,
 } from '../services/trust-safety.service';
-import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
+import { queueNames } from '../infrastructure/queue/queue-names';
+import { enqueueOutboxEvent } from '../outbox/service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -200,6 +198,9 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
         users_connections_requesterIdTousers: {
           select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
         },
+        users_connections_addresseeIdTousers: {
+          select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
+        },
       },
     });
 
@@ -218,7 +219,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       return;
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const accepted = await prisma.$transaction(async (tx) => {
       const acceptResult = await tx.connections.updateMany({
         where: { id: connectionId, addresseeId: req.user!.userId, status: 'pending' },
         data: { status: 'accepted' },
@@ -228,90 +229,37 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
         return null;
       }
 
-      await Promise.all([
-        tx.userStats.upsert({
-          where: { userId: connection.requesterId },
-          update: { connectionsCount: { increment: 1 } },
-          create: { userId: connection.requesterId, connectionsCount: 1 },
-        }),
-        tx.userStats.upsert({
-          where: { userId: connection.addresseeId },
-          update: { connectionsCount: { increment: 1 } },
-          create: { userId: connection.addresseeId, connectionsCount: 1 },
-        }),
-      ]);
-
-      return tx.connections.findUniqueOrThrow({
-        where: { id: connectionId },
+      // Persist one durable job in the same minimal transaction as the accept.
+      await enqueueOutboxEvent(tx, {
+        aggregateType: 'connection',
+        aggregateId: connectionId,
+        eventType: 'connection.accepted.side_effects',
+        queueName: queueNames.connectionSideEffects,
+        idempotencyKey: `connection:${connectionId}:accepted:side-effects`,
+        payload: {
+          connectionId,
+          requesterId: connection.requesterId,
+          addresseeId: connection.addresseeId,
+          requester: connection.users_connections_requesterIdTousers,
+          addressee: connection.users_connections_addresseeIdTousers,
+        },
       });
+
+      return true;
     });
 
-    if (!updated) {
+    if (!accepted) {
       res.status(400).json({ error: 'Connection request is no longer pending' });
       return;
     }
 
-    // Record activity for both users (non-blocking)
-    recordActivity(req.user.userId, 'connection', 1, { sourceId: connectionId }).catch(console.error);
-    recordActivity(connection.requesterId, 'connection', 1, { sourceId: connectionId }).catch(console.error);
-    recordAuthoritativeRecommendationOutcome({
-      userId: connection.requesterId,
-      entityType: 'PERSON',
-      entityId: connection.addresseeId,
-      eventType: 'CONNECTION_ACCEPTED',
-      meaningfulOutcome: true,
-      attributionWindowHours: 7 * 24,
-    }).catch(console.error);
-
-    // Update engagement streaks for both users (non-blocking)
-    updateEngagementStreak(req.user.userId, 'connection').catch(console.error);
-    updateEngagementStreak(connection.requesterId, 'connection').catch(console.error);
-
-    // Emit Socket.IO events for celebration
-    const io = getIO();
-    if (io) {
-      // Notify both users about the new connection
-      io.to(`user:${req.user.userId}`).emit('connection:accepted', {
-        connectionId: updated.id,
-        otherUser: connection.users_connections_requesterIdTousers,
-      });
-      
-      // Get addressee info for the requester's celebration
-      const addressee = await prisma.user.findUnique({
-        where: { id: req.user.userId },
-        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
-      });
-      
-      io.to(`user:${connection.requesterId}`).emit('connection:accepted', {
-        connectionId: updated.id,
-        otherUser: addressee,
-      });
-
-      // Send in-app notification to requester (non-blocking)
-      notificationService.notifyConnectionAccepted(
-        connection.requesterId,
-        req.user.userId,
-        addressee?.name || 'Someone'
-      ).catch(console.error);
-
-      // Send push notification to requester (non-blocking)
-      pushNotificationService.pushConnectionAccepted(
-        connection.requesterId,
-        addressee?.name || 'Someone',
-        updated.id,
-        req.user.userId
-      ).catch(console.error);
-    }
-
-    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
-
     res.status(200).json({
       message: 'Connection request accepted',
       connection: {
-        id: updated.id,
+        id: connection.id,
         status: 'ACCEPTED',
         message: null,
-        createdAt: updated.createdAt.toISOString(),
+        createdAt: connection.createdAt.toISOString(),
         user: connection.users_connections_requesterIdTousers,
       },
     });

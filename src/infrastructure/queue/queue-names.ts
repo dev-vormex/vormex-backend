@@ -6,6 +6,7 @@ export const queueNames = {
   mediaProcessing: 'media_processing',
   scheduledPublish: 'scheduled_publish',
   peopleYouKnow: 'people_you_know',
+  connectionSideEffects: 'connection_side_effects',
   maintenance: 'maintenance',
 } as const;
 

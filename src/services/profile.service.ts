@@ -6,7 +6,9 @@ import { decryptToken } from '../utils/encryption.util';
 import type {
   UnifiedContentItem,
   UnifiedFeedResponse,
+  CoreProfileResponse,
   FullProfileResponse,
+  ProfileConnectionStatus,
 } from '../types/profile.types';
 import { getActivityHeatmap } from './activity.service';
 import { getGitHubContributionCalendar } from './github.service';
@@ -28,6 +30,37 @@ import { serializeCoarseLocation } from '../utils/location-dto.util';
 
 const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 const LEGACY_PROFILE_AVIF_PATTERN = /\/profiles\/avatars\/[^?#]+\.avif(?:$|[?#])/i;
+
+const CORE_PROFILE_USER_SELECT = {
+  id: true,
+  username: true,
+  name: true,
+  email: true,
+  profileImage: true,
+  bannerImageUrl: true,
+  headline: true,
+  bio: true,
+  location: true,
+  currentCity: true,
+  currentState: true,
+  currentCountry: true,
+  shareLocationPublic: true,
+  college: true,
+  degree: true,
+  branch: true,
+  currentYear: true,
+  graduationYear: true,
+  portfolioUrl: true,
+  linkedinUrl: true,
+  githubProfileUrl: true,
+  otherSocialUrls: true,
+  isOpenToOpportunities: true,
+  isOnline: true,
+  lastActiveAt: true,
+  isVerified: true,
+  interests: true,
+  createdAt: true,
+} as const;
 
 function isLegacyProfileAvifUrl(url: string | null | undefined): url is string {
   return Boolean(url && LEGACY_PROFILE_AVIF_PATTERN.test(url));
@@ -80,6 +113,56 @@ function isProfileUserOnline(user: { isOnline?: boolean | null; lastActiveAt?: D
   if (user.isOnline) return true;
   if (!user.lastActiveAt) return false;
   return Date.now() - user.lastActiveAt.getTime() < PROFILE_ONLINE_WINDOW_MS;
+}
+
+function emptyProfileStats() {
+  return {
+    xp: 0,
+    level: 1,
+    totalPosts: 0,
+    totalArticles: 0,
+    totalShortVideos: 0,
+    totalForumQuestions: 0,
+    totalForumAnswers: 0,
+    totalComments: 0,
+    totalLikesReceived: 0,
+    connectionsCount: 0,
+    followersCount: 0,
+    currentStreak: 0,
+    longestStreak: 0,
+    lastActiveDate: null,
+    totalActiveDays: 0,
+  };
+}
+
+function toProfileConnectionState(
+  connection: {
+    id: string;
+    requesterId: string;
+    status: string;
+  } | null,
+  requestingUserId: string | null
+): CoreProfileResponse['viewerContext'] {
+  if (!connection || !requestingUserId) {
+    return { connectionStatus: 'none', connectionId: null };
+  }
+
+  let connectionStatus: ProfileConnectionStatus = 'none';
+  let direction: 'sent' | 'received' | undefined;
+  if (connection.status === 'accepted') {
+    connectionStatus = 'connected';
+  } else if (connection.status === 'blocked') {
+    connectionStatus = 'blocked';
+  } else if (connection.status === 'pending') {
+    direction = connection.requesterId === requestingUserId ? 'sent' : 'received';
+    connectionStatus = direction === 'sent' ? 'pending_sent' : 'pending_received';
+  }
+
+  return {
+    connectionStatus,
+    connectionId: connection.id,
+    ...(direction ? { direction } : {}),
+  };
 }
 
 async function backfillGitHubContributionCalendar(
@@ -488,6 +571,128 @@ export async function getUnifiedContentFeed(
       hasMore: false,
     };
   }
+}
+
+/**
+ * Load the default profile header/counts path with at most three DB queries:
+ * user, aggregate stats, and (for a signed-in viewer) relationship state.
+ */
+export async function getCoreProfile(
+  requestingUserId: string | null,
+  targetUsernameOrId: string
+): Promise<CoreProfileResponse> {
+  let identifier = targetUsernameOrId.startsWith('@')
+    ? targetUsernameOrId.substring(1)
+    : targetUsernameOrId;
+
+  const user = await prisma.user.findFirst({
+    where: isUUID(identifier)
+      ? { id: identifier }
+      : { username: identifier.toLowerCase() },
+    select: CORE_PROFILE_USER_SELECT,
+  });
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const targetUserId = user.id;
+  const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
+  const cacheKey = `profile:core:${requestingUserId || 'anon'}:${targetUserId}`;
+  const cached = await cacheService.get<CoreProfileResponse>(cacheKey);
+  if (cached) {
+    if (requestingUserId && !isOwner) {
+      setImmediate(() => {
+        void socialProofService.trackProfileView(
+          requestingUserId,
+          targetUserId,
+          'profile_open'
+        );
+      });
+    }
+    return cached;
+  }
+
+  // Only these two branches run together; this caps the core path at 2-3 queries total.
+  const [userStats, connection] = await Promise.all([
+    prisma.userStats.findUnique({ where: { userId: targetUserId } }).catch(() => null),
+    requestingUserId && !isOwner
+      ? prisma.connections.findFirst({
+          where: {
+            OR: [
+              { requesterId: requestingUserId, addresseeId: targetUserId },
+              { requesterId: targetUserId, addresseeId: requestingUserId },
+            ],
+          },
+          select: { id: true, requesterId: true, status: true },
+        }).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
+  const sourceStats = userStats || emptyProfileStats();
+  const levelProgress = calculateLevelProgress(sourceStats.xp);
+  const canShowLocation = isOwner || user.shareLocationPublic === true;
+  const response: CoreProfileResponse = {
+    user: {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      ...(isOwner ? { email: user.email } : {}),
+      avatar: user.profileImage,
+      profileImage: user.profileImage,
+      bannerImageUrl: user.bannerImageUrl,
+      headline: user.headline,
+      bio: user.bio,
+      location: canShowLocation ? serializeCoarseLocation(user) : null,
+      college: user.college || '',
+      degree: user.degree,
+      branch: user.branch || '',
+      currentYear: user.currentYear,
+      graduationYear: user.graduationYear,
+      portfolioUrl: user.portfolioUrl,
+      linkedinUrl: user.linkedinUrl,
+      githubProfileUrl: user.githubProfileUrl,
+      otherSocialUrls: user.otherSocialUrls,
+      isOpenToOpportunities: user.isOpenToOpportunities,
+      isOnline: isProfileUserOnline(user),
+      lastActiveAt: user.lastActiveAt,
+      verified: user.isVerified,
+      isVerified: user.isVerified,
+      interests: user.interests || [],
+      createdAt: user.createdAt,
+    },
+    stats: {
+      xp: sourceStats.xp,
+      level: levelProgress.level,
+      xpToNextLevel: levelProgress.xpToNextLevel,
+      totalPosts: sourceStats.totalPosts,
+      totalArticles: sourceStats.totalArticles,
+      totalShortVideos: sourceStats.totalShortVideos,
+      totalForumQuestions: sourceStats.totalForumQuestions,
+      totalForumAnswers: sourceStats.totalForumAnswers,
+      totalComments: sourceStats.totalComments,
+      totalLikesReceived: sourceStats.totalLikesReceived,
+      connectionsCount: sourceStats.connectionsCount,
+      followersCount: sourceStats.followersCount,
+      currentStreak: sourceStats.currentStreak,
+      longestStreak: sourceStats.longestStreak,
+      lastActiveDate: sourceStats.lastActiveDate,
+      totalActiveDays: sourceStats.totalActiveDays,
+    },
+    viewerContext: toProfileConnectionState(connection, requestingUserId),
+  };
+
+  await cacheService.set(cacheKey, response, 60, [`user:${targetUserId}`]);
+  if (requestingUserId && !isOwner) {
+    // Profile-view tracking starts after the core read path instead of competing with it.
+    setImmediate(() => {
+      void socialProofService.trackProfileView(
+        requestingUserId,
+        targetUserId,
+        'profile_open'
+      );
+    });
+  }
+  return response;
 }
 
 /**

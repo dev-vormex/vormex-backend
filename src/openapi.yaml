@@ -1454,7 +1454,7 @@ paths:
       tags:
         - Profile
       summary: Get user profile
-      description: Get full user profile with all data. Supports UUID or username (e.g., @koushik). Public route but respects privacy settings.
+      description: Get the lightweight core profile by default. Pass include=all for the legacy full bundle. Supports UUID or username (e.g., @koushik).
       parameters:
         - name: userId
           in: path
@@ -1472,11 +1472,18 @@ paths:
             usernameWithAt:
               summary: Username with @ prefix
               value: '@koushik'
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all]
+          description: Set to all to include GitHub, heatmap, feed, professional history, certificates, and achievements.
       security:
         - bearerAuth: []
       responses:
         '200':
-          description: Profile data
+          description: Core profile data, or the legacy full bundle when include=all
           content:
             application/json:
               schema:
