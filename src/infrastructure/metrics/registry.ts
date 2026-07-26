@@ -60,6 +60,28 @@ export const cacheOutcomeCounter = new client.Counter({
   registers: [register],
 });
 
+export const cacheRequestCounter = new client.Counter({
+  name: 'vormex_cache_request_total',
+  help: 'Application cache requests by operation, outcome, backend, and bounded namespace',
+  labelNames: ['operation', 'outcome', 'backend', 'namespace'],
+  registers: [register],
+});
+
+export const cacheOperationDuration = new client.Histogram({
+  name: 'vormex_cache_operation_duration_ms',
+  help: 'Application cache operation duration in milliseconds',
+  labelNames: ['operation', 'outcome', 'backend', 'namespace'],
+  buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000],
+  registers: [register],
+});
+
+export const profileViewAnalyticsCounter = new client.Counter({
+  name: 'vormex_profile_view_analytics_total',
+  help: 'Automatic profile-view analytics queue outcomes',
+  labelNames: ['outcome'],
+  registers: [register],
+});
+
 export const dbConnectionGauge = new client.Gauge({
   name: 'vormex_db_connections',
   help: 'Postgres connections visible to the current database, grouped by connection state',

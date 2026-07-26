@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
+import { redisSessionStore } from '../infrastructure/cache/redis-cache.service';
 import { isRedisEnabled, isRedisRequired, redisCommand } from '../infrastructure/redis/client';
 
 const ONE_THOUSAND_DAYS_SECONDS = 60 * 60 * 24 * 1000;
@@ -33,13 +33,13 @@ function sessionKey(sessionId: string): string {
 }
 
 export async function getAuthSession(sessionId: string): Promise<StoredSession | null> {
-  const session = await redisCacheService.get<StoredSession>(sessionKey(sessionId));
+  const session = await redisSessionStore.get<StoredSession>(sessionKey(sessionId));
   if (!session) {
     return null;
   }
 
   if (new Date(session.expiresAt).getTime() <= Date.now()) {
-    await redisCacheService.del(sessionKey(sessionId));
+    await redisSessionStore.del(sessionKey(sessionId));
     return null;
   }
 
@@ -86,7 +86,7 @@ async function storeSession(session: StoredSession): Promise<void> {
     Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000)
   );
 
-  await redisCacheService.set(sessionKey(session.sessionId), session, ttlSeconds, [
+  await redisSessionStore.set(sessionKey(session.sessionId), session, ttlSeconds, [
     `auth:user:${session.userId}`,
   ]);
 
@@ -169,8 +169,8 @@ export async function revokeAuthSession(refreshToken: string): Promise<void> {
     return;
   }
 
-  const existing = await redisCacheService.get<StoredSession>(sessionKey(parsed.sessionId));
-  await redisCacheService.del(sessionKey(parsed.sessionId));
+  const existing = await redisSessionStore.get<StoredSession>(sessionKey(parsed.sessionId));
+  await redisSessionStore.del(sessionKey(parsed.sessionId));
 
   if (existing?.userId && isRedisEnabled() && redisCommand) {
     try {
@@ -197,7 +197,7 @@ export async function revokeAllAuthSessions(userId: string): Promise<void> {
   }
 
   await Promise.allSettled(
-    sessionIds.map((sessionId) => redisCacheService.del(sessionKey(sessionId)))
+    sessionIds.map((sessionId) => redisSessionStore.del(sessionKey(sessionId)))
   );
 
   if (isRedisEnabled() && redisCommand) {

@@ -19,8 +19,9 @@ const PEOPLE_YOU_KNOW_INTERVAL_MS = parsePositiveInt(
 );
 const OUTBOX_DISPATCH_INTERVAL_MS = parsePositiveInt(
   process.env.OUTBOX_DISPATCH_INTERVAL_MS,
-  2_000
+  30_000
 );
+const OUTBOX_DISPATCH_ENABLED = process.env.OUTBOX_DISPATCH_ENABLED === 'true';
 
 export async function registerSchedulerJobs(): Promise<boolean> {
   if (!isQueueingEnabled()) {
@@ -57,16 +58,23 @@ export async function registerSchedulerJobs(): Promise<boolean> {
     }
   );
 
-  await getQueue(queueNames.maintenance).upsertJobScheduler(
-    'outbox_dispatch_tick',
-    {
-      every: OUTBOX_DISPATCH_INTERVAL_MS,
-    },
-    {
-      name: 'outbox_dispatch_tick',
-      data: {},
-    }
-  );
+  const maintenanceQueue = getQueue(queueNames.maintenance);
+  if (OUTBOX_DISPATCH_ENABLED) {
+    await maintenanceQueue.upsertJobScheduler(
+      'outbox_dispatch_tick',
+      {
+        every: OUTBOX_DISPATCH_INTERVAL_MS,
+      },
+      {
+        name: 'outbox_dispatch_tick',
+        data: {},
+      }
+    );
+  } else {
+    // Redis can be verified without releasing any historical outbox events.
+    await maintenanceQueue.removeJobScheduler('outbox_dispatch_tick');
+    logger.info({ event: 'outbox.dispatch.scheduler_disabled' });
+  }
 
   for (const schedule of maintenanceSchedules) {
     await getQueue(queueNames.maintenance).upsertJobScheduler(

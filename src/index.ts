@@ -90,6 +90,7 @@ import {
 } from './infrastructure/redis/client';
 import { initializeRealtimeSubscriptions } from './infrastructure/realtime/subscriber';
 import { requestSizeGuard } from './infrastructure/security/request-size.middleware';
+import { getBackgroundProcessesHealth } from './infrastructure/health/background-process-heartbeat';
 import {
   validateAIRequestInput,
   validateRequestInput,
@@ -242,7 +243,7 @@ function shouldStartApiRedis(): boolean {
     return false;
   }
 
-  const redisUrl = process.env.REDIS_URL || '';
+  const redisUrl = process.env.CRITICAL_REDIS_URL || process.env.REDIS_URL || '';
   return process.env.NODE_ENV === 'production' || !/upstash\.io/i.test(redisUrl);
 }
 
@@ -2675,14 +2676,21 @@ app.get('/api/health/live', async (_req: Request, res: Response): Promise<void> 
 app.get('/api/health/ready', async (_req: Request, res: Response): Promise<void> => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    const redisHealth = await getRedisHealth();
-    const redisReady = redisHealth.status === 'connected' || redisHealth.status === 'disabled';
+    const [redisHealth, backgroundProcesses] = await Promise.all([
+      getRedisHealth(),
+      getBackgroundProcessesHealth(),
+    ]);
+    const redisReady = Object.values(redisHealth.roles).every(
+      (role) => role.status === 'connected' || role.status === 'disabled'
+    );
+    const ready = redisReady && backgroundProcesses.healthy;
 
-    res.status(redisReady ? 200 : 503).json({
-      status: redisReady ? 'ok' : 'error',
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ok' : 'error',
       timestamp: Date.now(),
       database: 'connected',
       redis: redisHealth,
+      backgroundProcesses,
     });
   } catch (error) {
     console.error('Readiness check failed:', error);
@@ -2694,6 +2702,14 @@ app.get('/api/health/ready', async (_req: Request, res: Response): Promise<void>
         required: process.env.NODE_ENV === 'production',
         enabled: isRedisEnabled(),
         status: 'error',
+      })),
+      backgroundProcesses: await getBackgroundProcessesHealth().catch(() => ({
+        required: process.env.BACKGROUND_PROCESSES_REQUIRED === 'true',
+        healthy: false,
+        roles: {
+          worker: { status: 'unavailable' },
+          scheduler: { status: 'unavailable' },
+        },
       })),
     });
   }

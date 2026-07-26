@@ -18,19 +18,25 @@ import type {
   NotificationDeliveryPayload,
   RealtimeFanoutPayload,
 } from '../outbox/types';
+import type { ProfileViewAnalyticsPayload } from '../services/profile-view-analytics.service';
 import { pushNotificationService } from '../services/push-notification.service';
 import { publishScheduledReels } from '../services/scheduled-publish.service';
 import { flushPendingPeopleYouKnowNotifications } from '../services/people-you-know-join.service';
 import { runMaintenanceJob, type MaintenanceJobName } from '../services/cron.service';
 import { dispatchOutboxBatch } from '../outbox/dispatcher';
 import { logger } from '../lib/logger';
-import { queueBacklogGauge } from '../infrastructure/metrics/registry';
+import {
+  profileViewAnalyticsCounter,
+  queueBacklogGauge,
+} from '../infrastructure/metrics/registry';
 import {
   CHAT_DELIVERY_RECONCILIATION_JOB,
   enqueuePendingDeliveryReconciliation,
   reconcilePendingMessageDeliveries,
 } from '../services/chat-delivery-reconciliation.service';
 import { processConnectionAcceptedSideEffects } from '../services/connection-accepted-side-effects.service';
+import { socialProofService } from '../services/social-proof.service';
+import { isUUID } from '../utils/username.util';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -41,6 +47,11 @@ const WORKER_CONCURRENCY = parsePositiveInt(process.env.WORKER_CONCURRENCY, 10);
 const WORKER_ERROR_LOG_THROTTLE_MS = parsePositiveInt(
   process.env.WORKER_ERROR_LOG_THROTTLE_MS,
   30_000
+);
+const OUTBOX_DISPATCH_ENABLED = process.env.OUTBOX_DISPATCH_ENABLED === 'true';
+const OUTBOX_DISPATCH_BATCH_SIZE = parsePositiveInt(
+  process.env.OUTBOX_DISPATCH_BATCH_SIZE,
+  5
 );
 const FOLLOWER_FEED_INVALIDATION_BATCH_SIZE = parsePositiveInt(
   process.env.FOLLOWER_FEED_INVALIDATION_BATCH_SIZE,
@@ -203,7 +214,39 @@ async function processCacheInvalidation(job: Job<CacheInvalidationJobData>) {
   await redisCacheService.invalidateTags(...tags);
 }
 
-async function processAnalyticsEvents(job: Job) {
+type AnalyticsEventJobData =
+  | ProfileViewAnalyticsPayload
+  | {
+      event?: {
+        payload?: ProfileViewAnalyticsPayload;
+      };
+    };
+
+async function processAnalyticsEvents(job: Job<AnalyticsEventJobData>) {
+  const data = job.data as AnalyticsEventJobData & {
+    event?: { payload?: ProfileViewAnalyticsPayload };
+  };
+  const payload = data.event?.payload || (data as ProfileViewAnalyticsPayload);
+
+  if (payload.kind === 'profile_view') {
+    if (
+      !isUUID(payload.viewerId) ||
+      !isUUID(payload.viewedId) ||
+      payload.viewerId === payload.viewedId
+    ) {
+      profileViewAnalyticsCounter.inc({ outcome: 'worker_rejected' });
+      throw new Error('Invalid profile_view analytics payload');
+    }
+
+    await socialProofService.trackProfileView(
+      payload.viewerId,
+      payload.viewedId,
+      payload.source
+    );
+    profileViewAnalyticsCounter.inc({ outcome: 'worker_processed' });
+    return;
+  }
+
   logger.info({
     event: 'worker.stub.analytics_events',
     queueName: queueNames.analyticsEvents,
@@ -239,7 +282,12 @@ async function processAcceptedConnection(
 
 async function processMaintenance(job: Job) {
   if (job.name === 'outbox_dispatch_tick') {
-    return dispatchOutboxBatch();
+    // Double-gate dispatch so an old queued tick cannot drain the backlog.
+    if (!OUTBOX_DISPATCH_ENABLED) {
+      logger.warn({ event: 'outbox.dispatch.skipped', reason: 'disabled' });
+      return 0;
+    }
+    return dispatchOutboxBatch(OUTBOX_DISPATCH_BATCH_SIZE);
   }
 
   if (job.name === CHAT_DELIVERY_RECONCILIATION_JOB) {

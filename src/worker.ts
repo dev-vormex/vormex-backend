@@ -4,12 +4,17 @@ import { closeQueues } from './infrastructure/queue/queues';
 import { connectRedisClients, disconnectRedisClients } from './infrastructure/redis/client';
 import { logger } from './lib/logger';
 import { startWorkers, stopWorkers } from './workers';
+import { startBackgroundProcessHeartbeat } from './infrastructure/health/background-process-heartbeat';
 
 let idleTimer: NodeJS.Timeout | null = null;
+let stopHeartbeat: (() => Promise<void>) | null = null;
 
 async function bootstrap(): Promise<void> {
   await connectRedisClients();
   const started = await startWorkers();
+  if (started) {
+    stopHeartbeat = await startBackgroundProcessHeartbeat('worker');
+  }
 
   logger.info({
     event: 'worker.bootstrap.complete',
@@ -33,6 +38,8 @@ async function shutdown(signal: string): Promise<void> {
   });
 
   await stopWorkers();
+  await stopHeartbeat?.();
+  stopHeartbeat = null;
   if (idleTimer) {
     clearInterval(idleTimer);
   }

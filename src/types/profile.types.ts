@@ -100,6 +100,8 @@ export interface CoreProfileResponse {
     connectionStatus: ProfileConnectionStatus;
     connectionId: string | null;
     direction?: 'sent' | 'received';
+    isFollowing: boolean;
+    isFollowedBy: boolean;
   };
 }
 

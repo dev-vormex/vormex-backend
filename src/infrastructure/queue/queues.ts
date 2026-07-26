@@ -1,6 +1,6 @@
 import { Queue } from 'bullmq';
 import type { JobsOptions } from 'bullmq';
-import { isRedisEnabled, redisCommand } from '../redis/client';
+import { isCriticalRedisEnabled, redisCommand } from '../redis/client';
 import type { QueueName } from './queue-names';
 
 const defaultJobOptions: JobsOptions = {
@@ -23,7 +23,7 @@ export class QueueUnavailableError extends Error {
 }
 
 export function isQueueingEnabled(): boolean {
-  return isRedisEnabled() && Boolean(redisCommand);
+  return isCriticalRedisEnabled() && Boolean(redisCommand);
 }
 
 export function getQueue(name: QueueName): Queue {

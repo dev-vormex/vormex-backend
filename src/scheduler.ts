@@ -4,12 +4,17 @@ import { closeQueues } from './infrastructure/queue/queues';
 import { connectRedisClients, disconnectRedisClients } from './infrastructure/redis/client';
 import { logger } from './lib/logger';
 import { registerSchedulerJobs } from './scheduler/index';
+import { startBackgroundProcessHeartbeat } from './infrastructure/health/background-process-heartbeat';
 
 let idleTimer: NodeJS.Timeout | null = null;
+let stopHeartbeat: (() => Promise<void>) | null = null;
 
 async function bootstrap(): Promise<void> {
   await connectRedisClients();
   const registered = await registerSchedulerJobs();
+  if (registered) {
+    stopHeartbeat = await startBackgroundProcessHeartbeat('scheduler');
+  }
 
   logger.info({
     event: 'scheduler.bootstrap.complete',
@@ -35,6 +40,8 @@ async function shutdown(signal: string): Promise<void> {
   if (idleTimer) {
     clearInterval(idleTimer);
   }
+  await stopHeartbeat?.();
+  stopHeartbeat = null;
   await closeQueues();
   await disconnectRedisClients();
   await disconnectPrisma();

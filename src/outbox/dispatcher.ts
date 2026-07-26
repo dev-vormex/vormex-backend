@@ -4,6 +4,7 @@ import { getQueue } from '../infrastructure/queue/queues';
 import type { QueueName } from '../infrastructure/queue/queue-names';
 import { outboxDispatchCounter } from '../infrastructure/metrics/registry';
 import { logger } from '../lib/logger';
+import { classifyOutboxEventForDispatch } from './dispatch-policy';
 
 type OutboxRow = {
   id: string;
@@ -13,6 +14,7 @@ type OutboxRow = {
   queueName: QueueName;
   payload: Record<string, unknown>;
   attempts: number;
+  createdAt: Date;
 };
 
 const DEFAULT_BATCH_SIZE = 50;
@@ -47,7 +49,7 @@ async function pickPendingEvents(limit: number): Promise<OutboxRow[]> {
           "updatedAt" = NOW()
       FROM picked
       WHERE o.id = picked.id
-      RETURNING o.id, o."aggregateType", o."aggregateId", o."eventType", o."queueName", o.payload, o.attempts;
+      RETURNING o.id, o."aggregateType", o."aggregateId", o."eventType", o."queueName", o.payload, o.attempts, o."createdAt";
     `
   );
 }
@@ -77,6 +79,41 @@ export async function dispatchOutboxBatch(limit = DEFAULT_BATCH_SIZE): Promise<n
   }
 
   for (const event of events) {
+    const classification = classifyOutboxEventForDispatch(event);
+    if (classification.action !== 'dispatch') {
+      const terminalStatus = classification.action === 'expire' ? 'expired' : 'quarantined';
+      const reason = [
+        classification.reason,
+        `age_ms=${classification.ageMs}`,
+        classification.maxAgeMs === undefined
+          ? undefined
+          : `max_age_ms=${classification.maxAgeMs}`,
+      ].filter(Boolean).join(' ');
+
+      await prismaWrite.$executeRaw(
+        Prisma.sql`
+          UPDATE outbox_events
+          SET status = ${terminalStatus},
+              "lastError" = ${reason},
+              "updatedAt" = NOW()
+          WHERE id = ${event.id}
+        `
+      );
+      outboxDispatchCounter.inc({
+        status: terminalStatus,
+        queue: event.queueName,
+      });
+      logger.warn({
+        event: `outbox.dispatch.${terminalStatus}`,
+        outboxEventId: event.id,
+        eventType: event.eventType,
+        queueName: event.queueName,
+        ageMs: classification.ageMs,
+        reason: classification.reason,
+      });
+      continue;
+    }
+
     try {
       await getQueue(event.queueName).add(
         event.eventType,

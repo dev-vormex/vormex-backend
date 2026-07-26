@@ -16,6 +16,26 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Explicitly initialize remote Upstash clients on API startup.
+      - key: API_REDIS_MODE
+        value: "true"
+      # Required production secrets/URLs are entered in Render, never committed.
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: AUTH_CSRF_SECRET
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_CALLBACK_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
       - key: AUTH_REQUIRE_SESSION_ID
         value: "true"
       - key: SOCKET_TICKET_TTL_SECONDS
@@ -26,6 +46,23 @@ services:
         value: "20000"
       - key: RATE_LIMIT_AUTH_API_FINGERPRINT_PER_MINUTE
         value: "600"
+      # Legacy fallback during migration. Remove after both role URLs are set.
+      - key: REDIS_URL
+        sync: false
+      # Critical: persistent/noeviction; queues, sessions, realtime, heartbeats.
+      - key: CRITICAL_REDIS_URL
+        sync: false
+      # Cache: isolated and evictable; response/feed caches only.
+      - key: CACHE_REDIS_URL
+        sync: false
+      - key: CRITICAL_REDIS_REQUIRED
+        value: "true"
+      - key: CACHE_REDIS_REQUIRED
+        value: "true"
+      - key: CACHE_MEMORY_MAX_ENTRIES
+        value: "1000"
+      - key: BACKGROUND_PROCESSES_REQUIRED
+        value: "true"
       - key: PROXIMITY_REDIS_URL
         sync: false
       - key: FIREBASE_PROJECT_ID
@@ -68,12 +105,29 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CRITICAL_REDIS_URL
+        sync: false
+      - key: CACHE_REDIS_URL
+        sync: false
+      - key: CRITICAL_REDIS_REQUIRED
+        value: "true"
+      - key: CACHE_REDIS_REQUIRED
+        value: "true"
       - key: AUTH_REQUIRE_SESSION_ID
         value: "true"
       - key: WORKER_CONCURRENCY
         value: "1"
       - key: WORKER_ERROR_LOG_THROTTLE_MS
         value: "30000"
+      # Keep the historical outbox untouched while worker health is verified.
+      - key: OUTBOX_DISPATCH_ENABLED
+        value: "false"
+      - key: OUTBOX_DISPATCH_BATCH_SIZE
+        value: "5"
   - type: worker
     runtime: node
     name: vormex-backend-scheduler
@@ -84,10 +138,18 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: REDIS_URL
+        sync: false
+      - key: CRITICAL_REDIS_URL
+        sync: false
+      - key: CRITICAL_REDIS_REQUIRED
+        value: "true"
       - key: AUTH_REQUIRE_SESSION_ID
         value: "true"
+      - key: OUTBOX_DISPATCH_ENABLED
+        value: "false"
       - key: OUTBOX_DISPATCH_INTERVAL_MS
-        value: "5000"
+        value: "30000"
   - type: worker
     runtime: node
     name: vormex-proximity-worker

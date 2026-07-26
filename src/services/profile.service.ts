@@ -3,6 +3,7 @@ import { cacheService } from './cache.service';
 import { requestWithBreaker } from '../utils/http-client-with-breaker.util';
 import { isUUID } from '../utils/username.util';
 import { decryptToken } from '../utils/encryption.util';
+import { enqueueProfileViewAnalytics } from './profile-view-analytics.service';
 import type {
   UnifiedContentItem,
   UnifiedFeedResponse,
@@ -30,6 +31,8 @@ import { serializeCoarseLocation } from '../utils/location-dto.util';
 
 const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 const LEGACY_PROFILE_AVIF_PATTERN = /\/profiles\/avatars\/[^?#]+\.avif(?:$|[?#])/i;
+const PROFILE_CORE_CACHE_TTL_SECONDS = 120;
+const PROFILE_BUNDLE_CACHE_TTL_SECONDS = 120;
 
 const CORE_PROFILE_USER_SELECT = {
   id: true,
@@ -115,6 +118,36 @@ function isProfileUserOnline(user: { isOnline?: boolean | null; lastActiveAt?: D
   return Date.now() - user.lastActiveAt.getTime() < PROFILE_ONLINE_WINDOW_MS;
 }
 
+export function normalizeProfileCacheIdentifier(value: string): string {
+  const withoutPrefix = value.startsWith('@') ? value.substring(1) : value;
+  return withoutPrefix.trim().toLowerCase();
+}
+
+export function profileResponseCacheKey(
+  kind: 'core' | 'bundle',
+  requestingUserId: string | null,
+  identifier: string
+): string {
+  return `profile:${kind}:${requestingUserId || 'anon'}:${normalizeProfileCacheIdentifier(identifier)}`;
+}
+
+function trackProfileViewLater(
+  requestingUserId: string | null,
+  targetUserId: string
+): void {
+  if (!requestingUserId || requestingUserId === targetUserId) {
+    return;
+  }
+
+  setImmediate(() => {
+    void enqueueProfileViewAnalytics(
+      requestingUserId,
+      targetUserId,
+      'profile_open'
+    );
+  });
+}
+
 function emptyProfileStats() {
   return {
     xp: 0,
@@ -135,32 +168,46 @@ function emptyProfileStats() {
   };
 }
 
+interface ProfileRelationshipRow {
+  connectionId: string | null;
+  requesterId: string | null;
+  status: string | null;
+  isFollowing: boolean;
+  isFollowedBy: boolean;
+}
+
 function toProfileConnectionState(
-  connection: {
-    id: string;
-    requesterId: string;
-    status: string;
-  } | null,
+  relationship: ProfileRelationshipRow | null,
   requestingUserId: string | null
 ): CoreProfileResponse['viewerContext'] {
-  if (!connection || !requestingUserId) {
-    return { connectionStatus: 'none', connectionId: null };
+  const isFollowing = relationship?.isFollowing === true;
+  const isFollowedBy = relationship?.isFollowedBy === true;
+
+  if (!relationship?.connectionId || !requestingUserId) {
+    return {
+      connectionStatus: 'none',
+      connectionId: null,
+      isFollowing,
+      isFollowedBy,
+    };
   }
 
   let connectionStatus: ProfileConnectionStatus = 'none';
   let direction: 'sent' | 'received' | undefined;
-  if (connection.status === 'accepted') {
+  if (relationship.status === 'accepted') {
     connectionStatus = 'connected';
-  } else if (connection.status === 'blocked') {
+  } else if (relationship.status === 'blocked') {
     connectionStatus = 'blocked';
-  } else if (connection.status === 'pending') {
-    direction = connection.requesterId === requestingUserId ? 'sent' : 'received';
+  } else if (relationship.status === 'pending') {
+    direction = relationship.requesterId === requestingUserId ? 'sent' : 'received';
     connectionStatus = direction === 'sent' ? 'pending_sent' : 'pending_received';
   }
 
   return {
     connectionStatus,
-    connectionId: connection.id,
+    connectionId: relationship.connectionId,
+    isFollowing,
+    isFollowedBy,
     ...(direction ? { direction } : {}),
   };
 }
@@ -574,59 +621,92 @@ export async function getUnifiedContentFeed(
 }
 
 /**
- * Load the default profile header/counts path with at most three DB queries:
- * user, aggregate stats, and (for a signed-in viewer) relationship state.
+ * Load the default profile header/counts path with one identity query followed
+ * by bounded aggregate, connection, and follow-state branches.
  */
 export async function getCoreProfile(
   requestingUserId: string | null,
   targetUsernameOrId: string
 ): Promise<CoreProfileResponse> {
-  let identifier = targetUsernameOrId.startsWith('@')
-    ? targetUsernameOrId.substring(1)
-    : targetUsernameOrId;
-
-  const user = await prisma.user.findFirst({
-    where: isUUID(identifier)
-      ? { id: identifier }
-      : { username: identifier.toLowerCase() },
-    select: CORE_PROFILE_USER_SELECT,
-  });
-  if (!user) {
-    throw new Error('User not found');
+  const identifier = normalizeProfileCacheIdentifier(targetUsernameOrId);
+  const requestedCacheKey = profileResponseCacheKey(
+    'core',
+    requestingUserId,
+    identifier
+  );
+  const requestedCached = await cacheService.get<CoreProfileResponse>(requestedCacheKey);
+  if (requestedCached) {
+    trackProfileViewLater(requestingUserId, requestedCached.user.id);
+    return requestedCached;
   }
 
-  const targetUserId = user.id;
-  const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
-  const cacheKey = `profile:core:${requestingUserId || 'anon'}:${targetUserId}`;
-  const cached = await cacheService.get<CoreProfileResponse>(cacheKey);
-  if (cached) {
-    if (requestingUserId && !isOwner) {
-      setImmediate(() => {
-        void socialProofService.trackProfileView(
-          requestingUserId,
-          targetUserId,
-          'profile_open'
-        );
+  const coordinated = await cacheService.getOrSet(
+    requestedCacheKey,
+    async () => {
+      const user = await prisma.user.findFirst({
+        where: isUUID(identifier)
+          ? { id: identifier }
+          : { username: identifier.toLowerCase() },
+        select: CORE_PROFILE_USER_SELECT,
       });
-    }
-    return cached;
-  }
+      if (!user) {
+        throw new Error('User not found');
+      }
 
-  // Only these two branches run together; this caps the core path at 2-3 queries total.
-  const [userStats, connection] = await Promise.all([
-    prisma.userStats.findUnique({ where: { userId: targetUserId } }).catch(() => null),
-    requestingUserId && !isOwner
-      ? prisma.connections.findFirst({
-          where: {
-            OR: [
-              { requesterId: requestingUserId, addresseeId: targetUserId },
-              { requesterId: targetUserId, addresseeId: requestingUserId },
-            ],
-          },
-          select: { id: true, requesterId: true, status: true },
-        }).catch(() => null)
-      : Promise.resolve(null),
-  ]);
+      const targetUserId = user.id;
+      const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
+      const canonicalCacheKey = profileResponseCacheKey('core', requestingUserId, targetUserId);
+      const cached = requestedCacheKey === canonicalCacheKey
+        ? null
+        : await cacheService.get<CoreProfileResponse>(canonicalCacheKey);
+      if (cached) {
+        await cacheService.set(
+          requestedCacheKey,
+          cached,
+          PROFILE_CORE_CACHE_TTL_SECONDS,
+          [`user:${targetUserId}`]
+        );
+        return cached;
+      }
+
+      // These bounded relationship branches replace two extra authenticated
+      // client requests after the profile header has already loaded.
+      const [userStats, relationship] = await Promise.all([
+        prisma.userStats.findUnique({ where: { userId: targetUserId } }).catch(() => null),
+        requestingUserId && !isOwner
+          ? prisma.$queryRaw<ProfileRelationshipRow[]>`
+              SELECT
+                relationship.id AS "connectionId",
+                relationship."requesterId" AS "requesterId",
+                relationship.status AS "status",
+                EXISTS (
+                  SELECT 1
+                  FROM follows forward_follow
+                  WHERE forward_follow."followerId" = ${requestingUserId}
+                    AND forward_follow."followingId" = ${targetUserId}
+                ) AS "isFollowing",
+                EXISTS (
+                  SELECT 1
+                  FROM follows reverse_follow
+                  WHERE reverse_follow."followerId" = ${targetUserId}
+                    AND reverse_follow."followingId" = ${requestingUserId}
+                ) AS "isFollowedBy"
+              FROM (SELECT 1) seed
+              LEFT JOIN LATERAL (
+                SELECT connection.id, connection."requesterId", connection.status
+                FROM connections connection
+                WHERE (
+                  connection."requesterId" = ${requestingUserId}
+                  AND connection."addresseeId" = ${targetUserId}
+                ) OR (
+                  connection."requesterId" = ${targetUserId}
+                  AND connection."addresseeId" = ${requestingUserId}
+                )
+                LIMIT 1
+              ) relationship ON TRUE
+            `.then((rows) => rows[0] || null).catch(() => null)
+          : Promise.resolve(null),
+      ]);
 
   const sourceStats = userStats || emptyProfileStats();
   const levelProgress = calculateLevelProgress(sourceStats.xp);
@@ -678,21 +758,36 @@ export async function getCoreProfile(
       lastActiveDate: sourceStats.lastActiveDate,
       totalActiveDays: sourceStats.totalActiveDays,
     },
-    viewerContext: toProfileConnectionState(connection, requestingUserId),
+        viewerContext: toProfileConnectionState(
+          relationship,
+          requestingUserId
+        ),
   };
 
-  await cacheService.set(cacheKey, response, 60, [`user:${targetUserId}`]);
-  if (requestingUserId && !isOwner) {
-    // Profile-view tracking starts after the core read path instead of competing with it.
-    setImmediate(() => {
-      void socialProofService.trackProfileView(
-        requestingUserId,
-        targetUserId,
-        'profile_open'
-      );
-    });
-  }
-  return response;
+  const cacheKeys = Array.from(new Set([
+    requestedCacheKey,
+    canonicalCacheKey,
+    profileResponseCacheKey('core', requestingUserId, user.username),
+  ]));
+  await Promise.all(
+    cacheKeys.map((cacheKey) =>
+      cacheService.set(
+        cacheKey,
+        response,
+        PROFILE_CORE_CACHE_TTL_SECONDS,
+        [`user:${targetUserId}`]
+      )
+    )
+  );
+      return response;
+    },
+    {
+      ttlSeconds: PROFILE_CORE_CACHE_TTL_SECONDS,
+      lockTtlMs: 5_000,
+    }
+  );
+  trackProfileViewLater(requestingUserId, coordinated.user.id);
+  return coordinated;
 }
 
 /**
@@ -707,39 +802,51 @@ export async function getFullProfile(
   targetUsernameOrId: string
 ): Promise<FullProfileResponse> {
   try {
-    // Remove @ prefix if present (e.g., @koushik -> koushik)
-    let identifier = targetUsernameOrId;
-    if (identifier.startsWith('@')) {
-      identifier = identifier.substring(1);
+    const identifier = normalizeProfileCacheIdentifier(targetUsernameOrId);
+    const requestedCacheKey = profileResponseCacheKey(
+      'bundle',
+      requestingUserId,
+      identifier
+    );
+    const requestedCached = await cacheService.get<FullProfileResponse>(requestedCacheKey);
+    if (requestedCached && !isLegacyProfileAvifUrl(requestedCached.user.avatar)) {
+      trackProfileViewLater(requestingUserId, requestedCached.user.id);
+      return requestedCached;
+    }
+    if (requestedCached) {
+      await cacheService.del(requestedCacheKey);
     }
 
-    // Find target user by UUID or username
-    const user = await prisma.user.findFirst({
-      where: isUUID(identifier)
-        ? { id: identifier }
-        : { username: identifier.toLowerCase() },
-    });
+    const coordinated = await cacheService.getOrSet(
+      requestedCacheKey,
+      async () => {
+        // Find target user by UUID or username
+        const user = await prisma.user.findFirst({
+          where: isUUID(identifier)
+            ? { id: identifier }
+            : { username: identifier.toLowerCase() },
+        });
 
-    if (!user) {
-      throw new Error('User not found');
-    }
+        if (!user) {
+          throw new Error('User not found');
+        }
 
-    const targetUserId = user.id;
-    const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
+        const targetUserId = user.id;
+        const isOwner = requestingUserId !== null && requestingUserId === targetUserId;
 
-    if (requestingUserId && !isOwner) {
-      void socialProofService.trackProfileView(
-        requestingUserId,
-        targetUserId,
-        'profile_open'
-      );
-    }
-
-    const cacheKey = `profile:bundle:${requestingUserId || 'anon'}:${targetUserId}`;
-    const cached = await cacheService.get<FullProfileResponse>(cacheKey);
-    if (cached && !isLegacyProfileAvifUrl(cached.user.avatar)) {
-      return cached;
-    }
+        const canonicalCacheKey = profileResponseCacheKey('bundle', requestingUserId, targetUserId);
+        const cached = requestedCacheKey === canonicalCacheKey
+          ? null
+          : await cacheService.get<FullProfileResponse>(canonicalCacheKey);
+        if (cached && !isLegacyProfileAvifUrl(cached.user.avatar)) {
+          await cacheService.set(
+            requestedCacheKey,
+            cached,
+            PROFILE_BUNDLE_CACHE_TTL_SECONDS,
+            [`user:${targetUserId}`]
+          );
+          return cached;
+        }
 
     // All profiles are public - no privacy checks needed
 
@@ -848,37 +955,9 @@ export async function getFullProfile(
         : Promise.resolve(false),
     ]);
 
-    // Build stats object with real-time post count
-    // Get actual post count from database for accuracy
-    let realTimePostCount = 0;
-    let realTimeArticleCount = 0;
-    let realTimeShortVideoCount = 0;
-    
-    try {
-      const postCounts = await prisma.post.groupBy({
-        by: ['type'],
-        where: { authorId: targetUserId },
-        _count: { id: true }
-      });
-      
-      for (const pc of postCounts) {
-        const t = (pc.type || '').toLowerCase();
-        if (t === 'article') {
-          realTimeArticleCount += pc._count.id;
-        } else if (t === 'video' || t === 'short_video') {
-          realTimeShortVideoCount += pc._count.id;
-        } else if (
-          ['text', 'image', 'link', 'poll', 'celebration', 'document', 'mixed'].includes(t)
-        ) {
-          realTimePostCount += pc._count.id;
-        }
-      }
-    } catch (err) {
-      // Fallback to cached stats if count fails
-      console.debug('Failed to get real-time post count, using cached', err);
-    }
-    
-    const stats = userStats || {
+    // Social counters are maintained transactionally on their write paths. Recounting
+    // posts, follows, and connections here adds three pool competitors per profile open.
+    const stats = userStats ? { ...userStats } : {
       xp: 0,
       level: 1,
       totalPosts: 0,
@@ -896,33 +975,6 @@ export async function getFullProfile(
       totalActiveDays: 0,
     };
     
-    // Override with real-time counts if available
-    if (realTimePostCount > 0 || realTimeArticleCount > 0 || realTimeShortVideoCount > 0) {
-      stats.totalPosts = realTimePostCount;
-      stats.totalArticles = realTimeArticleCount;
-      stats.totalShortVideos = realTimeShortVideoCount;
-    }
-    
-    // Get real-time follower and connection counts
-    try {
-      const [followersCount, connectionsCount] = await Promise.all([
-        prisma.follows.count({ where: { followingId: targetUserId } }),
-        prisma.connections.count({ 
-          where: { 
-            status: 'accepted',
-            OR: [
-              { requesterId: targetUserId },
-              { addresseeId: targetUserId }
-            ]
-          }
-        })
-      ]);
-      stats.followersCount = followersCount;
-      stats.connectionsCount = connectionsCount;
-    } catch (err) {
-      console.debug('Failed to get real-time follower/connection count', err);
-    }
-
     const levelProgress = calculateLevelProgress(stats.xp);
     stats.level = levelProgress.level;
 
@@ -1051,8 +1103,30 @@ export async function getFullProfile(
         isProfileSaved: Boolean(isProfileSaved),
       },
     };
-    await cacheService.set(cacheKey, response, 120, [`user:${targetUserId}`]);
-    return response;
+    const cacheKeys = Array.from(new Set([
+      requestedCacheKey,
+      canonicalCacheKey,
+      profileResponseCacheKey('bundle', requestingUserId, user.username),
+    ]));
+    await Promise.all(
+      cacheKeys.map((cacheKey) =>
+        cacheService.set(
+          cacheKey,
+          response,
+          PROFILE_BUNDLE_CACHE_TTL_SECONDS,
+          [`user:${targetUserId}`]
+        )
+      )
+    );
+        return response;
+      },
+      {
+        ttlSeconds: PROFILE_BUNDLE_CACHE_TTL_SECONDS,
+        lockTtlMs: 15_000,
+      }
+    );
+    trackProfileViewLater(requestingUserId, coordinated.user.id);
+    return coordinated;
   } catch (error) {
     console.error(
       `Failed to get full profile for ${targetUsernameOrId}:`,
