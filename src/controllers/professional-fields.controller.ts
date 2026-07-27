@@ -20,6 +20,22 @@ const SKILL_SEARCH_MAX_LIMIT = 20;
 const skillSearchCacheKey = (query: string, limit: number): string =>
   `skills:search:v1:${createHash('sha256').update(query.toLowerCase()).digest('hex').slice(0, 24)}:${limit}`;
 
+async function invalidateProfessionalProfileCaches(
+  userId: string,
+  refreshSearchDocument = false
+): Promise<void> {
+  await cacheService.invalidateTags(
+    `user:${userId}`,
+    `people:user:${userId}`,
+    ...(refreshSearchDocument ? ['people:global'] : [])
+  ).catch((error) => {
+    console.warn('Professional profile cache invalidation failed:', error);
+  });
+  if (refreshSearchDocument) {
+    void reindexPublicProfile(userId).catch(() => undefined);
+  }
+}
+
 function validateUrl(url: string | null | undefined): boolean {
   if (!url) return true; // Optional field
   try {
@@ -113,7 +129,7 @@ export const addSkill = async (
     if (!existingUserSkill) {
       queueMatchAvailabilityNotifications(userId, 'skill_add');
     }
-    void reindexPublicProfile(userId).catch(() => undefined);
+    await invalidateProfessionalProfileCaches(userId, true);
 
     res.status(201).json(userSkill);
   } catch (error) {
@@ -174,6 +190,8 @@ export const updateSkill = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
+
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating skill:', error);
@@ -217,7 +235,7 @@ export const deleteSkill = async (
     await prisma.userSkill.delete({
       where: { id },
     });
-    void reindexPublicProfile(userId).catch(() => undefined);
+    await invalidateProfessionalProfileCaches(userId, true);
 
     res.status(200).json({ message: 'Skill removed successfully' });
   } catch (error) {
@@ -357,6 +375,7 @@ export const createExperience = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(201).json(experience);
   } catch (error) {
     console.error('Error creating experience:', error);
@@ -476,6 +495,7 @@ export const updateExperience = async (
       data: updateData,
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating experience:', error);
@@ -520,6 +540,7 @@ export const deleteExperience = async (
       where: { id },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json({ message: 'Experience deleted successfully' });
   } catch (error) {
     console.error('Error deleting experience:', error);
@@ -642,6 +663,7 @@ export const createEducation = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(201).json(education);
   } catch (error) {
     console.error('Error creating education:', error);
@@ -764,6 +786,7 @@ export const updateEducation = async (
       data: updateData,
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating education:', error);
@@ -808,6 +831,7 @@ export const deleteEducation = async (
       where: { id },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json({ message: 'Education deleted successfully' });
   } catch (error) {
     console.error('Error deleting education:', error);
@@ -933,6 +957,7 @@ export const createProject = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(201).json(project);
   } catch (error) {
     console.error('Error creating project:', error);
@@ -1060,6 +1085,7 @@ export const updateProject = async (
       data: updateData,
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating project:', error);
@@ -1104,6 +1130,7 @@ export const deleteProject = async (
       where: { id },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json({ message: 'Project deleted successfully' });
   } catch (error) {
     console.error('Error deleting project:', error);
@@ -1168,6 +1195,7 @@ export const featureProject = async (
       data: { featured: newFeaturedStatus },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error featuring project:', error);
@@ -1269,6 +1297,7 @@ export const createCertificate = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(201).json(certificate);
   } catch (error) {
     console.error('Error creating certificate:', error);
@@ -1366,6 +1395,7 @@ export const updateCertificate = async (
       data: updateData,
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating certificate:', error);
@@ -1410,6 +1440,7 @@ export const deleteCertificate = async (
       where: { id },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json({ message: 'Certificate deleted successfully' });
   } catch (error) {
     console.error('Error deleting certificate:', error);
@@ -1525,6 +1556,7 @@ export const createAchievement = async (
       },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(201).json(achievement);
   } catch (error) {
     console.error('Error creating achievement:', error);
@@ -1618,6 +1650,7 @@ export const updateAchievement = async (
       data: updateData,
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json(updated);
   } catch (error) {
     console.error('Error updating achievement:', error);
@@ -1662,6 +1695,7 @@ export const deleteAchievement = async (
       where: { id },
     });
 
+    await invalidateProfessionalProfileCaches(userId);
     res.status(200).json({ message: 'Achievement deleted successfully' });
   } catch (error) {
     console.error('Error deleting achievement:', error);
@@ -1843,6 +1877,7 @@ export const addInterest = async (
     });
 
     queueMatchAvailabilityNotifications(userId, 'interest_add');
+    await invalidateProfessionalProfileCaches(userId, true);
 
     res.status(201).json({
       interests: updatedUser.interests || [],
@@ -1944,6 +1979,7 @@ export const updateInterest = async (
     });
 
     queueMatchAvailabilityNotifications(userId, 'interest_update');
+    await invalidateProfessionalProfileCaches(userId, true);
 
     res.status(200).json({
       interests: updatedUser.interests || [],
@@ -2011,6 +2047,8 @@ export const deleteInterest = async (
       data: { interests: updatedInterests },
       select: { interests: true },
     });
+
+    await invalidateProfessionalProfileCaches(userId, true);
 
     res.status(200).json({
       interests: updatedUser.interests || [],

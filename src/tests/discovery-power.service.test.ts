@@ -22,7 +22,7 @@ test('hasPremiumPeopleDiscoveryFilters allows basic free filters', () => {
 
 test('hasPremiumPeopleDiscoveryFilters detects advanced discovery filters', () => {
   assert.equal(hasPremiumPeopleDiscoveryFilters({ verifiedOnly: 'true' }), true);
-  assert.equal(hasPremiumPeopleDiscoveryFilters({ scope: 'global' }), true);
+  assert.equal(hasPremiumPeopleDiscoveryFilters({ scope: 'global' }), false);
   assert.equal(hasPremiumPeopleDiscoveryFilters({ skillLevel: 'advanced' }), true);
 });
 

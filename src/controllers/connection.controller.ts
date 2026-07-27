@@ -29,6 +29,13 @@ interface AuthRequest extends Request {
 
 const TOP_NETWORKERS_CACHE_TAG = 'engagement:leaderboard';
 
+type CanonicalRelationshipStatus = 'none' | 'pending_sent' | 'pending_received' | 'connected';
+
+const canonicalRelationship = (
+  status: CanonicalRelationshipStatus,
+  connectionId: string | null
+) => ({ status, connectionId });
+
 const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
 
 const discoveryCacheTags = (...userIds: Array<string | null | undefined>): string[] =>
@@ -103,11 +110,34 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
 
     if (existingConnection) {
       if (existingConnection.status === 'accepted') {
-        res.status(400).json({ error: 'Already connected' });
+        res.status(200).json({
+          message: 'Already connected',
+          connection: {
+            id: existingConnection.id,
+            status: 'ACCEPTED',
+            message: null,
+            createdAt: existingConnection.createdAt.toISOString(),
+            user: receiver,
+          },
+          relationship: canonicalRelationship('connected', existingConnection.id),
+        });
         return;
       }
       if (existingConnection.status === 'pending') {
-        res.status(400).json({ error: 'Connection request already pending' });
+        const relationshipStatus = existingConnection.requesterId === req.user.userId
+          ? 'pending_sent'
+          : 'pending_received';
+        res.status(200).json({
+          message: 'Connection request already pending',
+          connection: {
+            id: existingConnection.id,
+            status: 'PENDING',
+            message: null,
+            createdAt: existingConnection.createdAt.toISOString(),
+            user: receiver,
+          },
+          relationship: canonicalRelationship(relationshipStatus, existingConnection.id),
+        });
         return;
       }
     }
@@ -126,15 +156,25 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
 
     await enforceTrustTierLimit(req.user.userId, 'connection_request');
 
-    const connection = await prisma.connections.create({
-      data: {
-        id: randomUUID(),
-        requesterId: req.user.userId,
-        addresseeId: receiverId,
-        status: 'pending',
-        updatedAt: new Date(),
-      },
-    });
+    const connection = existingConnection
+      ? await prisma.connections.update({
+          where: { id: existingConnection.id },
+          data: {
+            requesterId: req.user.userId,
+            addresseeId: receiverId,
+            status: 'pending',
+            updatedAt: new Date(),
+          },
+        })
+      : await prisma.connections.create({
+          data: {
+            id: randomUUID(),
+            requesterId: req.user.userId,
+            addresseeId: receiverId,
+            status: 'pending',
+            updatedAt: new Date(),
+          },
+        });
 
     // Get requester info for notification
     const requester = await prisma.user.findUnique({
@@ -167,6 +207,7 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
         createdAt: connection.createdAt.toISOString(),
         user: receiver,
       },
+      relationship: canonicalRelationship('pending_sent', connection.id),
     });
   } catch (error) {
     const safety = safetyErrorResponse(error);
@@ -214,6 +255,21 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       return;
     }
 
+    if (connection.status === 'accepted') {
+      res.status(200).json({
+        message: 'Connection request already accepted',
+        connection: {
+          id: connection.id,
+          status: 'ACCEPTED',
+          message: null,
+          createdAt: connection.createdAt.toISOString(),
+          user: connection.users_connections_requesterIdTousers,
+        },
+        relationship: canonicalRelationship('connected', connection.id),
+      });
+      return;
+    }
+
     if (connection.status !== 'pending') {
       res.status(400).json({ error: 'Connection request is no longer pending' });
       return;
@@ -249,9 +305,26 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
     });
 
     if (!accepted) {
-      res.status(400).json({ error: 'Connection request is no longer pending' });
+      const latest = await prisma.connections.findUnique({ where: { id: connectionId } });
+      if (latest?.status === 'accepted') {
+        res.status(200).json({
+          message: 'Connection request already accepted',
+          connection: {
+            id: connection.id,
+            status: 'ACCEPTED',
+            message: null,
+            createdAt: connection.createdAt.toISOString(),
+            user: connection.users_connections_requesterIdTousers,
+          },
+          relationship: canonicalRelationship('connected', connection.id),
+        });
+        return;
+      }
+      res.status(409).json({ error: 'Connection request changed; refresh and try again' });
       return;
     }
+
+    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 
     res.status(200).json({
       message: 'Connection request accepted',
@@ -262,6 +335,7 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
         createdAt: connection.createdAt.toISOString(),
         user: connection.users_connections_requesterIdTousers,
       },
+      relationship: canonicalRelationship('connected', connection.id),
     });
   } catch (error) {
     console.error('acceptConnectionRequest error:', error);
@@ -312,7 +386,10 @@ export const rejectConnectionRequest = async (req: AuthRequest, res: Response): 
 
     await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 
-    res.status(200).json({ message: 'Connection request rejected' });
+    res.status(200).json({
+      message: 'Connection request rejected',
+      relationship: canonicalRelationship('none', null),
+    });
   } catch (error) {
     console.error('rejectConnectionRequest error:', error);
     res.status(500).json({ error: 'Failed to reject connection request' });
@@ -366,7 +443,10 @@ export const cancelConnectionRequest = async (req: AuthRequest, res: Response): 
 
     await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 
-    res.status(200).json({ message: 'Connection request cancelled' });
+    res.status(200).json({
+      message: 'Connection request cancelled',
+      relationship: canonicalRelationship('none', null),
+    });
   } catch (error) {
     console.error('cancelConnectionRequest error:', error);
     res.status(500).json({ error: 'Failed to cancel connection request' });
@@ -416,7 +496,10 @@ export const removeConnection = async (req: AuthRequest, res: Response): Promise
 
     await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 
-    res.status(200).json({ message: 'Connection removed' });
+    res.status(200).json({
+      message: 'Connection removed',
+      relationship: canonicalRelationship('none', null),
+    });
   } catch (error) {
     console.error('removeConnection error:', error);
     res.status(500).json({ error: 'Failed to remove connection' });

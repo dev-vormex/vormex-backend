@@ -1,6 +1,7 @@
 import express from 'express';
 import {
   getProfile,
+  getProfileSections,
   getProfileFeed,
   updateProfile,
   uploadBanner,
@@ -25,6 +26,7 @@ const router = express.Router();
  */
 
 // Public routes (support both UUID and username; optionalAuth for "me" resolution)
+router.get('/users/:userId/profile/sections', optionalAuth, getProfileSections);
 router.get('/users/:userId/profile', optionalAuth, getProfile); // Public but respects privacy settings
 router.get('/users/:userId/feed', optionalAuth, getProfileFeed); // Public, with scoped visibility for signed-in viewers
 router.get('/users/:userId/activity', getUserActivity); // Public - GitHub-style contribution calendar

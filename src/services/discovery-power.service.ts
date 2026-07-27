@@ -138,7 +138,10 @@ export function hasPremiumPeopleDiscoveryFilters(query: QueryLike): boolean {
     }
   }
 
-  return normalizeSearchText(query.scope, 20).toLowerCase() === 'global';
+  // Global discovery is the default directory experience for every account.
+  // Premium continues to gate advanced filters (radius, verification, intent,
+  // availability, and so on), but never the ability to browse the network.
+  return false;
 }
 
 export function buildPremiumRequiredDiscoveryResponse(feature = 'Premium discovery') {

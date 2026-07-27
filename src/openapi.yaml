@@ -44,6 +44,8 @@ tags:
     description: GitHub OAuth and profile sync
   - name: Profile
     description: User profiles and content feeds
+  - name: People
+    description: Global people discovery and indexed search
   - name: Activity
     description: Activity tracking and contribution calendar
   - name: Skills
@@ -1444,6 +1446,86 @@ paths:
                     nullable: true
         '404':
           description: No stats found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /people/search:
+    get:
+      tags:
+        - People
+      summary: Search the global people directory
+      description: Indexed search across name, username, college, headline, skills, interests, and branch using a signed query-bound cursor.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 80
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 30
+      responses:
+        '200':
+          description: Ranked person summaries with canonical relationship state and the next cursor
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [people, hasMore]
+                properties:
+                  people:
+                    type: array
+                    items:
+                      type: object
+                  hasMore:
+                    type: boolean
+                  nextCursor:
+                    type: string
+                    nullable: true
+        '400':
+          description: Invalid or tampered cursor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/{userId}/profile/sections:
+    get:
+      tags:
+        - Profile
+      summary: Get deferred profile sections
+      description: Returns professional history, skills, achievements, certificates, projects, and GitHub summary without feed or activity data.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Independently cacheable lower profile sections
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: User not found
           content:
             application/json:
               schema:

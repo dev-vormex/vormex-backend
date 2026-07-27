@@ -34,7 +34,9 @@ test('people discovery removed offset and count from the hot path', () => {
   const getPeopleBlock = functionBlock(controller, 'getPeople');
 
   assert.match(getPeopleBlock, /decodePeopleCursor\(req\.query\.cursor\)/);
-  assert.match(getPeopleBlock, /take: requestedTake/);
+  assert.match(getPeopleBlock, /take: limit \+ 1/);
+  assert.match(getPeopleBlock, /const databaseOrderedPage = fetchedUsers\.slice\(0, limit\)/);
+  assert.match(getPeopleBlock, /encodePeopleCursor\(databaseOrderedPage\[databaseOrderedPage\.length - 1\]\)/);
   assert.match(getPeopleBlock, /totalIsApproximate: true/);
   assert.doesNotMatch(getPeopleBlock, /skip:/);
   assert.doesNotMatch(getPeopleBlock, /\.count\(/);

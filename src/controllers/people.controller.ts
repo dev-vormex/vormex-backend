@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { Response } from 'express';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
 import { prismaRead } from '../config/prisma';
@@ -72,6 +73,11 @@ interface PersonCard {
   profileBoostPriority?: number;
   discoveryPriority?: number;
   connectionStatus: 'none' | 'pending_sent' | 'pending_received' | 'connected';
+  connectionId: string | null;
+  relationship: {
+    status: 'none' | 'pending_sent' | 'pending_received' | 'connected';
+    connectionId: string | null;
+  };
   mutualConnections?: number;
 }
 
@@ -111,6 +117,9 @@ const PEOPLE_FILTER_OPTIONS_CACHE_TTL_SECONDS = 5 * 60;
 const PEOPLE_ACCEPTED_CONNECTION_IDS_CACHE_TTL_SECONDS = 30;
 const PEOPLE_FILTER_OPTION_LIMIT = 100;
 const PEOPLE_DEFAULT_LIMIT = 20;
+const PEOPLE_BROWSE_DEFAULT_LIMIT = 30;
+const PEOPLE_SEARCH_DEFAULT_LIMIT = 20;
+const PEOPLE_SEARCH_MAX_LIMIT = 30;
 const PEOPLE_MAX_LIMIT = 50;
 const PEOPLE_PERSONALIZED_MAX_LIMIT = 50;
 const PEOPLE_MAX_FILTER_VALUES = 10;
@@ -171,11 +180,19 @@ type PeopleCursor = {
 
 type RelationshipSummary = {
   connectionStatusByUser: Map<string, PersonCard['connectionStatus']>;
+  connectionIdByUser: Map<string, string>;
   mutualConnectionsByUser: Map<string, number>;
+};
+
+type PeopleSearchRankRow = {
+  id: string;
+  rank: number;
+  lastActiveAt: Date | null;
 };
 
 const emptyRelationshipSummary = (): RelationshipSummary => ({
   connectionStatusByUser: new Map<string, PersonCard['connectionStatus']>(),
+  connectionIdByUser: new Map<string, string>(),
   mutualConnectionsByUser: new Map<string, number>(),
 });
 
@@ -443,6 +460,7 @@ const getRelationshipSummary = async (
   const uniqueTargetIds = Array.from(new Set(targetIds));
   const targetIdSet = new Set(uniqueTargetIds);
   const connectionStatusByUser = new Map<string, PersonCard['connectionStatus']>();
+  const connectionIdByUser = new Map<string, string>();
   const mutualConnectionsByUser = new Map<string, number>();
 
   const [capabilities, currentConnectionIds] = await Promise.all([
@@ -453,6 +471,9 @@ const getRelationshipSummary = async (
   for (const [targetUserId, capability] of capabilities) {
     if (capability.connectionStatus !== 'none') {
       connectionStatusByUser.set(targetUserId, capability.connectionStatus);
+    }
+    if (capability.connectionId) {
+      connectionIdByUser.set(targetUserId, capability.connectionId);
     }
   }
 
@@ -491,8 +512,22 @@ const getRelationshipSummary = async (
     }
   }
 
-  return { connectionStatusByUser, mutualConnectionsByUser };
+  return { connectionStatusByUser, connectionIdByUser, mutualConnectionsByUser };
 };
+
+const peopleSearchScope = (query: string): string =>
+  `people.search.${createHash('sha256').update(query).digest('hex').slice(0, 20)}`;
+
+const decodePeopleSearchCursor = (value: unknown, query: string) =>
+  decodeKeysetCursor(value, peopleSearchScope(query));
+
+const encodePeopleSearchCursor = (row: PeopleSearchRankRow, query: string): string =>
+  encodeKeysetCursor({
+    scope: peopleSearchScope(query),
+    id: row.id,
+    n: Number(row.rank),
+    t: row.lastActiveAt?.toISOString() ?? null,
+  });
 
 const mapUserToPersonCard = (
   user: any,
@@ -500,6 +535,8 @@ const mapUserToPersonCard = (
   visibilityByUser: Map<string, PremiumVisibilityState> = new Map()
 ): PersonCard => {
   const visibleUser = applyPremiumVisibilityToUser(user, visibilityByUser);
+  const connectionStatus = relationship.connectionStatusByUser.get(visibleUser.id) || 'none';
+  const connectionId = relationship.connectionIdByUser.get(visibleUser.id) || null;
   return {
     id: visibleUser.id,
     username: visibleUser.username,
@@ -522,7 +559,12 @@ const mapUserToPersonCard = (
     profileBoostEndsAt: visibleUser.profileBoostEndsAt,
     profileBoostPriority: visibleUser.profileBoostPriority,
     discoveryPriority: visibleUser.discoveryPriority,
-    connectionStatus: relationship.connectionStatusByUser.get(visibleUser.id) || 'none',
+    connectionStatus,
+    connectionId,
+    relationship: {
+      status: connectionStatus,
+      connectionId,
+    },
     mutualConnections: relationship.mutualConnectionsByUser.get(visibleUser.id) || 0,
   };
 };
@@ -609,7 +651,7 @@ export const getPeople = async (
     const cursor = decodePeopleCursor(req.query.cursor);
     const requestedPage = parseBoundedInt(req.query.page, 1, 1, Number.MAX_SAFE_INTEGER);
     const page = cursor ? 1 : requestedPage;
-    const limit = parseBoundedInt(req.query.limit, PEOPLE_DEFAULT_LIMIT, 1, PEOPLE_MAX_LIMIT);
+    const limit = parseBoundedInt(req.query.limit, PEOPLE_BROWSE_DEFAULT_LIMIT, 1, PEOPLE_MAX_LIMIT);
     const includeMutualConnections = req.query.includeMutuals !== 'false' && req.query.includeMutualConnections !== 'false';
     const cursorWhere = buildCursorWhere(cursor);
     const cacheKey = buildPeopleListCacheKey(userId, req.query);
@@ -636,7 +678,7 @@ export const getPeople = async (
         userId,
         query: req.query,
         access,
-        applyDefaultLocalScope: !access.isPremium,
+        applyDefaultLocalScope: false,
       });
 
       const blockedWhere = blockedUserIds.length > 0 ? { id: { notIn: blockedUserIds } } : null;
@@ -644,24 +686,22 @@ export const getPeople = async (
       const findWhere = cursorWhere
         ? { AND: [where, cursorWhere, ...(blockedWhere ? [blockedWhere] : [])] }
         : countWhere;
-      const baseRequestedTake = limit + 1;
-      const requestedTake = cursor
-        ? baseRequestedTake
-        : Math.min(baseRequestedTake * 3, PEOPLE_SUGGESTION_POOL_MAX);
-
       const fetchedUsers = await prismaRead.user.findMany({
         where: findWhere,
-        take: requestedTake,
+        take: limit + 1,
         orderBy: peopleOrderBy,
         select: personCardUserSelectWithCursor,
       });
 
+      // The cursor must be calculated from the database-ordered page boundary.
+      // Premium visibility may only rearrange the users inside that boundary;
+      // otherwise a boosted user can move across the cursor and create gaps.
+      const databaseOrderedPage = fetchedUsers.slice(0, limit);
       const visibilityByUser = await getPremiumVisibilityByUserIds(
-        fetchedUsers.map((user) => user.id)
+        databaseOrderedPage.map((user) => user.id)
       );
-      const sortedUsers = sortByPremiumVisibility(fetchedUsers, visibilityByUser);
-      const hasExtraUser = sortedUsers.length > limit;
-      const users = sortedUsers.slice(0, limit);
+      const users = sortByPremiumVisibility(databaseOrderedPage, visibilityByUser);
+      const hasExtraUser = fetchedUsers.length > limit;
       const relationship = await getRelationshipSummary(
         userId,
         users.map((user) => user.id),
@@ -680,7 +720,9 @@ export const getPeople = async (
         page,
         totalPages,
         hasMore,
-        nextCursor: hasMore && users.length > 0 ? encodePeopleCursor(users[users.length - 1]) : null,
+        nextCursor: hasMore && databaseOrderedPage.length > 0
+          ? encodePeopleCursor(databaseOrderedPage[databaseOrderedPage.length - 1])
+          : null,
         totalIsApproximate: true,
       };
     };
@@ -700,7 +742,7 @@ export const getPeople = async (
       ? response
       : { ...response, people: filteredPeople };
 
-    await recordPeopleSearchAppearancesIfNeeded(userId, req.query, filteredPeople);
+    void recordPeopleSearchAppearancesIfNeeded(userId, req.query, filteredPeople);
 
     res.setHeader('X-Vormex-Cache', bypassCache ? 'BYPASS' : 'MISS');
     res.status(200).json(filteredResponse);
@@ -709,6 +751,181 @@ export const getPeople = async (
     res.status(500).json({
       error: 'Failed to fetch people',
     });
+  }
+};
+
+/**
+ * Global indexed people search.
+ * GET /api/people/search?q=&cursor=&limit=20
+ */
+export const searchPeople = async (
+  req: AuthenticatedRequest,
+  res: Response<PeopleResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = String(req.user.userId);
+    const normalizedQuery = normalizeSearchText(req.query.q, 80).toLowerCase();
+    if (normalizedQuery.length < PEOPLE_MIN_TEXT_SEARCH_LENGTH) {
+      res.status(200).json({
+        people: [],
+        total: 0,
+        page: 1,
+        totalPages: 1,
+        hasMore: false,
+        nextCursor: null,
+      });
+      return;
+    }
+
+    const cursor = decodePeopleSearchCursor(req.query.cursor, normalizedQuery);
+    if (req.query.cursor && !cursor) {
+      res.status(400).json({ error: 'Invalid or expired search cursor' });
+      return;
+    }
+    if (cursor?.n === undefined) {
+      if (req.query.cursor) {
+        res.status(400).json({ error: 'Invalid search cursor' });
+        return;
+      }
+    }
+
+    const cursorDate = cursor?.t ? new Date(cursor.t) : null;
+    if (cursorDate && Number.isNaN(cursorDate.getTime())) {
+      res.status(400).json({ error: 'Invalid search cursor' });
+      return;
+    }
+
+    const limit = parseBoundedInt(
+      req.query.limit,
+      PEOPLE_SEARCH_DEFAULT_LIMIT,
+      1,
+      PEOPLE_SEARCH_MAX_LIMIT
+    );
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const blockedClause = blockedUserIds.length
+      ? Prisma.sql`AND u."id" NOT IN (${Prisma.join(blockedUserIds)})`
+      : Prisma.empty;
+    const cursorClause = !cursor
+      ? Prisma.empty
+      : cursorDate
+        ? Prisma.sql`WHERE (
+            "rank" < ${cursor.n!}
+            OR ("rank" = ${cursor.n!} AND "lastActiveAt" < ${cursorDate})
+            OR ("rank" = ${cursor.n!} AND "lastActiveAt" = ${cursorDate} AND "id" > ${cursor.id})
+            OR ("rank" = ${cursor.n!} AND "lastActiveAt" IS NULL)
+          )`
+        : Prisma.sql`WHERE (
+            "rank" < ${cursor.n!}
+            OR ("rank" = ${cursor.n!} AND "lastActiveAt" IS NULL AND "id" > ${cursor.id})
+          )`;
+
+    const queryHash = createHash('sha256')
+      .update(`${normalizedQuery}|${String(req.query.cursor || '')}|${limit}`)
+      .digest('hex')
+      .slice(0, 32);
+    const cacheKey = `people:search:${PEOPLE_CACHE_VERSION}:user:${userId}:${queryHash}`;
+    const bypassCache = shouldBypassPeopleCache(req);
+
+    const computeResponse = async (): Promise<PeopleResponse> => {
+      const rankedRows = await prismaRead.$queryRaw<PeopleSearchRankRow[]>(Prisma.sql`
+        WITH ranked_people AS (
+          SELECT
+            u."id",
+            u."lastActiveAt",
+            (
+              CASE
+                WHEN lower(u."username") = ${normalizedQuery} THEN 1000
+                WHEN lower(u."name") = ${normalizedQuery} THEN 900
+                WHEN lower(u."username") LIKE ${`${normalizedQuery}%`} THEN 800
+                WHEN lower(u."name") LIKE ${`${normalizedQuery}%`} THEN 700
+                WHEN lower(COALESCE(u."college", '')) = ${normalizedQuery} THEN 600
+                WHEN lower(COALESCE(u."college", '')) LIKE ${`${normalizedQuery}%`} THEN 550
+                ELSE 100
+              END
+              + COALESCE(ts_rank_cd(d."searchVector", websearch_to_tsquery('english', ${normalizedQuery})), 0) * 100
+            )::double precision AS "rank"
+          FROM "users" u
+          LEFT JOIN "discovery_documents" d
+            ON d."entityType" = 'profile' AND d."entityId" = u."id"
+          WHERE u."id" <> ${userId}
+            AND u."isBanned" = false
+            ${blockedClause}
+            AND (
+              lower(u."username") = ${normalizedQuery}
+              OR lower(u."name") = ${normalizedQuery}
+              OR lower(u."username") LIKE ${`${normalizedQuery}%`}
+              OR lower(u."name") LIKE ${`${normalizedQuery}%`}
+              OR lower(COALESCE(u."college", '')) LIKE ${`${normalizedQuery}%`}
+              OR d."searchVector" @@ websearch_to_tsquery('english', ${normalizedQuery})
+            )
+        )
+        SELECT "id", "rank", "lastActiveAt"
+        FROM ranked_people
+        ${cursorClause}
+        ORDER BY "rank" DESC, "lastActiveAt" DESC NULLS LAST, "id" ASC
+        LIMIT ${limit + 1}
+      `);
+
+      const pageRows = rankedRows.slice(0, limit);
+      const users = pageRows.length
+        ? await prismaRead.user.findMany({
+            where: { id: { in: pageRows.map((row) => row.id) }, isBanned: false },
+            select: personCardUserSelectWithCursor,
+          })
+        : [];
+      const userById = new Map(users.map((user) => [user.id, user]));
+      const orderedUsers = pageRows.flatMap((row) => {
+        const user = userById.get(row.id);
+        return user ? [user] : [];
+      });
+      const [visibilityByUser, relationship] = await Promise.all([
+        getPremiumVisibilityByUserIds(orderedUsers.map((user) => user.id)),
+        getRelationshipSummary(userId, orderedUsers.map((user) => user.id), false),
+      ]);
+      const people = orderedUsers.map((user) =>
+        mapUserToPersonCard(user, relationship, visibilityByUser)
+      );
+      const hasMore = rankedRows.length > limit;
+      const boundary = pageRows[pageRows.length - 1];
+
+      return {
+        people,
+        total: people.length + (hasMore ? 1 : 0),
+        page: 1,
+        totalPages: hasMore ? 2 : 1,
+        hasMore,
+        nextCursor: hasMore && boundary
+          ? encodePeopleSearchCursor(boundary, normalizedQuery)
+          : null,
+        totalIsApproximate: true,
+      };
+    };
+
+    const response = bypassCache
+      ? await computeResponse()
+      : await cacheService.getOrSet(cacheKey, computeResponse, {
+          tags: peopleCacheTags(userId),
+          swr: {
+            softTtlSeconds: PEOPLE_AUTH_CACHE_TTL_SECONDS,
+            hardTtlSeconds: PEOPLE_AUTH_CACHE_TTL_SECONDS * 4,
+          },
+        });
+
+    void recordPeopleSearchAppearancesIfNeeded(
+      userId,
+      { ...req.query, search: normalizedQuery },
+      response.people
+    );
+    res.setHeader('X-Vormex-Cache', bypassCache ? 'BYPASS' : 'MISS');
+    res.status(200).json(response);
+  } catch (error) {
+    console.error('Error searching people:', error);
+    res.status(500).json({ error: 'Failed to search people' });
   }
 };
 

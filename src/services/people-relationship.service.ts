@@ -5,6 +5,7 @@ export type PeopleConnectionStatus = 'none' | 'pending_sent' | 'pending_received
 
 export type PeopleRelationshipCapability = {
   connectionStatus: PeopleConnectionStatus;
+  connectionId: string | null;
   canConnect: boolean;
   canMessage: boolean;
   canBlock: boolean;
@@ -42,6 +43,7 @@ export async function getPeopleRelationshipCapabilities(
   for (const targetId of uniqueIds) {
     result.set(targetId, {
       connectionStatus: 'none',
+      connectionId: null,
       canConnect: connectionLimit?.allowed ?? true,
       canMessage: options.includeActionLimits
         ? (sentMessageCountByTarget.get(targetId) || 0) < 2
@@ -58,7 +60,7 @@ export async function getPeopleRelationshipCapabilities(
         { requesterId: { in: uniqueIds }, addresseeId: currentUserId },
       ],
     },
-    select: { requesterId: true, addresseeId: true, status: true },
+    select: { id: true, requesterId: true, addresseeId: true, status: true },
   });
 
   for (const connection of connections) {
@@ -69,6 +71,7 @@ export async function getPeopleRelationshipCapabilities(
       : connection.requesterId === currentUserId ? 'pending_sent' : 'pending_received';
     result.set(targetId, {
       connectionStatus,
+      connectionId: connection.id,
       canConnect: false,
       canMessage: connectionStatus === 'connected' || (
         options.includeActionLimits && (sentMessageCountByTarget.get(targetId) || 0) < 2

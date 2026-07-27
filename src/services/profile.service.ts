@@ -9,6 +9,7 @@ import type {
   UnifiedFeedResponse,
   CoreProfileResponse,
   FullProfileResponse,
+  ProfileSectionsResponse,
   ProfileConnectionStatus,
 } from '../types/profile.types';
 import { getActivityHeatmap } from './activity.service';
@@ -33,6 +34,7 @@ const PROFILE_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 const LEGACY_PROFILE_AVIF_PATTERN = /\/profiles\/avatars\/[^?#]+\.avif(?:$|[?#])/i;
 const PROFILE_CORE_CACHE_TTL_SECONDS = 120;
 const PROFILE_BUNDLE_CACHE_TTL_SECONDS = 120;
+const PROFILE_SECTIONS_CACHE_TTL_SECONDS = 5 * 60;
 
 const CORE_PROFILE_USER_SELECT = {
   id: true,
@@ -124,7 +126,7 @@ export function normalizeProfileCacheIdentifier(value: string): string {
 }
 
 export function profileResponseCacheKey(
-  kind: 'core' | 'bundle',
+  kind: 'core' | 'bundle' | 'sections',
   requestingUserId: string | null,
   identifier: string
 ): string {
@@ -788,6 +790,144 @@ export async function getCoreProfile(
   );
   trackProfileViewLater(requestingUserId, coordinated.user.id);
   return coordinated;
+}
+
+/**
+ * Load the independently cacheable lower profile sections. This intentionally
+ * excludes feed and activity; those already have cursor/section endpoints and
+ * should only run when their own UI becomes visible.
+ */
+export async function getProfileSections(
+  targetUsernameOrId: string
+): Promise<ProfileSectionsResponse> {
+  const identifier = normalizeProfileCacheIdentifier(targetUsernameOrId);
+  const requestedCacheKey = profileResponseCacheKey('sections', null, identifier);
+  const cached = await cacheService.get<ProfileSectionsResponse>(requestedCacheKey);
+  if (cached) return cached;
+
+  return cacheService.getOrSet(
+    requestedCacheKey,
+    async () => {
+      const user = await prisma.user.findFirst({
+        where: isUUID(identifier)
+          ? { id: identifier }
+          : { username: identifier.toLowerCase() },
+        select: {
+          id: true,
+          username: true,
+          githubConnected: true,
+          githubUsername: true,
+          githubAvatarUrl: true,
+          githubProfileUrl: true,
+          githubLastSyncedAt: true,
+        },
+      });
+      if (!user) throw new Error('User not found');
+
+      const targetUserId = user.id;
+      const canonicalCacheKey = profileResponseCacheKey('sections', null, targetUserId);
+      if (canonicalCacheKey !== requestedCacheKey) {
+        const canonicalCached = await cacheService.get<ProfileSectionsResponse>(canonicalCacheKey);
+        if (canonicalCached) {
+          await cacheService.set(
+            requestedCacheKey,
+            canonicalCached,
+            PROFILE_SECTIONS_CACHE_TTL_SECONDS,
+            [`user:${targetUserId}`]
+          );
+          return canonicalCached;
+        }
+      }
+
+      const [userSkills, experiences, education, projects, certificates, achievements, githubStats] =
+        await Promise.all([
+          prisma.userSkill.findMany({
+            where: { userId: targetUserId },
+            include: { skill: true },
+            orderBy: { createdAt: 'desc' },
+          }).catch(() => []),
+          prisma.experience.findMany({
+            where: { userId: targetUserId },
+            orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }],
+          }).catch(() => []),
+          prisma.education.findMany({
+            where: { userId: targetUserId },
+            orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }],
+          }).catch(() => []),
+          prisma.project.findMany({
+            where: { userId: targetUserId },
+            orderBy: [{ featured: 'desc' }, { startDate: 'desc' }],
+          }).catch(() => []),
+          prisma.certificate.findMany({
+            where: { userId: targetUserId },
+            orderBy: { issueDate: 'desc' },
+          }).catch(() => []),
+          prisma.achievement.findMany({
+            where: { userId: targetUserId },
+            orderBy: { date: 'desc' },
+          }).catch(() => []),
+          user.githubConnected
+            ? prisma.gitHubStats.findUnique({ where: { userId: targetUserId } }).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
+      const response: ProfileSectionsResponse = {
+        skills: userSkills.map((entry) => ({
+          id: entry.id,
+          skill: {
+            id: entry.skill.id,
+            name: entry.skill.name,
+            category: entry.skill.category,
+          },
+          proficiency: entry.proficiency,
+          yearsOfExp: entry.yearsOfExp,
+        })),
+        experiences,
+        education,
+        projects,
+        certificates,
+        achievements,
+        github: {
+          connected: user.githubConnected || false,
+          username: user.githubUsername,
+          avatarUrl: user.githubAvatarUrl,
+          profileUrl: user.githubProfileUrl,
+          stats: githubStats
+            ? {
+                totalPublicRepos: githubStats.totalPublicRepos,
+                totalStars: githubStats.totalStars,
+                totalForks: githubStats.totalForks,
+                followers: githubStats.followers,
+                following: githubStats.following,
+                topLanguages: githubStats.topLanguages || {},
+                topRepos: githubStats.topRepos || [],
+              }
+            : null,
+          contributionCalendar: githubStats?.contributionData || null,
+          lastSyncedAt: user.githubLastSyncedAt,
+        },
+      };
+
+      const cacheKeys = Array.from(new Set([
+        requestedCacheKey,
+        canonicalCacheKey,
+        profileResponseCacheKey('sections', null, user.username),
+      ]));
+      await Promise.all(cacheKeys.map((cacheKey) =>
+        cacheService.set(
+          cacheKey,
+          response,
+          PROFILE_SECTIONS_CACHE_TTL_SECONDS,
+          [`user:${targetUserId}`]
+        )
+      ));
+      return response;
+    },
+    {
+      ttlSeconds: PROFILE_SECTIONS_CACHE_TTL_SECONDS,
+      lockTtlMs: 10_000,
+    }
+  );
 }
 
 /**

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { authenticate, optionalAuth } from '../middleware/auth.middleware';
 import {
   getPeople,
+  searchPeople,
   getSuggestions,
   getPeopleFromSameCollege,
   getPeopleNearMe,
@@ -54,6 +55,7 @@ router.get('/suggestions', authenticate, getSuggestions);
 router.get('/same-college', authenticate, getPeopleFromSameCollege);
 router.get('/near-me', authenticate, getPeopleNearMe);
 router.get('/colleges', authenticate, searchColleges);
+router.get('/search', authenticate, searchPeople);
 
 // Main people search (optional auth for personalized results)
 router.get('/', optionalAuth, getPeople);

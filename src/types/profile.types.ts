@@ -197,4 +197,15 @@ export interface FullProfileResponse {
   };
 }
 
+/** Heavy profile collections, loaded independently when lower content is visible. */
+export interface ProfileSectionsResponse {
+  github: FullProfileResponse['github'];
+  skills: FullProfileResponse['skills'];
+  experiences: FullProfileResponse['experiences'];
+  education: FullProfileResponse['education'];
+  projects: FullProfileResponse['projects'];
+  certificates: FullProfileResponse['certificates'];
+  achievements: FullProfileResponse['achievements'];
+}
+
 export type ProfileResponse = CoreProfileResponse | FullProfileResponse;

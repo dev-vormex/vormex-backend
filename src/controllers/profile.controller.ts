@@ -8,7 +8,7 @@ import * as profileService from '../services/profile.service';
 import { getActivityHeatmap, getContributionYears } from '../services/activity.service';
 import { queueMatchAvailabilityNotifications } from '../services/match-availability-notification.service';
 import { isUUID } from '../utils/username.util';
-import type { ProfileResponse, UnifiedFeedResponse } from '../types/profile.types';
+import type { ProfileResponse, ProfileSectionsResponse, UnifiedFeedResponse } from '../types/profile.types';
 import type { ActivityHeatmapResponse } from '../types/activity.types';
 import {
   isProfileThemeKey,
@@ -142,6 +142,38 @@ export const getProfile = async (
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to fetch profile',
     });
+  }
+};
+
+export const getProfileSections = async (
+  req: AuthenticatedRequest,
+  res: Response<ProfileSectionsResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    let userId = ensureString(req.params.userId);
+    const requestingUserId = req.user?.userId ? String(req.user.userId) : null;
+    if (!userId) {
+      res.status(400).json({ error: 'User ID or username is required' });
+      return;
+    }
+    if (userId.startsWith('@')) userId = userId.substring(1);
+    if (userId.toLowerCase() === 'me') {
+      if (!requestingUserId) {
+        res.status(401).json({ error: 'Authentication required to view own profile' });
+        return;
+      }
+      userId = requestingUserId;
+    }
+
+    const sections = await profileService.getProfileSections(userId);
+    res.status(200).json(sections);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'User not found') {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    console.error('Error getting profile sections:', error);
+    res.status(500).json({ error: 'Failed to fetch profile sections' });
   }
 };
 
