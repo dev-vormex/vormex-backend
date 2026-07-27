@@ -17,9 +17,13 @@ import {
 } from '../services/matching-engine.service';
 import { getBlockedUserIds } from '../services/trust-safety.service';
 
-const SMART_MATCH_CACHE_VERSION = 'v1';
-const SMART_MATCH_CACHE_TTL_SECONDS = 60;
+const SMART_MATCH_CACHE_VERSION = 'v2';
+const SMART_MATCH_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SMART_MATCH_CACHE_TTL_SECONDS = 48 * 60 * 60;
 const SMART_MATCH_TYPES = new Set(['all', 'same_campus', 'same_goal', 'mentor', 'mentee']);
+
+export const smartMatchSnapshotWindow = (nowMs: number = Date.now()): number =>
+  Math.floor(nowMs / SMART_MATCH_WINDOW_MS);
 
 const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
 
@@ -28,6 +32,7 @@ const smartMatchCacheKey = (params: {
   type: string;
   page: number;
   limit: number;
+  snapshotWindow: number;
 }): string =>
   [
     'matching:smart',
@@ -36,6 +41,7 @@ const smartMatchCacheKey = (params: {
     `type:${params.type}`,
     `page:${params.page}`,
     `limit:${params.limit}`,
+    `window:${params.snapshotWindow}`,
   ].join(':');
 
 const smartMatchCacheTags = (userId: string): string[] =>
@@ -66,69 +72,74 @@ export const getSmartMatches = async (
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
     const skip = (page - 1) * limit;
-    const cacheKey = smartMatchCacheKey({ userId, type, page, limit });
+    const snapshotWindow = smartMatchSnapshotWindow();
+    const cacheKey = smartMatchCacheKey({ userId, type, page, limit, snapshotWindow });
     const cached = await cacheService.get(cacheKey);
     if (cached) {
       res.setHeader('X-Vormex-Cache', 'HIT');
+      res.setHeader('X-Vormex-Match-Window', String(snapshotWindow));
       res.status(200).json(cached);
       return;
     }
 
-    const currentUser = await prisma.user.findUnique({
-      where: { id: userId },
-      select: MATCHING_ENGINE_USER_SELECT,
-    });
-
-    if (!currentUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
-
-    const [excludeIds, blockedUserIds] = await Promise.all([
-      getConnectedOrPendingUserIds(userId),
-      getBlockedUserIds(userId),
-    ]);
-    const where = buildMatchingCandidateWhere(currentUser, {
-      type,
-      excludedIds: [...excludeIds, ...blockedUserIds],
-    });
-
-    const [candidateUsers, total] = await Promise.all([
-      prisma.user.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy: [{ lastActiveAt: 'desc' }, { id: 'asc' }],
+    const response = await cacheService.getOrSet(cacheKey, async () => {
+      const currentUser = await prisma.user.findUnique({
+        where: { id: userId },
         select: MATCHING_ENGINE_USER_SELECT,
-      }),
-      prisma.user.count({ where }),
-    ]);
+      });
 
-    const visibilityByUser = await getPremiumVisibilityByUserIds(
-      candidateUsers.map((user) => user.id)
-    );
-    const matches = rankUserMatches(currentUser, candidateUsers, { visibilityByUser })
-      .map((match) => ({
-        user: serializeMatchedUser(match.candidate, visibilityByUser.get(match.candidate.id)),
-        score: match.score,
-        matchPercentage: match.matchPercentage,
-        reasons: match.reasons,
-        tags: match.tags,
-        whyMatched: match.whyMatched,
-        sharedSignals: match.sharedSignals,
-      }));
+      if (!currentUser) {
+        throw new Error('Smart match user not found');
+      }
 
-    const response = {
-      matches,
-      total,
-      page,
-      totalPages: Math.ceil(total / limit),
-      hasMore: page < Math.ceil(total / limit),
-    };
+      const [excludeIds, blockedUserIds] = await Promise.all([
+        getConnectedOrPendingUserIds(userId),
+        getBlockedUserIds(userId),
+      ]);
+      const where = buildMatchingCandidateWhere(currentUser, {
+        type,
+        excludedIds: [...excludeIds, ...blockedUserIds],
+      });
+      const [candidateUsers, total] = await Promise.all([
+        prisma.user.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: [{ lastActiveAt: 'desc' }, { id: 'asc' }],
+          select: MATCHING_ENGINE_USER_SELECT,
+        }),
+        prisma.user.count({ where }),
+      ]);
+      const visibilityByUser = await getPremiumVisibilityByUserIds(
+        candidateUsers.map((user) => user.id)
+      );
+      const matches = rankUserMatches(currentUser, candidateUsers, { visibilityByUser })
+        .map((match) => ({
+          user: serializeMatchedUser(match.candidate, visibilityByUser.get(match.candidate.id)),
+          score: match.score,
+          matchPercentage: match.matchPercentage,
+          reasons: match.reasons,
+          tags: match.tags,
+          whyMatched: match.whyMatched,
+          sharedSignals: match.sharedSignals,
+        }));
 
-    await cacheService.set(cacheKey, response, SMART_MATCH_CACHE_TTL_SECONDS, smartMatchCacheTags(userId));
+      return {
+        matches,
+        total,
+        page,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page < Math.ceil(total / limit),
+        snapshotWindow,
+      };
+    }, {
+      ttlSeconds: SMART_MATCH_CACHE_TTL_SECONDS,
+      lockTtlMs: 30_000,
+      tags: smartMatchCacheTags(userId),
+    });
 
-    res.setHeader('X-Vormex-Cache', 'MISS');
+    res.setHeader('X-Vormex-Cache', 'SNAPSHOT');
+    res.setHeader('X-Vormex-Match-Window', String(snapshotWindow));
     res.status(200).json(response);
   } catch (error) {
     console.error('Error fetching smart matches:', error);

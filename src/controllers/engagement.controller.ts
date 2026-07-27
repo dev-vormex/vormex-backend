@@ -32,6 +32,13 @@ const TOP_NETWORKERS_CACHE_TAG = 'engagement:leaderboard';
 const TOP_NETWORKERS_CACHE_TTL_SECONDS = 300;
 const TOP_NETWORKERS_DEFAULT_LIMIT = 100;
 const TOP_NETWORKERS_MAX_LIMIT = 100;
+const DAILY_MATCH_CACHE_VERSION = 'v2';
+const DAILY_MATCH_WINDOW_MS = 24 * 60 * 60 * 1000;
+const DAILY_MATCH_CACHE_TTL_SECONDS = 48 * 60 * 60;
+
+export function dailyMatchSnapshotWindow(nowMs: number = Date.now()): number {
+  return Math.floor(nowMs / DAILY_MATCH_WINDOW_MS);
+}
 
 // Helper to get today's date at midnight UTC
 function getTodayStart(): Date {
@@ -376,81 +383,80 @@ export const getDailyMatches = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Get current user for matching
-    const currentUser = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { college: true, interests: true },
-    });
+    const snapshotWindow = dailyMatchSnapshotWindow();
+    const cacheKey = [
+      'matching:daily',
+      DAILY_MATCH_CACHE_VERSION,
+      `user:${userId}`,
+      `window:${snapshotWindow}`,
+    ].join(':');
+    const payload = await cacheService.getOrSet(cacheKey, async () => {
+      const [currentUser, existingConnections] = await Promise.all([
+        prisma.user.findUnique({
+          where: { id: userId },
+          select: { college: true, interests: true },
+        }),
+        prisma.connections.findMany({
+          where: {
+            OR: [
+              { requesterId: userId },
+              { addresseeId: userId },
+            ],
+          },
+          select: { requesterId: true, addresseeId: true },
+        }),
+      ]);
 
-    // Get existing connections to exclude
-    const existingConnections = await prisma.connections.findMany({
-      where: {
-        OR: [
-          { requesterId: userId },
-          { addresseeId: userId },
-        ],
-      },
-      select: { requesterId: true, addresseeId: true },
-    });
+      const connectedUserIds = new Set<string>();
+      existingConnections.forEach((connection) => {
+        connectedUserIds.add(connection.requesterId);
+        connectedUserIds.add(connection.addresseeId);
+      });
+      connectedUserIds.add(userId);
 
-    const connectedUserIds = new Set<string>();
-    existingConnections.forEach((conn) => {
-      connectedUserIds.add(conn.requesterId);
-      connectedUserIds.add(conn.addresseeId);
-    });
-    connectedUserIds.add(userId);
+      // Variable rewards should vary between days, not between page reloads.
+      const matchCount = Math.floor(Math.random() * 5) + 1;
+      const potentialMatches = await prisma.user.findMany({
+        where: {
+          id: { notIn: Array.from(connectedUserIds) },
+          isBanned: false,
+        },
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          profileImage: true,
+          headline: true,
+          college: true,
+          lastActiveAt: true,
+          interests: true,
+          isVerified: true,
+          profileBadgeStyle: true,
+        },
+        take: matchCount * 3,
+      });
 
-    // Variable reward: randomize match count (1-5)
-    const matchCount = Math.floor(Math.random() * 5) + 1;
+      const scoredMatches = potentialMatches.map((user) => {
+        let score = 0;
+        if (currentUser?.college && user.college === currentUser.college) score += 20;
+        if (currentUser?.interests && user.interests) {
+          const userInterests = Array.isArray(user.interests) ? user.interests : [];
+          const myInterests = Array.isArray(currentUser.interests) ? currentUser.interests : [];
+          score += userInterests.filter((interest: string) => myInterests.includes(interest)).length * 10;
+        }
+        if (user.lastActiveAt && new Date(user.lastActiveAt) > new Date(Date.now() - DAILY_MATCH_WINDOW_MS)) {
+          score += 10;
+        }
+        return { ...user, score };
+      });
 
-    // Find users with similar interests or same college
-    const potentialMatches = await prisma.user.findMany({
-      where: {
-        id: { notIn: Array.from(connectedUserIds) },
-        isBanned: false,
-      },
-      select: {
-        id: true,
-        username: true,
-        name: true,
-        profileImage: true,
-        headline: true,
-        college: true,
-        lastActiveAt: true,
-        interests: true,
-        isVerified: true,
-        profileBadgeStyle: true,
-      },
-      take: matchCount * 3, // Get more than needed for filtering
-    });
-
-    // Score and sort by relevance
-    const scoredMatches = potentialMatches.map((user) => {
-      let score = 0;
-      if (currentUser?.college && user.college === currentUser.college) {
-        score += 20;
-      }
-      // Check interest overlap
-      if (currentUser?.interests && user.interests) {
-        const userInterests = Array.isArray(user.interests) ? user.interests : [];
-        const myInterests = Array.isArray(currentUser.interests) ? currentUser.interests : [];
-        const overlap = userInterests.filter((i: string) => myInterests.includes(i)).length;
-        score += overlap * 10;
-      }
-      // Boost recently active users
-      if (user.lastActiveAt && new Date(user.lastActiveAt) > new Date(Date.now() - 24 * 60 * 60 * 1000)) {
-        score += 10;
-      }
-      return { ...user, score };
-    });
-
-    // Sort by score and take top matches
-    const topMatches = scoredMatches
-      .sort((a, b) => b.score - a.score)
-      .slice(0, matchCount);
-    const premiumVisibilityByUser = await getPremiumVisibilityByUserIds(topMatches.map((user) => user.id));
-
-    const matches = topMatches.map((user) => ({
+      const topMatches = scoredMatches
+        .sort((a, b) => b.score - a.score)
+        .slice(0, matchCount);
+      const premiumVisibilityByUser = await getPremiumVisibilityByUserIds(
+        topMatches.map((user) => user.id)
+      );
+      const matches = topMatches.map((user) => ({
         id: user.id,
         username: user.username,
         name: user.name,
@@ -461,29 +467,40 @@ export const getDailyMatches = async (req: AuthRequest, res: Response): Promise<
         isVerified: Boolean(user.isVerified),
         profileBadgeStyle: user.profileBadgeStyle ?? null,
         isPremium: Boolean(premiumVisibilityByUser.get(user.id)?.isPremium),
-        isOnline: user.lastActiveAt ? new Date(user.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000) : false,
-        replyRate: Math.floor(Math.random() * 40) + 60, // TODO: Calculate real reply rate
+        isOnline: user.lastActiveAt
+          ? new Date(user.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000)
+          : false,
+        replyRate: Math.floor(Math.random() * 40) + 60,
       }));
+      const surpriseMessages = [
+        'You have new matches waiting!',
+        'Someone from your college is here!',
+        'A perfect match just joined!',
+        'Great networking opportunities today!',
+        'Check back tomorrow for more matches!',
+      ];
 
-    // Generate surprise message (variable reward)
-    const surpriseMessages = [
-      "You have new matches waiting!",
-      "Someone from your college is here!",
-      "A perfect match just joined!",
-      "Great networking opportunities today!",
-      "Check back tomorrow for more matches!",
-    ];
-    const surpriseMessage = matches.length > 0 
-      ? surpriseMessages[Math.floor(Math.random() * (surpriseMessages.length - 1))]
-      : surpriseMessages[surpriseMessages.length - 1];
-
-    res.json({
-      data: {
+      return {
         matches,
         matchCount: matches.length,
-        surpriseMessage,
-      },
+        surpriseMessage: matches.length > 0
+          ? surpriseMessages[Math.floor(Math.random() * (surpriseMessages.length - 1))]
+          : surpriseMessages[surpriseMessages.length - 1],
+        snapshotWindow,
+      };
+    }, {
+      ttlSeconds: DAILY_MATCH_CACHE_TTL_SECONDS,
+      lockTtlMs: 30_000,
+      tags: [
+        `matching:user:${userId}`,
+        `people:user:${userId}`,
+        `people:connections:${userId}`,
+      ],
     });
+
+    res.setHeader('X-Vormex-Cache', 'SNAPSHOT');
+    res.setHeader('X-Vormex-Match-Window', String(snapshotWindow));
+    res.json({ data: payload });
   } catch (error) {
     console.error('getDailyMatches error:', error);
     res.status(500).json({ error: 'Failed to fetch daily matches' });

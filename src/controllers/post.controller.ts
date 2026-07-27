@@ -77,12 +77,14 @@ interface AuthRequest extends Request {
 const FEED_REALTIME_ROOM = 'feed:global';
 const FEED_IMPRESSION_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const FEED_IMPRESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-const HOME_FEED_CACHE_TTL_SECONDS = 60;
-const HOME_FEED_CACHE_VERSION = 'v2';
+const HOME_FEED_SNAPSHOT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const HOME_FEED_CACHE_TTL_SECONDS = 48 * 60 * 60;
+const HOME_FEED_RECOMMENDATION_SESSION_TTL_MS = HOME_FEED_CACHE_TTL_SECONDS * 1000;
+const HOME_FEED_CACHE_VERSION = 'v3';
 const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
 const HOME_FEED_DEFAULT_LIMIT = 40;
 const HOME_FEED_MAX_LIMIT = 50;
-const HOME_FEED_RECOMMENDATION_CONTEXT_CACHE_TTL_SECONDS = 2 * 60;
+const HOME_FEED_RECOMMENDATION_CONTEXT_CACHE_TTL_SECONDS = 24 * 60 * 60;
 const RECENT_PROFILE_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_RECENT_PROFILE_SIGNALS = 24;
 const MAX_FEED_CONTEXT_CONNECTIONS = 500;
@@ -161,8 +163,11 @@ async function selectHomeFeedAdPlacements(
 
 const feedCacheTags = (...tags: Array<string | null | undefined>): string[] => {
   const dynamicTags = tags.filter((tag): tag is string => Boolean(tag));
-  return Array.from(new Set([HOME_FEED_CACHE_GLOBAL_TAG, ...dynamicTags]));
+  return Array.from(new Set(dynamicTags));
 };
+
+const feedSnapshotCacheTags = (...tags: Array<string | null | undefined>): string[] =>
+  Array.from(new Set([HOME_FEED_CACHE_GLOBAL_TAG, ...feedCacheTags(...tags)]));
 
 async function enqueuePostCreatedFollowerFeedInvalidation(postId: string, authorId: string): Promise<void> {
   try {
@@ -192,15 +197,23 @@ function buildHomeFeedCacheKey(params: {
   cursor: string;
   limit: number;
   mode: 'latest' | 'recommended';
+  experimentVariant: string;
+  snapshotWindow: number;
 }): string {
   return [
     'posts:feed',
     HOME_FEED_CACHE_VERSION,
     `user:${params.userId}`,
     `mode:${params.mode}`,
+    `variant:${params.experimentVariant}`,
+    `window:${params.snapshotWindow}`,
     `limit:${params.limit}`,
     `cursor:${params.cursor || 'first'}`,
   ].join(':');
+}
+
+export function homeFeedSnapshotWindow(nowMs: number = Date.now()): number {
+  return Math.floor(nowMs / HOME_FEED_SNAPSHOT_WINDOW_MS);
 }
 
 function buildFeedRecommendationContextCacheKey(userId: string): string {
@@ -208,11 +221,10 @@ function buildFeedRecommendationContextCacheKey(userId: string): string {
 }
 
 function shouldBypassHomeFeedCache(req: Request): boolean {
-  const cacheControl = String(req.headers['cache-control'] || '').toLowerCase();
   return (
-    cacheControl.includes('no-cache') ||
     Boolean(ensureString(req.query.cacheBust)) ||
-    Boolean(ensureString(req.query._t))
+    Boolean(ensureString(req.query._t)) ||
+    String(req.headers['x-vormex-feed-refresh'] || '').toLowerCase() === 'true'
   );
 }
 
@@ -653,6 +665,8 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     const modeRaw = (ensureString(req.query.mode) || 'recommended').toLowerCase();
     const mode: 'latest' | 'recommended' = modeRaw === 'latest' ? 'latest' : 'recommended';
     const experimentVariant = assignRecommendationVariant(currentUserId);
+    const snapshotWindow = homeFeedSnapshotWindow(requestStartedAtMs);
+    const blockedUserIdsPromise = getBlockedUserIds(currentUserId);
     const recommendationEventsEnabled = process.env.RECOMMENDATION_EVENTS_ENABLED === 'true';
     let unifiedRankingEnabled =
       mode === 'recommended' &&
@@ -683,11 +697,11 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     const latestCursorWhere = createdAtDescKeysetWhere(latestCursor);
     const candidateLimit =
       unifiedRankingEnabled
-        ? 500
+        ? recommendedFeedCandidateLimit(limit)
         : mode === 'recommended'
         ? recommendedFeedCandidateLimit(limit)
         : limit;
-    const bypassFeedCache = shouldBypassHomeFeedCache(req) || unifiedRankingEnabled || recommendationEventsEnabled;
+    const bypassFeedCache = shouldBypassHomeFeedCache(req);
     const cacheCursor =
       mode === 'recommended'
         ? cursor
@@ -697,8 +711,10 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
       cursor: cacheCursor || '',
       limit,
       mode,
+      experimentVariant,
+      snapshotWindow,
     });
-    const blockedUserIds = await getBlockedUserIds(currentUserId);
+    const blockedUserIds = await blockedUserIdsPromise;
     const blockedUserIdSet = new Set(blockedUserIds);
 
     const decoratePost = (post: any, item: RecommendationSnapshotItem | undefined) => item ? {
@@ -864,6 +880,7 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
           pageSize: limit,
           snapshotAt: new Date(recommendationSessionStartedAtMs),
           experimentVariant,
+          ttlMs: HOME_FEED_RECOMMENDATION_SESSION_TTL_MS,
         });
         recommendationEnvelope = session.envelope;
         recommendationItems = new Map(session.items.map((item) => [item.entityId, item]));
@@ -919,6 +936,7 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
           })),
           pageSize: mappedPosts.length,
           experimentVariant,
+          ttlMs: HOME_FEED_RECOMMENDATION_SESSION_TTL_MS,
         });
         recommendationEnvelope = { ...eventSession.envelope, nextCursor };
         const eventItems = new Map(eventSession.items.map((item) => [item.entityId, item]));
@@ -930,6 +948,7 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
         nextCursor,
         hasMore,
         modulePlacements,
+        snapshotWindow,
         ...(recommendationEnvelope || {}),
       };
     };
@@ -937,11 +956,9 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
     const feedPayload = bypassFeedCache
       ? await computeFeedPayload()
       : await cacheService.getOrSet(feedCacheKey, computeFeedPayload, {
-          tags: feedCacheTags(`feed:${currentUserId}`),
-          swr: {
-            softTtlSeconds: HOME_FEED_CACHE_TTL_SECONDS,
-            hardTtlSeconds: HOME_FEED_CACHE_TTL_SECONDS * 4,
-          },
+          tags: feedSnapshotCacheTags(`feed:${currentUserId}`),
+          ttlSeconds: HOME_FEED_CACHE_TTL_SECONDS,
+          lockTtlMs: 60_000,
         });
     const filteredPosts = feedPayload.posts.filter((post) => {
       const authorId = post.authorId || post.author?.id;
@@ -961,7 +978,8 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
       adPlacements,
     };
 
-    res.setHeader('X-Vormex-Cache', bypassFeedCache ? 'BYPASS' : 'MISS');
+    res.setHeader('X-Vormex-Cache', bypassFeedCache ? 'BYPASS' : 'SNAPSHOT');
+    res.setHeader('X-Vormex-Feed-Window', String(snapshotWindow));
     res.json(responsePayload);
 
     // Returned rows are candidates, not impressions. Android viewport events are authoritative.
@@ -1354,6 +1372,11 @@ export const updatePost = async (req: AuthRequest, res: Response): Promise<void>
     });
 
     await attachReactionSummaries(prisma as any, [updated]);
+    await cacheService.invalidateTags(
+      HOME_FEED_CACHE_GLOBAL_TAG,
+      `feed:${userId}`,
+      `user:${userId}`
+    ).catch(() => undefined);
     res.status(200).json(mapPostResponse(updated, userId));
   } catch (error) {
     console.error('updatePost error:', error);
@@ -1580,7 +1603,7 @@ export const deletePost = async (req: AuthRequest, res: Response): Promise<void>
         aggregateType: 'post',
         aggregateId: postId,
         eventType: 'post.deleted.cache.invalidate',
-        tags: feedCacheTags(`feed:${userId}`, `user:${userId}`),
+        tags: feedSnapshotCacheTags(`feed:${userId}`, `user:${userId}`),
       });
     });
 

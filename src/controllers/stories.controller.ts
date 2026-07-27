@@ -16,6 +16,7 @@ import {
   safetyErrorResponse,
 } from '../services/trust-safety.service';
 import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
+import { cacheService } from '../services/cache.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -26,6 +27,28 @@ const DEFAULT_STORY_REACTION = 'LIKE';
 const DEFAULT_STORY_FEED_LIMIT = 180;
 const MAX_STORY_FEED_LIMIT = 300;
 const MIN_STORY_FEED_LIMIT = 20;
+const STORY_FEED_CACHE_VERSION = 'v1';
+const STORY_FEED_SNAPSHOT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const STORY_FEED_CACHE_TTL_SECONDS = 48 * 60 * 60;
+const STORY_FEED_RECOMMENDATION_SESSION_TTL_MS = STORY_FEED_CACHE_TTL_SECONDS * 1000;
+
+export function storyFeedSnapshotWindow(nowMs: number = Date.now()): number {
+  return Math.floor(nowMs / STORY_FEED_SNAPSHOT_WINDOW_MS);
+}
+
+function storyFeedCacheKey(userId: string, limit: number, nowMs: number): string {
+  return [
+    'stories:feed',
+    STORY_FEED_CACHE_VERSION,
+    `user:${userId}`,
+    `limit:${limit}`,
+    `window:${storyFeedSnapshotWindow(nowMs)}`,
+  ].join(':');
+}
+
+async function invalidateStoryFeedCaches(...tags: string[]): Promise<void> {
+  await cacheService.invalidateTags(...Array.from(new Set(tags.filter(Boolean))));
+}
 
 function getStoryViewsCount(story: any) {
   return story?._count?.story_views ?? story?.viewsCount ?? 0;
@@ -88,6 +111,25 @@ function mapStoryToResponse(story: any, currentUserId?: string) {
   };
 }
 
+export function pruneExpiredStoryGroups<T extends { stories?: any[]; hasUnviewed?: boolean; lastStoryAt?: unknown }>(
+  groups: T[],
+  nowMs: number = Date.now()
+): T[] {
+  return groups.flatMap((group) => {
+    const stories = (Array.isArray(group.stories) ? group.stories : []).filter((story) => {
+      const expiresAtMs = new Date(story?.expiresAt).getTime();
+      return Number.isFinite(expiresAtMs) && expiresAtMs > nowMs;
+    });
+    if (stories.length === 0) return [];
+    return [{
+      ...group,
+      stories,
+      hasUnviewed: stories.some((story) => !story?.isViewed),
+      lastStoryAt: stories[0]?.createdAt || group.lastStoryAt,
+    }];
+  });
+}
+
 function normalizeStoryVisibility(value: unknown): 'PUBLIC' | 'CONNECTIONS' | 'PRIVATE' {
   const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
   if (normalized === 'CONNECTIONS') return 'CONNECTIONS';
@@ -108,85 +150,102 @@ export const getStoriesFeed = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     const limit = parseStoryFeedLimit(req.query.limit);
-
-    const stories = await prisma.stories.findMany({
-      where: {
-        expiresAt: { gt: new Date() },
-        ...(await buildStoryVisibilityWhere(currentUserId)),
-      },
-      include: {
-        users: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            profileImage: true,
-            headline: true,
+    const nowMs = Date.now();
+    const snapshotWindow = storyFeedSnapshotWindow(nowMs);
+    const payload = await cacheService.getOrSet(
+      storyFeedCacheKey(currentUserId, limit, nowMs),
+      async () => {
+        const stories = await prisma.stories.findMany({
+          where: {
+            expiresAt: { gt: new Date() },
+            ...(await buildStoryVisibilityWhere(currentUserId)),
           },
-        },
-        story_views: {
-          where: { viewerId: currentUserId },
-          select: { viewerId: true },
-          take: 1,
-        },
-        _count: {
-          select: {
-            story_views: true,
+          include: {
+            users: {
+              select: {
+                id: true,
+                username: true,
+                name: true,
+                profileImage: true,
+                headline: true,
+              },
+            },
+            story_views: {
+              where: { viewerId: currentUserId },
+              select: { viewerId: true },
+              take: 1,
+            },
+            _count: {
+              select: {
+                story_views: true,
+              },
+            },
           },
-        },
-      },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: limit,
-    });
-
-    // Group by author
-    const groupMap = new Map<string, { user: any; stories: any[]; hasUnviewed: boolean; lastStoryAt: Date }>();
-    for (const s of stories) {
-      const existing = groupMap.get(s.authorId);
-      const storyData = mapStoryToResponse(s, currentUserId);
-      if (!existing) {
-        groupMap.set(s.authorId, {
-          user: s.users,
-          stories: [storyData],
-          hasUnviewed: !storyData.isViewed,
-          lastStoryAt: s.createdAt,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: limit,
         });
-      } else {
-        existing.stories.push(storyData);
-        existing.hasUnviewed = existing.hasUnviewed || !storyData.isViewed;
-        if (new Date(s.createdAt).getTime() > new Date(existing.lastStoryAt).getTime()) {
-          existing.lastStoryAt = s.createdAt;
+
+        const groupMap = new Map<string, { user: any; stories: any[]; hasUnviewed: boolean; lastStoryAt: Date }>();
+        for (const story of stories) {
+          const existing = groupMap.get(story.authorId);
+          const storyData = mapStoryToResponse(story, currentUserId);
+          if (!existing) {
+            groupMap.set(story.authorId, {
+              user: story.users,
+              stories: [storyData],
+              hasUnviewed: !storyData.isViewed,
+              lastStoryAt: story.createdAt,
+            });
+          } else {
+            existing.stories.push(storyData);
+            existing.hasUnviewed = existing.hasUnviewed || !storyData.isViewed;
+            if (new Date(story.createdAt).getTime() > new Date(existing.lastStoryAt).getTime()) {
+              existing.lastStoryAt = story.createdAt;
+            }
+          }
         }
+
+        const storyGroups = Array.from(groupMap.values())
+          .map((group) => ({
+            ...group,
+            isOwnStory: group.user.id === currentUserId,
+          }))
+          .sort((left, right) => {
+            if (left.isOwnStory !== right.isOwnStory) return left.isOwnStory ? -1 : 1;
+            if (left.hasUnviewed !== right.hasUnviewed) return left.hasUnviewed ? -1 : 1;
+            return new Date(right.lastStoryAt).getTime() - new Date(left.lastStoryAt).getTime();
+          });
+
+        const decorated = await decorateSurfaceRecommendations({
+          userId: currentUserId,
+          surface: 'STORIES',
+          entityType: 'STORY',
+          items: storyGroups,
+          idOf: (group: any) => String(group.stories?.[0]?.id || group.user?.id),
+          authorIdOf: (group: any) => group.user?.id,
+          createdAtOf: (group: any) => group.lastStoryAt,
+          pageSize: storyGroups.length || 1,
+          sessionTtlMs: STORY_FEED_RECOMMENDATION_SESSION_TTL_MS,
+        });
+        return {
+          storyGroups: decorated.items,
+          recommendationSessionId: decorated.recommendationSessionId,
+          requestId: decorated.requestId,
+          rankerVersion: decorated.rankerVersion,
+          experimentVariant: decorated.experimentVariant,
+          snapshotWindow,
+        };
+      },
+      {
+        ttlSeconds: STORY_FEED_CACHE_TTL_SECONDS,
+        lockTtlMs: 60_000,
+        tags: ['stories:feed:global', `stories:${currentUserId}`],
       }
-    }
-
-    const storyGroups = Array.from(groupMap.values())
-      .map((g) => ({
-        ...g,
-        isOwnStory: g.user.id === currentUserId,
-      }))
-      .sort((a, b) => {
-        if (a.isOwnStory !== b.isOwnStory) return a.isOwnStory ? -1 : 1;
-        if (a.hasUnviewed !== b.hasUnviewed) return a.hasUnviewed ? -1 : 1;
-        return new Date(b.lastStoryAt).getTime() - new Date(a.lastStoryAt).getTime();
-      });
-
-    const decorated = await decorateSurfaceRecommendations({
-      userId: currentUserId,
-      surface: 'STORIES',
-      entityType: 'STORY',
-      items: storyGroups,
-      idOf: (group: any) => String(group.stories?.[0]?.id || group.user?.id),
-      authorIdOf: (group: any) => group.user?.id,
-      createdAtOf: (group: any) => group.lastStoryAt,
-      pageSize: storyGroups.length || 1,
-    });
+    );
+    res.setHeader('X-Vormex-Story-Window', String(snapshotWindow));
     res.json({
-      storyGroups: decorated.items,
-      recommendationSessionId: decorated.recommendationSessionId,
-      requestId: decorated.requestId,
-      rankerVersion: decorated.rankerVersion,
-      experimentVariant: decorated.experimentVariant,
+      ...payload,
+      storyGroups: pruneExpiredStoryGroups(payload.storyGroups || [], Date.now()),
     });
   } catch (error) {
     console.error('getStoriesFeed error:', error);
@@ -307,6 +366,7 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
       }
     }
 
+    await invalidateStoryFeedCaches('stories:feed:global', `stories:${userId}`);
     res.status(201).json({ message: 'Story created', story: storyData });
   } catch (error) {
     console.error('createStory error:', error);
@@ -425,6 +485,7 @@ export const deleteStory = async (req: AuthRequest, res: Response): Promise<void
       io.emit('story:deleted', { storyId, authorId: userId, timestamp: new Date() });
     }
 
+    await invalidateStoryFeedCaches('stories:feed:global', `stories:${userId}`);
     res.json({ message: 'Story deleted' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete story' });
@@ -555,6 +616,7 @@ export const viewStory = async (req: AuthRequest, res: Response): Promise<void> 
       }
     }
 
+    await invalidateStoryFeedCaches(`stories:${viewerId}`, `stories:${story.authorId}`);
     res.json({ message: 'Story viewed', viewsCount, isNewView });
   } catch (error) {
     console.error('viewStory error:', error);
@@ -784,6 +846,7 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
       where: { id: storyId },
       data: { reactionsCount },
     });
+    await invalidateStoryFeedCaches(`stories:${userId}`, `stories:${story.authorId}`);
     res.json({
       success: true,
       message: existingReaction ? 'Reaction updated' : 'Reaction added',
@@ -831,6 +894,7 @@ export const removeStoryReaction = async (req: AuthRequest, res: Response): Prom
       where: { id: storyId },
       data: { reactionsCount: newCount },
     });
+    await invalidateStoryFeedCaches(`stories:${userId}`, `stories:${story.authorId}`);
     res.json({ message: 'Reaction removed', reactionsCount: newCount });
   } catch (error) {
     res.status(500).json({ error: 'Failed to remove reaction' });

@@ -67,7 +67,10 @@ const CACHE_METRIC_NAMESPACES = new Set([
   'people',
   'profile',
   'rate',
+  'recommendation',
   'reels',
+  'safety',
+  'stories',
   'talk',
   'test',
 ]);

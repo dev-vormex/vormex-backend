@@ -35,6 +35,7 @@ export async function decorateSurfaceRecommendations<T extends Record<string, an
   authorIdOf?: (item: T) => string | null | undefined;
   createdAtOf?: (item: T) => Date | string | null | undefined;
   pageSize?: number;
+  sessionTtlMs?: number;
 }): Promise<{
   items: T[];
   recommendationSessionId?: string;
@@ -142,6 +143,7 @@ export async function decorateSurfaceRecommendations<T extends Record<string, an
     surface: input.surface,
     pageSize: input.pageSize || ranked.length || 1,
     experimentVariant: variant,
+    ttlMs: input.sessionTtlMs,
     orderedItems: ranked.map((item) => ({
       entityType: input.entityType,
       entityId: item.id,

@@ -10,11 +10,9 @@ interface AuthRequest extends Request {
   user?: { userId: string };
 }
 
-const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
-
 function invalidateHomeFeedCache(userId: string): void {
   cacheService
-    .invalidateTags(HOME_FEED_CACHE_GLOBAL_TAG, `feed:${userId}`)
+    .invalidateTags(`feed:${userId}`)
     .catch((error: unknown) => {
       console.error('Failed to invalidate home feed cache:', error);
     });

@@ -335,7 +335,7 @@ function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
-async function getTargetProfile(userId: string): Promise<TargetProfile | null> {
+async function loadTargetProfile(userId: string): Promise<TargetProfile | null> {
   const user = await prismaRead.user.findUnique({
     where: { id: userId },
     select: {
@@ -408,6 +408,17 @@ async function getTargetProfile(userId: string): Promise<TargetProfile | null> {
   };
 }
 
+async function getTargetProfile(userId: string): Promise<TargetProfile | null> {
+  return cacheService.getOrSet(
+    `feed:managed-ads:profile:v1:user:${userId}`,
+    () => loadTargetProfile(userId),
+    {
+      ttlSeconds: 60 * 60,
+      tags: [`user:${userId}`, `feed:${userId}`],
+    }
+  );
+}
+
 async function dailyImpressionCounts(campaignIds: string[], userId: string, now: Date): Promise<Map<string, number>> {
   if (campaignIds.length === 0) return new Map();
   const rows = await (prismaRead as any).managedAdEvent.groupBy({
@@ -442,6 +453,29 @@ async function sessionImpressionCampaignIds(
   return new Set(rows.map((row: any) => row.campaignId));
 }
 
+async function getActiveManagedAdCampaigns(
+  placement: ManagedAdPlacementName,
+  now: Date
+): Promise<ManagedAdCampaignRecord[]> {
+  const minuteWindow = Math.floor(now.getTime() / 60_000);
+  return cacheService.getOrSet(
+    `feed:managed-ads:campaigns:v1:${placement}:${minuteWindow}`,
+    () => (prismaRead as any).managedAdCampaign.findMany({
+      where: {
+        status: 'active',
+        placements: { has: placement },
+        OR: [{ startsAt: null }, { startsAt: { lte: now } }],
+        AND: [{ OR: [{ endsAt: null }, { endsAt: { gt: now } }] }],
+      },
+      orderBy: [{ priority: 'desc' }, { createdAt: 'desc' }],
+    }),
+    {
+      ttlSeconds: 2 * 60,
+      tags: ['managed-ads'],
+    }
+  );
+}
+
 export async function selectManagedAdPlacements(input: SelectManagedAdPlacementsInput): Promise<ManagedAdPlacement[]> {
   const userId = input.userId ? String(input.userId) : null;
   if (!userId) return [];
@@ -452,15 +486,7 @@ export async function selectManagedAdPlacements(input: SelectManagedAdPlacements
   const now = input.now || new Date();
   const [profile, campaigns] = await Promise.all([
     getTargetProfile(userId),
-    (prismaRead as any).managedAdCampaign.findMany({
-      where: {
-        status: 'active',
-        placements: { has: input.placement },
-        OR: [{ startsAt: null }, { startsAt: { lte: now } }],
-        AND: [{ OR: [{ endsAt: null }, { endsAt: { gt: now } }] }],
-      },
-      orderBy: [{ priority: 'desc' }, { createdAt: 'desc' }],
-    }),
+    getActiveManagedAdCampaigns(input.placement, now),
   ]);
 
   if (!profile || campaigns.length === 0) return [];
@@ -566,5 +592,5 @@ export async function recordManagedAdEvent(input: TrackManagedAdEventInput): Pro
 }
 
 export function invalidateManagedAdCaches(): void {
-  cacheService.invalidateTags('feed:global', 'reels:feed').catch(() => undefined);
+  cacheService.invalidateTags('feed:global', 'reels:feed', 'managed-ads').catch(() => undefined);
 }

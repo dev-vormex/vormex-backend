@@ -2,6 +2,7 @@ import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { prisma, prismaRead } from '../config/prisma';
 import { isRedisEnabled, redisCommand } from '../infrastructure/redis/client';
+import { cacheService } from './cache.service';
 import {
   RECOMMENDATION_RANKER_VERSION,
   assignRecommendationVariant,
@@ -10,8 +11,9 @@ import {
   type RecommendationSurface,
 } from './recommendation-engine.service';
 
-const SESSION_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000;
 const SESSION_VALIDATION_MS = 7 * 24 * 60 * 60 * 1000;
+const RECOMMENDATION_PREFERENCES_CACHE_TTL_SECONDS = 5 * 60;
 const RAW_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const CURSOR_VERSION = 1;
 
@@ -162,7 +164,16 @@ function normalizeSnapshot(row: any): RecommendationSessionSnapshot {
 
 async function cacheSnapshot(snapshot: RecommendationSessionSnapshot): Promise<void> {
   if (!isRedisEnabled() || !redisCommand) return;
-  await redisCommand.set(sessionCacheKey(snapshot.id), JSON.stringify(snapshot), 'PX', SESSION_TTL_MS);
+  const remainingTtlMs = Math.max(
+    1_000,
+    new Date(snapshot.expiresAt).getTime() - Date.now()
+  );
+  await redisCommand.set(
+    sessionCacheKey(snapshot.id),
+    JSON.stringify(snapshot),
+    'PX',
+    remainingTtlMs
+  );
 }
 
 export async function loadRecommendationSession(
@@ -199,12 +210,17 @@ export async function createRecommendationSession(input: {
   snapshotAt?: Date;
   rankerVersion?: string;
   experimentVariant?: string;
+  ttlMs?: number;
 }): Promise<{ snapshot: RecommendationSessionSnapshot; envelope: RecommendationEnvelope; items: RecommendationSnapshotItem[] }> {
   const now = input.snapshotAt || new Date();
   const id = randomUUID();
   const requestId = randomUUID();
   const rankerVersion = input.rankerVersion || RECOMMENDATION_RANKER_VERSION;
   const experimentVariant = input.experimentVariant || assignRecommendationVariant(input.userId);
+  const sessionTtlMs = Math.min(
+    Math.max(60_000, Math.floor(input.ttlMs || DEFAULT_SESSION_TTL_MS)),
+    SESSION_VALIDATION_MS
+  );
   const orderedItems = input.orderedItems.map((item, index) => ({ ...item, position: index + 1 }));
   const snapshot: RecommendationSessionSnapshot = {
     id,
@@ -212,7 +228,7 @@ export async function createRecommendationSession(input: {
     surface: input.surface,
     requestId,
     snapshotAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + SESSION_TTL_MS).toISOString(),
+    expiresAt: new Date(now.getTime() + sessionTtlMs).toISOString(),
     validationUntil: new Date(now.getTime() + SESSION_VALIDATION_MS).toISOString(),
     rankerVersion,
     experimentVariant,
@@ -442,15 +458,21 @@ export async function getRecommendationPreferences(userId: string): Promise<{
   activityRecommendationsEnabled: boolean;
   namedActivityLegalBasisApproved: boolean;
 }> {
-  const rows = await prismaRead.$queryRaw<any[]>(Prisma.sql`
-    SELECT "personalizedRecommendationsEnabled", "activityRecommendationsEnabled"
-    FROM "recommendation_user_profiles" WHERE "userId" = ${userId} LIMIT 1
-  `);
-  return {
-    personalizedRecommendationsEnabled: rows[0]?.personalizedRecommendationsEnabled ?? true,
-    activityRecommendationsEnabled: rows[0]?.activityRecommendationsEnabled ?? true,
-    namedActivityLegalBasisApproved: process.env.NAMED_ACTIVITY_RECOMMENDATIONS_LEGAL_BASIS_APPROVED === 'true',
-  };
+  const cacheKey = `recommendation:preferences:v1:user:${userId}`;
+  return cacheService.getOrSet(cacheKey, async () => {
+    const rows = await prismaRead.$queryRaw<any[]>(Prisma.sql`
+      SELECT "personalizedRecommendationsEnabled", "activityRecommendationsEnabled"
+      FROM "recommendation_user_profiles" WHERE "userId" = ${userId} LIMIT 1
+    `);
+    return {
+      personalizedRecommendationsEnabled: rows[0]?.personalizedRecommendationsEnabled ?? true,
+      activityRecommendationsEnabled: rows[0]?.activityRecommendationsEnabled ?? true,
+      namedActivityLegalBasisApproved: process.env.NAMED_ACTIVITY_RECOMMENDATIONS_LEGAL_BASIS_APPROVED === 'true',
+    };
+  }, {
+    ttlSeconds: RECOMMENDATION_PREFERENCES_CACHE_TTL_SECONDS,
+    tags: [`recommendation:preferences:${userId}`],
+  });
 }
 
 export async function updateRecommendationPreferences(userId: string, input: {
@@ -471,6 +493,10 @@ export async function updateRecommendationPreferences(userId: string, input: {
       "activityRecommendationsEnabled" = COALESCE(${input.activityRecommendationsEnabled ?? null}, "recommendation_user_profiles"."activityRecommendationsEnabled"),
       "updatedAt" = CURRENT_TIMESTAMP
   `);
+  await cacheService.invalidateTags(
+    `recommendation:preferences:${userId}`,
+    `feed:${userId}`
+  );
   return getRecommendationPreferences(userId);
 }
 

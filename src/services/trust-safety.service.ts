@@ -3,6 +3,7 @@ import type { Request } from 'express';
 import type { PrismaClient } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { TtlMemo } from '../infrastructure/cache/ttl-memo';
+import { cacheService } from './cache.service';
 import { evaluateRateLimit } from './rate-limit.service';
 import { encryptToken } from '../utils/encryption.util';
 
@@ -34,6 +35,7 @@ const TRUST_LEVELS: IdentityTrustLevel[] = [
 // block/unblock paths invalidate the pair immediately.
 const messageInteractionMemo = new TtlMemo<void>(5_000, 20_000);
 const identityTrustLevelMemo = new TtlMemo<IdentityTrustLevel>(30_000, 10_000);
+const BLOCKED_USER_IDS_CACHE_TTL_SECONDS = 60;
 
 const INSTALL_ID_HEADER = 'x-vormex-install-id';
 const PLATFORM_HEADER = 'x-vormex-platform';
@@ -546,6 +548,7 @@ export async function createUserBlockWithDeviceScope(params: {
   )));
 
   invalidateMessageInteractionCache(params.blockerId, params.blockedId);
+  await invalidateBlockedUserIdsCache(params.blockerId, params.blockedId);
 
   return { block, deviceScopeCount: uniqueDevices.length };
 }
@@ -590,55 +593,73 @@ export async function findBlockBetween(userAId: string, userBId: string) {
 
 export async function getBlockedUserIds(userId: string): Promise<string[]> {
   if (!userId) return [];
-  const [rows, ownInstallHashes, outgoingDeviceScopes] = await Promise.all([
-    prisma.user_blocks.findMany({
-      where: {
-        OR: [
-          { blockerId: userId },
-          { blockedId: userId },
-        ],
-      },
-      select: {
-        blockerId: true,
-        blockedId: true,
-      },
-    }),
-    getUserInstallHashes(userId),
-    prisma.user_block_device_scopes.findMany({
-      where: { blockerId: userId },
-      select: { installHash: true },
-      distinct: ['installHash'],
-    }),
-  ]);
-  const blockedIds = new Set(rows.map((row) => (
-    row.blockerId === userId ? row.blockedId : row.blockerId
-  )));
+  const cacheKey = `safety:blocked-users:v1:user:${userId}`;
+  return cacheService.getOrSet(cacheKey, async () => {
+    const [rows, ownInstallHashes, outgoingDeviceScopes] = await Promise.all([
+      prisma.user_blocks.findMany({
+        where: {
+          OR: [
+            { blockerId: userId },
+            { blockedId: userId },
+          ],
+        },
+        select: {
+          blockerId: true,
+          blockedId: true,
+        },
+      }),
+      getUserInstallHashes(userId),
+      prisma.user_block_device_scopes.findMany({
+        where: { blockerId: userId },
+        select: { installHash: true },
+        distinct: ['installHash'],
+      }),
+    ]);
+    const blockedIds = new Set(rows.map((row) => (
+      row.blockerId === userId ? row.blockedId : row.blockerId
+    )));
 
-  const outgoingHashes = outgoingDeviceScopes.map((row: any) => row.installHash).filter(Boolean);
-  if (outgoingHashes.length > 0) {
-    const linkedUsers = await prisma.user_devices.findMany({
-      where: {
-        installHash: { in: outgoingHashes },
-        userId: { not: userId },
-      },
-      select: { userId: true },
-      distinct: ['userId'],
-    });
-    linkedUsers.forEach((row: any) => blockedIds.add(row.userId));
-  }
+    const outgoingHashes = outgoingDeviceScopes.map((row: any) => row.installHash).filter(Boolean);
+    if (outgoingHashes.length > 0) {
+      const linkedUsers = await prisma.user_devices.findMany({
+        where: {
+          installHash: { in: outgoingHashes },
+          userId: { not: userId },
+        },
+        select: { userId: true },
+        distinct: ['userId'],
+      });
+      linkedUsers.forEach((row: any) => blockedIds.add(row.userId));
+    }
 
-  if (ownInstallHashes.length > 0) {
-    const scopedBlocksAgainstThisDevice = await prisma.user_block_device_scopes.findMany({
-      where: { installHash: { in: ownInstallHashes } },
-      select: { blockerId: true },
-      distinct: ['blockerId'],
-    });
-    scopedBlocksAgainstThisDevice.forEach((row: any) => {
-      if (row.blockerId !== userId) blockedIds.add(row.blockerId);
-    });
-  }
+    if (ownInstallHashes.length > 0) {
+      const scopedBlocksAgainstThisDevice = await prisma.user_block_device_scopes.findMany({
+        where: { installHash: { in: ownInstallHashes } },
+        select: { blockerId: true },
+        distinct: ['blockerId'],
+      });
+      scopedBlocksAgainstThisDevice.forEach((row: any) => {
+        if (row.blockerId !== userId) blockedIds.add(row.blockerId);
+      });
+    }
 
-  return Array.from(blockedIds);
+    return Array.from(blockedIds);
+  }, {
+    ttlSeconds: BLOCKED_USER_IDS_CACHE_TTL_SECONDS,
+    tags: [`safety:blocked:${userId}`],
+  });
+}
+
+export async function invalidateBlockedUserIdsCache(...userIds: string[]): Promise<void> {
+  const uniqueIds = Array.from(new Set(userIds.map(String).filter(Boolean)));
+  if (uniqueIds.length === 0) return;
+  await cacheService.invalidateTags(
+    ...uniqueIds.flatMap((userId) => [
+      `safety:blocked:${userId}`,
+      `feed:${userId}`,
+      `stories:${userId}`,
+    ])
+  );
 }
 
 export async function areUsersBlocked(userAId: string, userBId: string): Promise<boolean> {
