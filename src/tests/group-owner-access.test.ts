@@ -4,12 +4,21 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   buildGroupInviteUrl,
+  buildAnonymousGroupListCacheKey,
   canShareGroupInviteLink,
   getEffectiveGroupRole,
   hasGroupRoleAtLeast,
   normalizeInviteLinkVisibility,
   normalizeGroupRole,
 } from '../controllers/groups.controller';
+
+function sourceBetween(source: string, start: string, end: string): string {
+  const startIndex = source.indexOf(start);
+  assert.notEqual(startIndex, -1, `${start} not found`);
+  const endIndex = source.indexOf(end, startIndex);
+  assert.notEqual(endIndex, -1, `${end} not found after ${start}`);
+  return source.slice(startIndex, endIndex);
+}
 
 test('group creator has effective owner access even if membership is missing', () => {
   const group = { creatorId: 'creator-1' };
@@ -61,4 +70,53 @@ test('group invite migration adds link, direct invite, and join request storage'
   assert.match(sql, /CREATE TABLE IF NOT EXISTS "group_join_requests"/);
   assert.match(sql, /group_invites_groupId_invitedUserId_key/);
   assert.match(sql, /group_join_requests_groupId_requesterId_key/);
+});
+
+test('anonymous group list cache keys normalize equivalent searches', () => {
+  const first = buildAnonymousGroupListCacheKey({
+    page: 1,
+    limit: 20,
+    search: '  Study   Partners ',
+    category: 'Engineering',
+    privacy: 'public',
+  });
+  const second = buildAnonymousGroupListCacheKey({
+    page: 1,
+    limit: 20,
+    search: 'study partners',
+    category: 'Engineering',
+    privacy: 'PUBLIC',
+  });
+
+  assert.equal(first, second);
+  assert.notEqual(first, buildAnonymousGroupListCacheKey({ page: 2, limit: 20 }));
+});
+
+test('group discovery lists use denormalized counts, read routing, and cache coordination', () => {
+  const controller = fs.readFileSync(
+    path.join(process.cwd(), 'src/controllers/groups.controller.ts'),
+    'utf8',
+  );
+  const discover = sourceBetween(controller, 'export const discoverGroups', 'export const getUserPendingInvites');
+  const list = sourceBetween(controller, 'export const listGroups', 'export const updateGroup');
+
+  assert.match(discover, /prismaRead\.groups\.findMany/);
+  assert.match(discover, /memberCount: g\.memberCount/);
+  assert.doesNotMatch(discover, /_count/);
+  assert.match(list, /prismaRead\.groups\.findMany/);
+  assert.match(list, /cacheService\.getOrSet/);
+  assert.match(list, /GROUP_LIST_CACHE_TAG/);
+  assert.match(list, /memberCount: g\.memberCount/);
+  assert.doesNotMatch(list, /_count/);
+});
+
+test('group discovery has an index for visibility and popularity ordering', () => {
+  const schema = fs.readFileSync(path.join(process.cwd(), 'prisma/schema.prisma'), 'utf8');
+  const migration = fs.readFileSync(
+    path.join(process.cwd(), 'prisma/migrations/20260729150000_optimize_group_discovery_indexes/migration.sql'),
+    'utf8',
+  );
+
+  assert.match(schema, /@@index\(\[isPrivate, memberCount\(sort: Desc\), id\], map: "groups_visibility_members_idx"\)/);
+  assert.match(migration, /CREATE INDEX IF NOT EXISTS "groups_visibility_members_idx"/);
 });

@@ -1,11 +1,12 @@
 import { Response } from 'express';
 import { randomBytes, randomUUID } from 'crypto';
 import { AuthenticatedRequest, ErrorResponse } from '../types/auth.types';
-import { prisma } from '../config/prisma';
+import { prisma, prismaRead } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { imageProcessingService } from '../services/image-processing.service';
 import { bunnyStorageService } from '../services/bunny-storage.service';
 import { pushNotificationService } from '../services/push-notification.service';
+import { cacheService } from '../services/cache.service';
 import { getIO } from '../sockets';
 import { buildGroupVisibilityWhere, canViewGroup } from '../utils/access-control.util';
 
@@ -16,6 +17,9 @@ type GroupInviteAction = 'accept' | 'decline';
 
 const GROUP_INVITE_EXPIRES_MS = 3 * 24 * 60 * 60 * 1000;
 const GROUP_INVITE_BASE_URL = (process.env.FRONTEND_URL || 'https://vormex.in').replace(/\/+$/, '');
+const GROUP_LIST_CACHE_TAG = 'groups:list';
+const GROUP_LIST_CACHE_SOFT_TTL_SECONDS = 30;
+const GROUP_LIST_CACHE_HARD_TTL_SECONDS = 120;
 
 interface GroupUser {
   id: string;
@@ -82,6 +86,37 @@ interface GroupsResponse {
     total: number;
     totalPages: number;
   };
+}
+
+const normalizeGroupListQueryValue = (value: unknown, maxLength = 80): string => {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/\s+/g, ' ').slice(0, maxLength);
+};
+
+export const buildAnonymousGroupListCacheKey = (params: {
+  page: number;
+  limit: number;
+  search?: string;
+  category?: string;
+  privacy?: string;
+}): string => {
+  const search = normalizeGroupListQueryValue(params.search).toLowerCase();
+  const category = normalizeGroupListQueryValue(params.category);
+  const privacy = normalizeGroupListQueryValue(params.privacy, 20).toUpperCase();
+  return [
+    'groups:list:v2',
+    params.page,
+    params.limit,
+    encodeURIComponent(search),
+    encodeURIComponent(category),
+    encodeURIComponent(privacy),
+  ].join(':');
+};
+
+function invalidateGroupListCache(): void {
+  void cacheService.invalidateTags(GROUP_LIST_CACHE_TAG).catch((error: unknown) => {
+    console.error('Failed to invalidate group list cache:', error);
+  });
 }
 
 interface GroupInvite {
@@ -448,14 +483,9 @@ export const createGroup = async (
           },
         },
       },
-      include: {
-        users: {
-          select: { id: true, name: true, username: true, profileImage: true, isVerified: true, profileBadgeStyle: true },
-        },
-        _count: { select: { group_members: true } },
-      },
     });
 
+    invalidateGroupListCache();
     res.status(201).json({
       id: group.id,
       name: group.name,
@@ -467,7 +497,7 @@ export const createGroup = async (
       category: group.category,
       tags: group.tags,
       rules: group.rules,
-      memberCount: group._count.group_members,
+      memberCount: group.memberCount,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
       isMember: true,
@@ -496,16 +526,12 @@ export const getGroup = async (
       return;
     }
 
-    const group = await prisma.groups.findFirst({
+    const group = await prismaRead.groups.findFirst({
       where: {
         OR: [{ id: identifier }, { name: { equals: identifier, mode: 'insensitive' } }],
       },
       include: {
-        users: {
-          select: { id: true, name: true, username: true, profileImage: true, isVerified: true, profileBadgeStyle: true },
-        },
         group_members: userId ? { where: { userId } } : false,
-        _count: { select: { group_members: true } },
       },
     });
 
@@ -518,7 +544,7 @@ export const getGroup = async (
       return;
     }
 
-    const groupWithRelations = group as typeof group & { group_members: unknown[]; _count: { group_members: number } };
+    const groupWithRelations = group as typeof group & { group_members: unknown[] };
     const memberRecord = userId && Array.isArray(groupWithRelations.group_members) ? groupWithRelations.group_members[0] : null;
     const memberRole = userId ? getEffectiveGroupRole(group, memberRecord as any, userId) : null;
 
@@ -533,7 +559,7 @@ export const getGroup = async (
       category: group.category,
       tags: group.tags,
       rules: group.rules,
-      memberCount: groupWithRelations._count.group_members,
+      memberCount: group.memberCount,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
       isMember: !!memberRecord || memberRole === 'owner',
@@ -566,23 +592,16 @@ export const getMyGroups = async (
     const skip = (page - 1) * limit;
 
     const [memberships, total] = await Promise.all([
-      prisma.group_members.findMany({
+      prismaRead.group_members.findMany({
         where: { userId },
         skip,
         take: limit,
         orderBy: { joinedAt: 'desc' },
         include: {
-          groups: {
-            include: {
-              users: {
-                select: { id: true, name: true, username: true, profileImage: true, isVerified: true, profileBadgeStyle: true },
-              },
-              _count: { select: { group_members: true } },
-            },
-          },
+          groups: true,
         },
       }),
-      prisma.group_members.count({ where: { userId } }),
+      prismaRead.group_members.count({ where: { userId } }),
     ]);
 
     const groups: Group[] = memberships.map((m) => ({
@@ -596,7 +615,7 @@ export const getMyGroups = async (
       category: m.groups.category,
       tags: m.groups.tags,
       rules: m.groups.rules,
-      memberCount: m.groups._count.group_members,
+      memberCount: m.groups.memberCount,
       postCount: 0,
       createdAt: m.groups.createdAt.toISOString(),
       isMember: true,
@@ -737,7 +756,7 @@ export const discoverGroups = async (
 
     let userGroupIds: string[] = [];
     if (userId) {
-      const memberships = await prisma.group_members.findMany({
+      const memberships = await prismaRead.group_members.findMany({
         where: { userId },
         select: { groupId: true },
       });
@@ -771,19 +790,13 @@ export const discoverGroups = async (
     const where: any = { AND: filters };
 
     const [groupsList, total] = await Promise.all([
-      prisma.groups.findMany({
+      prismaRead.groups.findMany({
         where,
         skip,
         take: limit,
-        orderBy: { memberCount: 'desc' },
-        include: {
-          users: {
-            select: { id: true, name: true, username: true, profileImage: true, isVerified: true, profileBadgeStyle: true },
-          },
-          _count: { select: { group_members: true } },
-        },
+        orderBy: [{ memberCount: 'desc' }, { id: 'asc' }],
       }),
-      prisma.groups.count({ where }),
+      prismaRead.groups.count({ where }),
     ]);
 
     const groups: Group[] = groupsList.map((g) => ({
@@ -797,7 +810,7 @@ export const discoverGroups = async (
       category: g.category,
       tags: g.tags,
       rules: g.rules,
-      memberCount: g._count.group_members,
+      memberCount: g.memberCount,
       postCount: 0,
       createdAt: g.createdAt.toISOString(),
       isMember: false,
@@ -993,6 +1006,7 @@ export const joinGroupByInviteLink = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({
       status: 'joined',
       message: 'Successfully joined the group',
@@ -1335,6 +1349,7 @@ export const respondToGroupInvite = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({ status: 'joined', message: 'Successfully joined the group', groupId: invite.groupId });
   } catch (error) {
     console.error('Error responding to group invite:', error);
@@ -1477,6 +1492,7 @@ export const respondToGroupJoinRequest = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({ status: 'joined', message: 'Join request approved', groupId });
   } catch (error) {
     console.error('Error responding to group join request:', error);
@@ -1548,6 +1564,7 @@ export const joinGroup = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({
       status: 'joined',
       message: 'Successfully joined the group',
@@ -1605,6 +1622,7 @@ export const leaveGroup = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Error leaving group:', error);
@@ -1850,9 +1868,9 @@ export const listGroups = async (
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
     const skip = (page - 1) * limit;
-    const search = req.query.search as string | undefined;
-    const category = req.query.category as string | undefined;
-    const privacy = req.query.privacy as string | undefined;
+    const search = normalizeGroupListQueryValue(req.query.search) || undefined;
+    const category = normalizeGroupListQueryValue(req.query.category) || undefined;
+    const privacy = normalizeGroupListQueryValue(req.query.privacy, 20).toUpperCase() || undefined;
     const userId = req.user?.userId ? String(req.user.userId) : null;
 
     const filters: any[] = [await buildGroupVisibilityWhere(userId)];
@@ -1883,59 +1901,82 @@ export const listGroups = async (
 
     const where: any = { AND: filters };
 
-    const [groupsList, total] = await Promise.all([
-      prisma.groups.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy: { memberCount: 'desc' },
-        include: {
-          users: {
-            select: { id: true, name: true, username: true, profileImage: true, isVerified: true, profileBadgeStyle: true },
+    const computeResponse = async (): Promise<GroupsResponse> => {
+      const [groupsList, total] = await Promise.all([
+        prismaRead.groups.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: [{ memberCount: 'desc' }, { id: 'asc' }],
+          include: {
+            group_members: userId
+              ? { where: { userId }, select: { role: true, showInMessages: true } }
+              : false,
           },
-          group_members: userId ? { where: { userId } } : false,
-          _count: { select: { group_members: true } },
-        },
-      }),
-      prisma.groups.count({ where }),
-    ]);
+        }),
+        prismaRead.groups.count({ where }),
+      ]);
 
-    const groups: Group[] = groupsList.map((g) => {
-      const groupWithMembership = g as typeof g & { group_members?: Array<{ role: string }> };
-      const memberRecord = Array.isArray(groupWithMembership.group_members)
-        ? groupWithMembership.group_members[0]
-        : null;
-      const memberRole = userId ? getEffectiveGroupRole(g, memberRecord, userId) : null;
+      const groups: Group[] = groupsList.map((g) => {
+        const groupWithMembership = g as typeof g & {
+          group_members?: Array<{ role: string; showInMessages: boolean }>;
+        };
+        const memberRecord = Array.isArray(groupWithMembership.group_members)
+          ? groupWithMembership.group_members[0]
+          : null;
+        const memberRole = userId ? getEffectiveGroupRole(g, memberRecord, userId) : null;
+
+        return {
+          id: g.id,
+          name: g.name,
+          slug: generateSlug(g.name),
+          description: g.description,
+          coverImage: g.coverImage ?? g.imageUrl,
+          iconImage: g.iconImage ?? g.imageUrl,
+          privacy: mapGroupPrivacy(g.isPrivate),
+          category: g.category,
+          tags: g.tags,
+          rules: g.rules,
+          memberCount: g.memberCount,
+          postCount: 0,
+          createdAt: g.createdAt.toISOString(),
+          isMember: Boolean(memberRecord) || memberRole === 'owner',
+          memberRole: memberRole ? mapRoleToEnum(memberRole) : null,
+          ...(userId ? { isAddedToMessages: Boolean(memberRecord?.showInMessages) } : {}),
+        };
+      });
 
       return {
-        id: g.id,
-        name: g.name,
-        slug: generateSlug(g.name),
-        description: g.description,
-        coverImage: g.coverImage ?? g.imageUrl,
-        iconImage: g.iconImage ?? g.imageUrl,
-        privacy: mapGroupPrivacy(g.isPrivate),
-        category: g.category,
-        tags: g.tags,
-        rules: g.rules,
-        memberCount: g._count.group_members,
-        postCount: 0,
-        createdAt: g.createdAt.toISOString(),
-        isMember: Boolean(memberRecord) || memberRole === 'owner',
-        memberRole: memberRole ? mapRoleToEnum(memberRole) : null,
-        ...(userId ? { isAddedToMessages: Boolean((memberRecord as any)?.showInMessages) } : {}),
+        groups,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
       };
-    });
+    };
 
-    res.status(200).json({
-      groups,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
-    });
+    const response = userId
+      ? await computeResponse()
+      : await cacheService.getOrSet(
+          buildAnonymousGroupListCacheKey({ page, limit, search, category, privacy }),
+          computeResponse,
+          {
+            tags: [GROUP_LIST_CACHE_TAG],
+            swr: {
+              softTtlSeconds: GROUP_LIST_CACHE_SOFT_TTL_SECONDS,
+              hardTtlSeconds: GROUP_LIST_CACHE_HARD_TTL_SECONDS,
+            },
+          }
+        );
+
+    if (!userId) {
+      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=90');
+      res.vary('Authorization');
+      res.vary('Cookie');
+    }
+    res.status(200).json(response);
   } catch (error) {
     console.error('Error listing groups:', error);
     res.status(500).json({ error: 'Failed to list groups' });
@@ -1995,12 +2036,9 @@ export const updateGroup = async (
     const group = await prisma.groups.update({
       where: { id: groupId },
       data: updateDataWithTimestamp,
-      include: {
-        _count: { select: { group_members: true } },
-      },
     });
 
-    const groupWithCount = group as typeof group & { _count: { group_members: number } };
+    invalidateGroupListCache();
     res.status(200).json({
       id: group.id,
       name: group.name,
@@ -2012,7 +2050,7 @@ export const updateGroup = async (
       category: group.category,
       tags: group.tags,
       rules: group.rules,
-      memberCount: groupWithCount._count.group_members,
+      memberCount: group.memberCount,
       postCount: 0,
       createdAt: group.createdAt.toISOString(),
       isMember: true,
@@ -2064,6 +2102,7 @@ export const deleteGroup = async (
       prisma.groups.delete({ where: { id: groupId } }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Error deleting group:', error);
@@ -2121,6 +2160,7 @@ export const uploadGroupIcon = async (
       data: { iconImage: cdnUrl, updatedAt: new Date() },
     });
 
+    invalidateGroupListCache();
     res.json({ iconUrl: cdnUrl });
   } catch (error: any) {
     console.error('Upload group icon error:', error);
@@ -2178,6 +2218,7 @@ export const uploadGroupCover = async (
       data: { coverImage: cdnUrl, updatedAt: new Date() },
     });
 
+    invalidateGroupListCache();
     res.json({ coverUrl: cdnUrl });
   } catch (error: any) {
     console.error('Upload group cover error:', error);
@@ -2326,6 +2367,7 @@ export const removeMember = async (
       }),
     ]);
 
+    invalidateGroupListCache();
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Error removing member:', error);

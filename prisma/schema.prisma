@@ -1698,6 +1698,7 @@ model groups {
 
   @@index([creatorId])
   @@index([isPrivate])
+  @@index([isPrivate, memberCount(sort: Desc), id], map: "groups_visibility_members_idx")
   @@index([inviteLinkVisibility])
   @@index([slug])
 }

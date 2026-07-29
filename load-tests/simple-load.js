@@ -45,6 +45,13 @@ const scenarios = {
       { name: 'skills-search', method: 'GET', path: '/api/skills/search?q=ko&limit=10', weight: 1 },
     ],
   },
+  'groups-read': {
+    description: 'Anonymous group discovery reads. Useful for isolating group query and database-pool capacity.',
+    requiresAuth: false,
+    requests: [
+      { name: 'groups-list', method: 'GET', path: '/api/groups?limit=10', weight: 1 },
+    ],
+  },
   'auth-read': {
     description: 'Authenticated read mix for app-home style traffic. Requires LOAD_TEST_TOKEN or --token.',
     requiresAuth: true,
@@ -261,11 +268,30 @@ function createStats() {
     latencies: [],
     statuses: new Map(),
     endpoints: new Map(),
+    endpointStats: new Map(),
   };
 }
 
 function increment(map, key, delta = 1) {
   map.set(key, (map.get(key) || 0) + delta);
+}
+
+function recordEndpointResult(stats, name, latency, failed, status) {
+  let endpoint = stats.endpointStats.get(name);
+  if (!endpoint) {
+    endpoint = {
+      total: 0,
+      failed: 0,
+      latencies: [],
+      statuses: new Map(),
+    };
+    stats.endpointStats.set(name, endpoint);
+  }
+
+  endpoint.total += 1;
+  endpoint.failed += failed ? 1 : 0;
+  endpoint.latencies.push(latency);
+  increment(endpoint.statuses, status);
 }
 
 function sleep(ms) {
@@ -278,10 +304,19 @@ async function runWorker(workerId, config, stats, deadlineMs) {
     ? (config.concurrency / config.targetRps) * 1000
     : 0;
 
+  let initialDelayMs = 0;
   if (config.spreadStart && perWorkerIntervalMs > 0) {
-    await sleep((workerId / config.concurrency) * perWorkerIntervalMs);
+    initialDelayMs = (workerId / config.concurrency) * perWorkerIntervalMs;
   } else if (config.startJitterMs > 0) {
-    await sleep(Math.random() * config.startJitterMs);
+    initialDelayMs = Math.random() * config.startJitterMs;
+  }
+
+  if (initialDelayMs > 0) {
+    const remainingBeforeStartMs = deadlineMs - performance.now();
+    if (initialDelayMs >= remainingBeforeStartMs) {
+      return;
+    }
+    await sleep(initialDelayMs);
   }
 
   while (performance.now() < deadlineMs) {
@@ -314,7 +349,10 @@ async function runWorker(workerId, config, stats, deadlineMs) {
       increment(stats.statuses, String(response.status));
       increment(stats.endpoints, request.name);
 
-      if (response.status < 200 || response.status >= 400) {
+      const failed = response.status < 200 || response.status >= 400;
+      recordEndpointResult(stats, request.name, latency, failed, String(response.status));
+
+      if (failed) {
         stats.failed += 1;
       }
     } catch (error) {
@@ -324,8 +362,10 @@ async function runWorker(workerId, config, stats, deadlineMs) {
       stats.failed += 1;
       stats.networkErrors += 1;
       stats.latencies.push(latency);
-      increment(stats.statuses, error.name === 'AbortError' ? 'timeout' : 'network-error');
+      const status = error.name === 'AbortError' ? 'timeout' : 'network-error';
+      increment(stats.statuses, status);
       increment(stats.endpoints, request.name);
+      recordEndpointResult(stats, request.name, latency, true, status);
     }
 
     if (perWorkerIntervalMs > 0) {
@@ -400,6 +440,22 @@ function printSummary(stats, config, elapsedSeconds) {
   console.log('\nEndpoint counts');
   for (const [endpoint, count] of [...stats.endpoints.entries()].sort((a, b) => b[1] - a[1])) {
     console.log(`  ${endpoint}: ${count}`);
+  }
+
+  console.log('\nEndpoint performance');
+  for (const [name, endpoint] of [...stats.endpointStats.entries()].sort((a, b) => b[1].total - a[1].total)) {
+    const latencies = endpoint.latencies.slice().sort((a, b) => a - b);
+    const average = latencies.reduce((sum, value) => sum + value, 0) / Math.max(latencies.length, 1);
+    const statuses = [...endpoint.statuses.entries()]
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+      .map(([status, count]) => `${status}:${count}`)
+      .join(', ');
+
+    console.log(
+      `  ${name}: requests=${endpoint.total} failed=${endpoint.failed} ` +
+      `avg=${formatNumber(average)}ms p95=${formatNumber(percentile(latencies, 95))}ms ` +
+      `p99=${formatNumber(percentile(latencies, 99))}ms statuses=[${statuses}]`
+    );
   }
 
   return summary;

@@ -10,6 +10,8 @@ Use separate tests for separate bottlenecks:
 - `health-live`: raw API process/network overhead, no database.
 - `health-ready`: database connection overhead through Prisma.
 - `public-read`: anonymous feed/discovery traffic.
+- `app-public-read`: realistic anonymous mobile browsing without health checks.
+- `groups-read`: isolated group discovery traffic for investigating query/pool saturation.
 - `auth-read`: logged-in app-home traffic.
 - `chat-socket-load.js`: the realtime chat send path (socket ack, cross-socket
   delivery, typing relay, delivered receipts, duplicate detection).
@@ -44,6 +46,22 @@ Public read traffic:
 
 ```bash
 node load-tests/simple-load.js --scenario public-read --duration 60 --concurrency 30
+```
+
+Realistic 500-user anonymous browsing simulation (one request per user about
+every 10 seconds):
+
+```bash
+node load-tests/simple-load.js --scenario app-public-read --duration 120 \
+  --concurrency 500 --target-rps 50 --spread-start --virtual-ips 500 \
+  --max-p95 2000 --max-error-rate 1
+```
+
+If the mixed scenario reports slow group reads, isolate that endpoint:
+
+```bash
+node load-tests/simple-load.js --scenario groups-read --duration 60 \
+  --concurrency 500 --target-rps 10 --spread-start --virtual-ips 500
 ```
 
 Rate-limit-respecting public read traffic from one IP:
@@ -176,6 +194,8 @@ Watch these values:
 - `Throughput`: requests per second.
 - `Failed`: non-2xx/3xx responses plus network errors.
 - `p95` / `p99`: tail latency. These matter more than average latency.
+- `Endpoint performance`: per-endpoint failures and tail latency; use this to
+  find which request causes a mixed scenario to miss its threshold.
 - `Status counts`: `429` means rate limit, `503` means readiness/database trouble, `5xx` means backend errors.
 - `--target-rps`: use this when you want a realistic request rate from one IP instead of max-speed pressure.
 - `--virtual-ips`: use this only against your own local/staging backend to test backend capacity beyond the per-IP limiter.
