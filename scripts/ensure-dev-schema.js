@@ -4,11 +4,12 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const projectRoot = path.join(__dirname, '..');
-const prismaBin = path.join(
+const prismaCliPath = path.join(
   projectRoot,
   'node_modules',
-  '.bin',
-  process.platform === 'win32' ? 'prisma.cmd' : 'prisma'
+  'prisma',
+  'build',
+  'index.js'
 );
 
 const sqlFiles = [
@@ -30,14 +31,13 @@ const sqlFiles = [
 
 for (const sqlFile of sqlFiles) {
   const result = spawnSync(
-    prismaBin,
-    ['db', 'execute', '--schema', 'prisma/schema.prisma', '--file', sqlFile],
+    process.execPath,
+    [prismaCliPath, 'db', 'execute', '--schema', 'prisma/schema.prisma', '--file', sqlFile],
     {
       cwd: projectRoot,
       env: process.env,
       stdio: 'inherit',
-      // Node >=20.12 blocks spawning .cmd files without a shell (CVE-2024-27980)
-      shell: process.platform === 'win32',
+      shell: false,
     }
   );
 

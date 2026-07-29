@@ -2,20 +2,19 @@ import crypto from 'node:crypto';
 import { redisSessionStore } from '../infrastructure/cache/redis-cache.service';
 import { isRedisEnabled, isRedisRequired, redisCommand } from '../infrastructure/redis/client';
 
-const ONE_THOUSAND_DAYS_SECONDS = 60 * 60 * 24 * 1000;
-const DEFAULT_SESSION_TTL_SECONDS = ONE_THOUSAND_DAYS_SECONDS;
-const MAX_SESSION_TTL_SECONDS = ONE_THOUSAND_DAYS_SECONDS;
-const configuredSessionTtlSeconds = Number(
-  process.env.AUTH_REFRESH_TOKEN_TTL_SECONDS ||
-    process.env.AUTH_SESSION_TTL_SECONDS ||
-    DEFAULT_SESSION_TTL_SECONDS
-);
-const SESSION_TTL_SECONDS = Math.min(
-  MAX_SESSION_TTL_SECONDS,
-  Math.max(60 * 60, Number.isFinite(configuredSessionTtlSeconds)
-    ? configuredSessionTtlSeconds
-    : DEFAULT_SESSION_TTL_SECONDS)
-);
+const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const MAX_SESSION_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+export function getAuthSessionTtlSeconds(): number {
+  const configured = Number(
+    process.env.AUTH_REFRESH_TOKEN_TTL_SECONDS ||
+      process.env.AUTH_SESSION_TTL_SECONDS ||
+      DEFAULT_SESSION_TTL_SECONDS
+  );
+  const seconds = Number.isFinite(configured) ? Math.floor(configured) : DEFAULT_SESSION_TTL_SECONDS;
+
+  return Math.min(MAX_SESSION_TTL_SECONDS, Math.max(60 * 60, seconds));
+}
 
 export type StoredSession = {
   sessionId: string;
@@ -109,7 +108,7 @@ export async function createAuthSession(params: {
 }): Promise<{ sessionId: string; refreshToken: string; expiresAt: Date }> {
   const sessionId = crypto.randomUUID();
   const secret = crypto.randomBytes(48).toString('hex');
-  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
+  const expiresAt = new Date(Date.now() + getAuthSessionTtlSeconds() * 1000);
 
   await storeSession({
     sessionId,

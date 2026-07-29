@@ -57,7 +57,7 @@ export const getLiveStats = async (req: Request, res: Response) => {
     res.json({ success: true, data: stats });
   } catch (error: any) {
     console.error('Error getting live stats:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -87,7 +87,7 @@ export const trackProfileView = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error tracking profile view:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -115,7 +115,7 @@ export const getProfileViews = async (req: Request, res: Response) => {
     res.json({ success: true, data: stats });
   } catch (error: any) {
     console.error('Error getting profile views:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -146,7 +146,7 @@ export const getProfileViewHistory = async (req: Request, res: Response) => {
     res.json({ success: true, data: history });
   } catch (error: any) {
     console.error('Error getting profile view history:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -200,7 +200,7 @@ export const getProfileSaves = async (req: Request, res: Response) => {
     res.json({ success: true, data: savers });
   } catch (error: any) {
     console.error('Error getting profile savers:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -214,7 +214,7 @@ export const getRecentProfileViews = async (req: Request, res: Response) => {
     res.json({ success: true, data: recentProfiles });
   } catch (error: any) {
     console.error('Error getting recently viewed profiles:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -242,7 +242,7 @@ export const getProfileInsights = async (req: Request, res: Response) => {
     res.json({ success: true, data: insights });
   } catch (error: any) {
     console.error('Error getting profile insights:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -262,7 +262,7 @@ export const getLeaderboard = async (req: Request, res: Response) => {
     res.json({ success: true, data: leaderboard });
   } catch (error: any) {
     console.error('Error getting leaderboard:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -298,7 +298,7 @@ export const getGroupStats = async (req: Request, res: Response) => {
     res.json({ success: true, data: stats });
   } catch (error: any) {
     console.error('Error getting group stats:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -319,7 +319,7 @@ export const getEventStats = async (req: Request, res: Response) => {
     res.json({ success: true, data: stats });
   } catch (error: any) {
     console.error('Error getting event stats:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -339,7 +339,7 @@ export const trackEventView = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error tracking event view:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -356,7 +356,7 @@ export const getActivityFeed = async (req: Request, res: Response) => {
     res.json({ success: true, data: feed });
   } catch (error: any) {
     console.error('Error getting activity feed:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -382,7 +382,7 @@ export const recordActivity = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error recording activity:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -400,7 +400,7 @@ export const getTrending = async (req: Request, res: Response) => {
     res.json({ success: true, data: items });
   } catch (error: any) {
     console.error('Error getting trending items:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -416,7 +416,7 @@ export const getOnboardingStats = async (req: Request, res: Response) => {
     res.json({ success: true, data: stats });
   } catch (error: any) {
     console.error('Error getting onboarding stats:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };
 
@@ -439,6 +439,6 @@ export const updateActivity = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error updating activity:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Request could not be completed' });
   }
 };

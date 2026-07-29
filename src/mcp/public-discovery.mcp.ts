@@ -22,7 +22,13 @@ import {
 
 const MCP_PATH = '/mcp';
 export const OPENAI_APPS_CHALLENGE_PATH = '/.well-known/openai-apps-challenge';
-export const OPENAI_APPS_CHALLENGE_TOKEN = 'REMOVED_SECRET';
+const LOCAL_OPENAI_APPS_CHALLENGE_TOKEN = 'local-openai-apps-challenge';
+
+export function getOpenAiAppsChallengeToken(): string {
+  const configuredToken = process.env.OPENAI_APPS_CHALLENGE_TOKEN?.trim();
+  if (configuredToken) return configuredToken;
+  return process.env.NODE_ENV === 'production' ? '' : LOCAL_OPENAI_APPS_CHALLENGE_TOKEN;
+}
 const mcpRateLimit = createRateLimitMiddleware(() => [
   { keyPrefix: 'mcp:search:ip', limit: 60, windowSeconds: 60, code: 'MCP_RATE_LIMITED' },
 ]);
@@ -467,7 +473,12 @@ export function createPublicDiscoveryMcpServer(): McpServer {
 
 export function registerPublicDiscoveryMcp(app: Express): void {
   app.get(OPENAI_APPS_CHALLENGE_PATH, (_req: Request, res: Response): void => {
-    res.status(200).type('text/plain').send(OPENAI_APPS_CHALLENGE_TOKEN);
+    const challengeToken = getOpenAiAppsChallengeToken();
+    if (!challengeToken) {
+      res.status(503).type('text/plain').send('Challenge verification is not configured');
+      return;
+    }
+    res.status(200).type('text/plain').send(challengeToken);
   });
 
   app.all(MCP_PATH, mcpRateLimit, async (req: Request, res: Response): Promise<void> => {

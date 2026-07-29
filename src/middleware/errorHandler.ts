@@ -27,9 +27,12 @@ export const errorHandler = (
     || err.message?.includes('Unexpected field');
   const statusCode = err.statusCode || (isUploadValidationError ? ((err as any).code === 'LIMIT_FILE_SIZE' ? 413 : 400) : 500);
   const status = err.status || (isUploadValidationError ? 'bad_request' : 'error');
-  const message = isUploadValidationError
-    ? err.message || 'Invalid file upload'
-    : err.message || 'Internal Server Error';
+  const isServerError = statusCode >= 500;
+  const message = isServerError
+    ? 'Internal Server Error'
+    : isUploadValidationError
+      ? err.message || 'Invalid file upload'
+      : err.message || 'Request failed';
   const requestId = getRequestId(req);
   const log = getRequestLogger(req);
 
@@ -39,14 +42,13 @@ export const errorHandler = (
     statusCode,
     status,
     message,
-    stack: err.stack,
+    ...(process.env.NODE_ENV !== 'production' ? { stack: err.stack } : {}),
   });
 
   res.status(statusCode).json({
     status,
     message,
     requestId,
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
   });
 };
 
@@ -58,7 +60,8 @@ export const notFoundHandler = (
   _res: Response,
   next: NextFunction
 ): void => {
-  const error: AppError = new Error(`Not Found - ${req.originalUrl}`);
+  const requestPath = req.originalUrl.split('?')[0];
+  const error: AppError = new Error(`Not Found - ${requestPath}`);
   error.statusCode = 404;
   error.status = 'not_found';
   next(error);

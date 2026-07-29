@@ -111,6 +111,22 @@ test('Socket.IO supports production fallback transport and requires authenticati
   );
 });
 
+test('agent session rooms require server-side ownership before joining', () => {
+  const indexSource = source('src/index.ts');
+  const handler = between(
+    indexSource,
+    "socket.on('agent:join_session'",
+    "  socket.on('agent:leave_session'"
+  );
+
+  assert.match(handler, /agentSessionService\.requireSession\(sessionId, authenticatedUserId\)/);
+  assert.ok(
+    handler.indexOf('requireSession') < handler.indexOf('socket.join'),
+    'ownership must be checked before joining the room'
+  );
+  assert.match(handler, /Agent session not found/);
+});
+
 test('REST chat send reuses shared service and does not invalidate cache inline', () => {
   const controller = source('src/controllers/chat.controller.ts');
   const handler = between(

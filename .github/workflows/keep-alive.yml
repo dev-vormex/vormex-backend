@@ -5,6 +5,8 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   ping-backend:
     name: Ping Production Health Endpoint

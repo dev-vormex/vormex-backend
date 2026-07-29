@@ -13,11 +13,12 @@ const shouldKeepDbAwake =
   /neon\.tech/i.test(databaseUrl);
 const backgroundJobsMode = (process.env.DEV_BACKGROUND_JOBS || 'auto').toLowerCase();
 
-const tsNodeDevBin = path.join(
+const tsxCliPath = path.join(
   projectRoot,
   'node_modules',
-  '.bin',
-  process.platform === 'win32' ? 'ts-node-dev.cmd' : 'ts-node-dev'
+  'tsx',
+  'dist',
+  'cli.mjs'
 );
 
 let serverProcess = null;
@@ -32,8 +33,7 @@ function spawnChild(command, args, name) {
     cwd: projectRoot,
     env: process.env,
     stdio: 'inherit',
-    // Node >=20.12 blocks spawning .cmd files without a shell (CVE-2024-27980)
-    shell: process.platform === 'win32' && command.endsWith('.cmd'),
+    shell: false,
   });
 
   child.on('error', (error) => {
@@ -125,21 +125,21 @@ console.log('[dev] Ensuring required schema primitives exist.');
 runBootstrap(process.execPath, [path.join(__dirname, 'ensure-dev-schema.js')], 'schema bootstrap');
 
 serverProcess = spawnChild(
-  tsNodeDevBin,
-  ['--respawn', '--transpile-only', 'src/api.ts'],
+  process.execPath,
+  [tsxCliPath, 'watch', 'src/api.ts'],
   'api server'
 );
 
 if (shouldStartBackgroundJobs()) {
   workerProcess = spawnChild(
-    tsNodeDevBin,
-    ['--respawn', '--transpile-only', 'src/worker.ts'],
+    process.execPath,
+    [tsxCliPath, 'watch', 'src/worker.ts'],
     'worker'
   );
 
   schedulerProcess = spawnChild(
-    tsNodeDevBin,
-    ['--respawn', '--transpile-only', 'src/scheduler.ts'],
+    process.execPath,
+    [tsxCliPath, 'watch', 'src/scheduler.ts'],
     'scheduler'
   );
 } else {

@@ -8,10 +8,10 @@
   },
   "scripts": {
     "dev": "node scripts/dev.js",
-    "dev:server": "ts-node-dev --respawn --transpile-only src/api.ts",
-    "dev:api": "ts-node-dev --respawn --transpile-only src/api.ts",
-    "dev:worker": "ts-node-dev --respawn --transpile-only src/worker.ts",
-    "dev:scheduler": "ts-node-dev --respawn --transpile-only src/scheduler.ts",
+    "dev:server": "tsx watch src/api.ts",
+    "dev:api": "tsx watch src/api.ts",
+    "dev:worker": "tsx watch src/worker.ts",
+    "dev:scheduler": "tsx watch src/scheduler.ts",
     "postinstall": "npm run prisma:generate",
     "build": "node scripts/build.js",
     "test": "npm run build && node --test dist/tests/*.test.js",
@@ -22,15 +22,15 @@
     "start:scheduler": "node scripts/run-compiled.js scheduler",
     "start:proximity-worker": "node scripts/run-compiled.js proximity-worker",
     "start:proximity-scheduler": "node scripts/run-compiled.js proximity-scheduler",
-    "dev:proximity-worker": "ts-node-dev --respawn --transpile-only src/proximity-worker.ts",
-    "dev:proximity-scheduler": "ts-node-dev --respawn --transpile-only src/proximity-scheduler.ts",
+    "dev:proximity-worker": "tsx watch src/proximity-worker.ts",
+    "dev:proximity-scheduler": "tsx watch src/proximity-scheduler.ts",
     "load:proximity": "node scripts/load-proximity.js",
     "load:recommendations": "node scripts/load-recommendations.js",
     "ai:smoke": "node scripts/ai-smoke.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "contacts:backfill-email-hashes": "ts-node-dev --transpile-only src/scripts/backfill-user-email-hashes.ts",
+    "contacts:backfill-email-hashes": "tsx src/scripts/backfill-user-email-hashes.ts",
     "neon:keep-alive": "node scripts/neon-keep-alive.js",
     "docs:generate": "swagger-cli bundle -o src/openapi.json src/openapi.yaml",
     "docs:validate": "swagger-cli validate src/openapi.yaml",
@@ -63,7 +63,6 @@
     "@types/qrcode": "^1.5.6",
     "@types/sharp": "^0.32.0",
     "@types/speakeasy": "^2.0.10",
-    "@types/swagger-jsdoc": "^6.0.4",
     "@types/swagger-ui-express": "^4.1.6",
     "axios": "^1.13.2",
     "bcryptjs": "^2.4.3",
@@ -72,7 +71,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
-    "firebase-admin": "^13.6.1",
+    "firebase-admin": "^14.2.0",
     "google-auth-library": "^10.5.0",
     "helmet": "^8.1.0",
     "ioredis": "^5.10.1",
@@ -86,10 +85,9 @@
     "prom-client": "^15.1.3",
     "qrcode": "^1.5.4",
     "resend": "6.1.1",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "socket.io": "^4.8.3",
     "speakeasy": "^2.0.0",
-    "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "typescript": "^5.9.3",
     "ws": "^8.20.0"
@@ -97,6 +95,10 @@
   "devDependencies": {
     "socket.io-client": "^4.8.3",
     "swagger-cli": "^4.0.4",
-    "ts-node-dev": "^2.0.0"
+    "tsx": "^4.20.6"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.8",
+    "uuid": "11.1.1"
   }
 }

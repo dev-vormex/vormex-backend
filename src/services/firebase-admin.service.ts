@@ -1,4 +1,7 @@
-import * as admin from 'firebase-admin';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { AppCheck, getAppCheck } from 'firebase-admin/app-check';
+import { Auth, getAuth } from 'firebase-admin/auth';
+import { getMessaging, Messaging } from 'firebase-admin/messaging';
 import { logger } from '../lib/logger';
 
 let firebaseInitialized = false;
@@ -21,7 +24,7 @@ function firebaseCredentials() {
 }
 
 export function initializeFirebaseAdmin(): boolean {
-  if (firebaseInitialized || admin.apps.length > 0) {
+  if (firebaseInitialized || getApps().length > 0) {
     firebaseInitialized = true;
     return true;
   }
@@ -39,14 +42,14 @@ export function initializeFirebaseAdmin(): boolean {
   }
 
   try {
-    admin.initializeApp({
-      credential: admin.credential.cert(credentials),
+    initializeApp({
+      credential: cert(credentials),
     });
     firebaseInitialized = true;
     logger.info({ event: 'firebase_admin.initialized' });
     return true;
   } catch (error) {
-    if (admin.apps.length > 0) {
+    if (getApps().length > 0) {
       firebaseInitialized = true;
       return true;
     }
@@ -59,14 +62,14 @@ export function initializeFirebaseAdmin(): boolean {
   }
 }
 
-export function getFirebaseMessaging(): admin.messaging.Messaging | null {
-  return initializeFirebaseAdmin() ? admin.messaging() : null;
+export function getFirebaseMessaging(): Messaging | null {
+  return initializeFirebaseAdmin() ? getMessaging() : null;
 }
 
-export function getFirebaseAuth(): admin.auth.Auth | null {
-  return initializeFirebaseAdmin() ? admin.auth() : null;
+export function getFirebaseAuth(): Auth | null {
+  return initializeFirebaseAdmin() ? getAuth() : null;
 }
 
-export function getFirebaseAppCheck(): admin.appCheck.AppCheck | null {
-  return initializeFirebaseAdmin() ? admin.appCheck() : null;
+export function getFirebaseAppCheck(): AppCheck | null {
+  return initializeFirebaseAdmin() ? getAppCheck() : null;
 }

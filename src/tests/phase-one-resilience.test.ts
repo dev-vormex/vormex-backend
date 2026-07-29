@@ -44,6 +44,19 @@ test('sessions use the critical store while ordinary response caching uses the c
   assert.match(queues, /isCriticalRedisEnabled/);
 });
 
+test('browser-facing API responses do not expose health internals or raw server errors', () => {
+  const index = source('src/index.ts');
+  const errors = source('src/middleware/errorHandler.ts');
+  const sessionService = source('src/services/auth-session.service.ts');
+
+  assert.match(index, /Cache-Control', 'no-store, private'/);
+  assert.doesNotMatch(index, /database: 'connected'/);
+  assert.match(errors, /statusCode >= 500/);
+  assert.match(errors, /\? 'Internal Server Error'/);
+  assert.match(sessionService, /DEFAULT_SESSION_TTL_SECONDS = 30 \* 24 \* 60 \* 60/);
+  assert.match(sessionService, /MAX_SESSION_TTL_SECONDS = 90 \* 24 \* 60 \* 60/);
+});
+
 test('background heartbeat evaluation distinguishes healthy, stale, and missing processes', () => {
   const now = Date.parse('2026-07-26T12:00:00.000Z');
   const healthy = JSON.stringify({

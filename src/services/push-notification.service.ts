@@ -1,5 +1,5 @@
 import { prisma } from '../config/prisma';
-import type * as admin from 'firebase-admin';
+import type { MulticastMessage } from 'firebase-admin/messaging';
 import { getFirebaseMessaging, initializeFirebaseAdmin } from './firebase-admin.service';
 import { logger } from '../lib/logger';
 import { pushNotificationConfigCounter } from '../infrastructure/metrics/registry';
@@ -201,7 +201,7 @@ export class PushNotificationService {
       // IMPORTANT: Use DATA-ONLY messages (no 'notification' field)
       // This ensures onMessageReceived() is ALWAYS called, even when app is killed
       // The Android app handles displaying the notification itself
-      const message: admin.messaging.MulticastMessage = {
+      const message: MulticastMessage = {
         tokens: tokenStrings,
         // NO notification field - this is intentional for background delivery
         data: {

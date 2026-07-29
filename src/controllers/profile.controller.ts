@@ -140,7 +140,7 @@ export const getProfile = async (
     }
 
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to fetch profile',
+      error: 'Failed to fetch profile',
     });
   }
 };
@@ -252,7 +252,7 @@ export const getProfileFeed = async (
   } catch (error) {
     console.error('Error getting profile feed:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to fetch feed',
+      error: 'Failed to fetch feed',
     });
   }
 };
@@ -621,7 +621,7 @@ export const updateProfile = async (
   } catch (error) {
     console.error('Error updating profile:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to update profile',
+      error: 'Failed to update profile',
     });
   }
 };
@@ -696,7 +696,7 @@ export const uploadBanner = async (
   } catch (error) {
     console.error('Error uploading banner:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to update banner',
+      error: 'Failed to update banner',
     });
   }
 };
@@ -771,7 +771,7 @@ export const uploadAvatar = async (
   } catch (error) {
     console.error('Error uploading avatar:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to update avatar',
+      error: 'Failed to update avatar',
     });
   }
 };
@@ -856,7 +856,7 @@ export const getUserActivity = async (
   } catch (error) {
     console.error('Error getting user activity:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to fetch activity data',
+      error: 'Failed to fetch activity data',
     });
   }
 };
@@ -908,7 +908,7 @@ export const getUserActivityYears = async (
   } catch (error) {
     console.error('Error getting activity years:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to fetch activity years',
+      error: 'Failed to fetch activity years',
     });
   }
 };

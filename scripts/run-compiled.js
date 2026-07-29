@@ -5,7 +5,6 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const projectRoot = path.join(__dirname, '..');
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const allowedEntries = new Set(['api', 'worker', 'scheduler', 'proximity-worker', 'proximity-scheduler']);
 const entryName = process.argv[2] || 'api';
 
@@ -16,8 +15,8 @@ if (!allowedEntries.has(entryName)) {
 
 const compiledEntryPath = path.join(projectRoot, 'dist', `${entryName}.js`);
 
-function runNpmScript(scriptName) {
-  const result = spawnSync(npmCommand, ['run', scriptName], {
+function runBuild() {
+  const result = spawnSync(process.execPath, [path.join(projectRoot, 'scripts', 'build.js')], {
     cwd: projectRoot,
     env: process.env,
     stdio: 'inherit',
@@ -30,7 +29,7 @@ function runNpmScript(scriptName) {
 
 if (!fs.existsSync(compiledEntryPath)) {
   console.log(`[start] Missing dist/${entryName}.js. Running build before startup.`);
-  runNpmScript('build');
+  runBuild();
 }
 
 require(compiledEntryPath);

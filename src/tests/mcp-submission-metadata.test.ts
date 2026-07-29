@@ -6,8 +6,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   createPublicDiscoveryMcpServer,
+  getOpenAiAppsChallengeToken,
   OPENAI_APPS_CHALLENGE_PATH,
-  OPENAI_APPS_CHALLENGE_TOKEN,
   registerPublicDiscoveryMcp,
 } from '../mcp/public-discovery.mcp';
 
@@ -23,7 +23,7 @@ test('OpenAI app verification endpoint returns only the challenge token', async 
     const response = await fetch(`http://127.0.0.1:${address.port}${OPENAI_APPS_CHALLENGE_PATH}`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type') || '', /^text\/plain/);
-    assert.equal(await response.text(), OPENAI_APPS_CHALLENGE_TOKEN);
+    assert.equal(await response.text(), getOpenAiAppsChallengeToken());
   } finally {
     await new Promise<void>((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
   }

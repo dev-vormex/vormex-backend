@@ -5,6 +5,7 @@ import pinoHttp from 'pino-http';
 import { AuthenticatedRequest } from '../types/auth.types';
 
 const isProduction = process.env.NODE_ENV === 'production';
+const includeIdentifiers = process.env.LOG_INCLUDE_IDENTIFIERS === 'true';
 
 export const logger = pino({
   level: process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug'),
@@ -14,6 +15,7 @@ export const logger = pino({
     paths: [
       'req.headers.authorization',
       'req.headers.cookie',
+      'req.headers["x-csrf-token"]',
       'req.body.password',
       'req.body.newPassword',
       'req.body.token',
@@ -91,17 +93,12 @@ export const httpLogger = pinoHttp({
   serializers: {
     req(req) {
       const request = req as Request;
-      const remoteAddress =
-        request.ip ||
-        request.socket?.remoteAddress ||
-        (req as Request & { connection?: { remoteAddress?: string } }).connection?.remoteAddress ||
-        null;
 
       return {
         requestId: request.requestId,
         method: req.method,
-        url: req.url,
-        remoteAddress,
+        path: request.path || req.url?.split('?')[0],
+        ...(includeIdentifiers ? { remoteAddress: request.ip } : {}),
       };
     },
     res(res) {
@@ -114,8 +111,12 @@ export const httpLogger = pinoHttp({
     const authenticatedReq = req as Request & AuthenticatedRequest;
     return {
       requestId: authenticatedReq.requestId,
-      userId: authenticatedReq.user?.userId ? String(authenticatedReq.user.userId) : null,
-      ip: authenticatedReq.ip,
+      ...(includeIdentifiers
+        ? {
+            userId: authenticatedReq.user?.userId ? String(authenticatedReq.user.userId) : null,
+            ip: authenticatedReq.ip,
+          }
+        : {}),
     };
   },
 });

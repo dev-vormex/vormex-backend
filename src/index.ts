@@ -100,6 +100,7 @@ import {
   sanitizeInputTree,
 } from './utils/input-security.util';
 import { agentRealtimeVoiceService } from './agent/realtime-voice.service';
+import { agentSessionService } from './agent/session.service';
 import { botGuard, generalApiRateLimit } from './middleware/abuse-protection.middleware';
 import { optionalAppCheck } from './middleware/app-check.middleware';
 import { authenticate, optionalAuth, verifySocketAccessToken } from './middleware/auth.middleware';
@@ -228,6 +229,7 @@ const io = new SocketIOServer(httpServer, {
   // networks/proxies that cannot complete a WebSocket upgrade.
   transports: ['websocket', 'polling'],
   allowUpgrades: true,
+  maxHttpBufferSize: 256 * 1024,
 });
 
 // Share Socket.IO instance with controllers via the sockets module
@@ -1314,12 +1316,22 @@ io.on('connection', async (socket) => {
 
   registerArcadeSocketHandlers({ io, socket, getSocketUserId });
 
-  socket.on('agent:join_session', ({ sessionId }) => {
+  socket.on('agent:join_session', async (payload: any = {}) => {
     const authenticatedUserId = getSocketUserId(socket);
-    if (!authenticatedUserId || !sessionId) {
+    const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId.trim() : '';
+    if (!authenticatedUserId || !sessionId || sessionId.length > 128) {
       return;
     }
-    socket.join(`agent:session:${sessionId}`);
+
+    try {
+      await agentSessionService.requireSession(sessionId, authenticatedUserId);
+      await socket.join(`agent:session:${sessionId}`);
+    } catch {
+      socket.emit('agent:session_error', {
+        sessionId,
+        error: 'Agent session not found',
+      });
+    }
   });
 
   socket.on('agent:leave_session', ({ sessionId }) => {
@@ -2660,6 +2672,11 @@ app.use(express.json({
   },
 }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use('/api', (_req: Request, res: Response, next) => {
+  res.setHeader('Cache-Control', 'no-store, private');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+});
 app.use('/api', validateRequestInput);
 
 /**
@@ -2688,29 +2705,12 @@ app.get('/api/health/ready', async (_req: Request, res: Response): Promise<void>
     res.status(ready ? 200 : 503).json({
       status: ready ? 'ok' : 'error',
       timestamp: Date.now(),
-      database: 'connected',
-      redis: redisHealth,
-      backgroundProcesses,
     });
   } catch (error) {
-    console.error('Readiness check failed:', error);
+    logger.error({ event: 'health.readiness_failed', error });
     res.status(503).json({
       status: 'error',
       timestamp: Date.now(),
-      database: 'disconnected',
-      redis: await getRedisHealth().catch(() => ({
-        required: process.env.NODE_ENV === 'production',
-        enabled: isRedisEnabled(),
-        status: 'error',
-      })),
-      backgroundProcesses: await getBackgroundProcessesHealth().catch(() => ({
-        required: process.env.BACKGROUND_PROCESSES_REQUIRED === 'true',
-        healthy: false,
-        roles: {
-          worker: { status: 'unavailable' },
-          scheduler: { status: 'unavailable' },
-        },
-      })),
     });
   }
 });
@@ -2723,15 +2723,12 @@ app.get('/api/health', async (_req: Request, res: Response): Promise<void> => {
     res.status(200).json({
       status: 'ok',
       timestamp: Date.now(),
-      database: 'connected',
     });
   } catch (error) {
-    console.error('Database connection error:', error);
+    logger.error({ event: 'health.database_failed', error });
     res.status(503).json({
       status: 'error',
       timestamp: Date.now(),
-      database: 'disconnected',
-      message: 'Database connection failed',
     });
   }
 });
@@ -2748,8 +2745,11 @@ app.get(
   }
 );
 
-// API Documentation (Swagger UI)
-setupSwagger(app, PORT);
+// API documentation is disabled by default in production to avoid exposing the
+// complete attack surface. Enable it deliberately for a protected environment.
+if (process.env.NODE_ENV !== 'production' || process.env.API_DOCS_ENABLED === 'true') {
+  setupSwagger(app, PORT);
+}
 app.use('/api', optionalAppCheck, botGuard, optionalAuth, generalApiRateLimit);
 app.use('/api/ai', validateAIRequestInput);
 app.use('/api/agent', validateAIRequestInput);
