@@ -5,6 +5,12 @@ const { spawn, spawnSync } = require('child_process');
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
+const { loadProtectedLocalDatabaseCredentials } = require('./local-neon-credentials');
+const localCredentialResult = loadProtectedLocalDatabaseCredentials();
+if (localCredentialResult.status === 'loaded') {
+  console.log('[dev] Loaded Windows-protected local database credentials.');
+}
+
 const projectRoot = path.join(__dirname, '..');
 const databaseUrl = process.env.DATABASE_URL || '';
 const redisUrl = process.env.REDIS_URL || '';
