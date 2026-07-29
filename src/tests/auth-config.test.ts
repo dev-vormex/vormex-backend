@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { findSensitivePublicEnvNames } from '../config/auth-security.config';
+import {
+  findSensitivePublicEnvNames,
+  validateAuthRuntimeConfig,
+} from '../config/auth-security.config';
 import { getAccessTokenTtlSeconds, isWeakAuthSecret } from '../utils/jwt.util';
 
 test('sensitive auth values are detected when placed in frontend-exposed env names', () => {
@@ -37,5 +40,37 @@ test('access token lifetime defaults to 15 minutes and is capped at one hour', (
     else process.env.AUTH_ACCESS_TOKEN_TTL = previousAccessTtl;
     if (previousLegacyTtl === undefined) delete process.env.JWT_EXPIRES_IN;
     else process.env.JWT_EXPIRES_IN = previousLegacyTtl;
+  }
+});
+
+test('dual encryption keys must be valid and distinct', () => {
+  const names = [
+    'NODE_ENV',
+    'ENCRYPTION_KEY',
+    'ENCRYPTION_KEY_PREVIOUS',
+    'AUTH_COOKIE_SAME_SITE',
+    'AUTH_COOKIE_SECURE',
+  ] as const;
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+
+  try {
+    process.env.NODE_ENV = 'test';
+    process.env.AUTH_COOKIE_SAME_SITE = 'lax';
+    process.env.AUTH_COOKIE_SECURE = 'true';
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.ENCRYPTION_KEY_PREVIOUS = 'a'.repeat(64);
+    assert.throws(
+      () => validateAuthRuntimeConfig(),
+      /ENCRYPTION_KEY_PREVIOUS must be different/
+    );
+
+    process.env.ENCRYPTION_KEY_PREVIOUS = 'b'.repeat(64);
+    assert.doesNotThrow(() => validateAuthRuntimeConfig());
+  } finally {
+    for (const name of names) {
+      const value = previous[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });

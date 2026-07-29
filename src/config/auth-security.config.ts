@@ -66,4 +66,14 @@ export function validateAuthRuntimeConfig(): void {
 
   assertCookieConfig();
   assertHexSecret('ENCRYPTION_KEY', process.env.ENCRYPTION_KEY, 64);
+
+  if (process.env.ENCRYPTION_KEY_PREVIOUS) {
+    assertHexSecret('ENCRYPTION_KEY_PREVIOUS', process.env.ENCRYPTION_KEY_PREVIOUS, 64);
+    if (
+      process.env.ENCRYPTION_KEY_PREVIOUS.toLowerCase() ===
+      process.env.ENCRYPTION_KEY?.toLowerCase()
+    ) {
+      throw new Error('ENCRYPTION_KEY_PREVIOUS must be different from ENCRYPTION_KEY');
+    }
+  }
 }

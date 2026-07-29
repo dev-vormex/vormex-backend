@@ -1,15 +1,21 @@
 import crypto from 'crypto';
+import {
+  currentEncryptionKey,
+  decryptionKeyCandidates,
+  EncryptionKeySource,
+} from '../config/encryption-keyring';
 
 const LEGACY_ALGORITHM = 'aes-256-cbc';
 const ALGORITHM = 'aes-256-gcm';
 const GCM_PREFIX = 'v2';
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY!;
 
-if (!ENCRYPTION_KEY || !/^[a-f0-9]{64}$/i.test(ENCRYPTION_KEY)) {
-  throw new Error('ENCRYPTION_KEY must be 64 characters (32 bytes in hex)');
+export type EncryptedTokenFormat = 'v2' | 'legacy';
+
+export interface DecryptedToken {
+  plaintext: string;
+  keySource: EncryptionKeySource;
+  format: EncryptedTokenFormat;
 }
-
-const key = Buffer.from(ENCRYPTION_KEY, 'hex');
 
 function bufferFromHex(value: string, expectedBytes?: number): Buffer {
   if (!/^[a-f0-9]+$/i.test(value) || value.length % 2 !== 0) {
@@ -31,7 +37,7 @@ function bufferFromHex(value: string, expectedBytes?: number): Buffer {
  */
 export function encryptToken(token: string): string {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  const cipher = crypto.createCipheriv(ALGORITHM, currentEncryptionKey(), iv);
   const encrypted = Buffer.concat([
     cipher.update(token, 'utf8'),
     cipher.final(),
@@ -55,7 +61,7 @@ export function encryptToken(token: string): string {
  * @returns The plaintext access token
  * @throws Error if the encrypted data format is invalid
  */
-export function decryptToken(encryptedData: string): string {
+export function decryptTokenWithMetadata(encryptedData: string): DecryptedToken {
   const parts = encryptedData.split(':');
 
   if (parts.length === 4 && parts[0] === GCM_PREFIX) {
@@ -63,13 +69,25 @@ export function decryptToken(encryptedData: string): string {
     const authTag = bufferFromHex(parts[2], 16);
     const encrypted = bufferFromHex(parts[3]);
 
-    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-    decipher.setAuthTag(authTag);
+    for (const candidate of decryptionKeyCandidates()) {
+      try {
+        const decipher = crypto.createDecipheriv(ALGORITHM, candidate.key, iv);
+        decipher.setAuthTag(authTag);
 
-    return Buffer.concat([
-      decipher.update(encrypted),
-      decipher.final(),
-    ]).toString('utf8');
+        return {
+          plaintext: Buffer.concat([
+            decipher.update(encrypted),
+            decipher.final(),
+          ]).toString('utf8'),
+          keySource: candidate.source,
+          format: 'v2',
+        };
+      } catch {
+        // Try the next configured key without exposing cryptographic details.
+      }
+    }
+
+    throw new Error('Unable to decrypt stored secret');
   }
 
   if (parts.length !== 2) {
@@ -77,11 +95,27 @@ export function decryptToken(encryptedData: string): string {
   }
 
   const iv = bufferFromHex(parts[0], 16);
-  const encrypted = parts[1];
+  const encrypted = bufferFromHex(parts[1]);
 
-  const decipher = crypto.createDecipheriv(LEGACY_ALGORITHM, key, iv);
-  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
+  for (const candidate of decryptionKeyCandidates({ legacyUnauthenticated: true })) {
+    try {
+      const decipher = crypto.createDecipheriv(LEGACY_ALGORITHM, candidate.key, iv);
+      return {
+        plaintext: Buffer.concat([
+          decipher.update(encrypted),
+          decipher.final(),
+        ]).toString('utf8'),
+        keySource: candidate.source,
+        format: 'legacy',
+      };
+    } catch {
+      // Try the next configured key without exposing cryptographic details.
+    }
+  }
 
-  return decrypted;
+  throw new Error('Unable to decrypt stored secret');
+}
+
+export function decryptToken(encryptedData: string): string {
+  return decryptTokenWithMetadata(encryptedData).plaintext;
 }

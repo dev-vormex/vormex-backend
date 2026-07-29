@@ -31,6 +31,7 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "contacts:backfill-email-hashes": "tsx src/scripts/backfill-user-email-hashes.ts",
+    "encryption:rotate": "node dist/scripts/rotate-encryption-key.js",
     "neon:keep-alive": "node scripts/neon-keep-alive.js",
     "docs:generate": "swagger-cli bundle -o src/openapi.json src/openapi.yaml",
     "docs:validate": "swagger-cli validate src/openapi.yaml",
