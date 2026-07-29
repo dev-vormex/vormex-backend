@@ -7,15 +7,15 @@ on:
       - 'src/openapi.yaml'
       - 'src/routes/**'
       - 'src/controllers/**'
-
-permissions:
-  contents: read
   pull_request:
     branches: [ main, develop ]
     paths:
       - 'src/openapi.yaml'
       - 'src/routes/**'
       - 'src/controllers/**'
+
+permissions:
+  contents: read
 
 jobs:
   validate-openapi:
