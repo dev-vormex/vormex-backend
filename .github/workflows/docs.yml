@@ -4,12 +4,14 @@ on:
   push:
     branches: [ main, develop ]
     paths:
+      - '.github/workflows/docs.yml'
       - 'src/openapi.yaml'
       - 'src/routes/**'
       - 'src/controllers/**'
   pull_request:
     branches: [ main, develop ]
     paths:
+      - '.github/workflows/docs.yml'
       - 'src/openapi.yaml'
       - 'src/routes/**'
       - 'src/controllers/**'
