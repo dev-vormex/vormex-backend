@@ -78,7 +78,7 @@
     "js-yaml": "^4.1.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
-    "openai": "^6.32.0",
+    "openai": "^7.1.0",
     "pino": "^9.4.0",
     "pino-http": "^10.0.0",
     "prisma": "^5.22.0",
