@@ -17,7 +17,9 @@ import {
 import { getPremiumPlan } from '../services/premium-access.service';
 import {
   assertUsersCanInteract,
+  areUsersBlocked,
   enforceTrustTierLimit,
+  getBlockedUserIds,
   safetyErrorResponse,
 } from '../services/trust-safety.service';
 import { queueNames } from '../infrastructure/queue/queue-names';
@@ -324,8 +326,6 @@ export const acceptConnectionRequest = async (req: AuthRequest, res: Response): 
       return;
     }
 
-    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
-
     res.status(200).json({
       message: 'Connection request accepted',
       connection: {
@@ -516,16 +516,20 @@ export const getConnections = async (req: AuthRequest, res: Response): Promise<v
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
     const skip = (page - 1) * limit;
+    const blockedUserIds = await getBlockedUserIds(req.user.userId);
+    const relationshipWhere: any = {
+      status: 'accepted',
+      AND: [
+        { OR: [{ requesterId: req.user.userId }, { addresseeId: req.user.userId }] },
+        ...(blockedUserIds.length > 0
+          ? [{ requesterId: { notIn: blockedUserIds }, addresseeId: { notIn: blockedUserIds } }]
+          : []),
+      ],
+    };
 
     const [connections, total] = await Promise.all([
       prisma.connections.findMany({
-        where: {
-          status: 'accepted',
-          OR: [
-            { requesterId: req.user.userId },
-            { addresseeId: req.user.userId },
-          ],
-        },
+        where: relationshipWhere,
         include: {
           users_connections_requesterIdTousers: {
             select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
@@ -539,13 +543,7 @@ export const getConnections = async (req: AuthRequest, res: Response): Promise<v
         take: limit,
       }),
       prisma.connections.count({
-        where: {
-          status: 'accepted',
-          OR: [
-            { requesterId: req.user.userId },
-            { addresseeId: req.user.userId },
-          ],
-        },
+        where: relationshipWhere,
       }),
     ]);
 
@@ -584,16 +582,25 @@ export const getUserConnections = async (req: AuthRequest, res: Response): Promi
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
     const skip = (page - 1) * limit;
+    const viewerId = req.user?.userId ? String(req.user.userId) : null;
+    if (viewerId && viewerId !== userId && await areUsersBlocked(viewerId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
+    const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+    const relationshipWhere: any = {
+      status: 'accepted',
+      AND: [
+        { OR: [{ requesterId: userId }, { addresseeId: userId }] },
+        ...(blockedUserIds.length > 0
+          ? [{ requesterId: { notIn: blockedUserIds }, addresseeId: { notIn: blockedUserIds } }]
+          : []),
+      ],
+    };
 
     const [connections, total] = await Promise.all([
       prisma.connections.findMany({
-        where: {
-          status: 'accepted',
-          OR: [
-            { requesterId: userId },
-            { addresseeId: userId },
-          ],
-        },
+        where: relationshipWhere,
         include: {
           users_connections_requesterIdTousers: {
             select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
@@ -607,13 +614,7 @@ export const getUserConnections = async (req: AuthRequest, res: Response): Promi
         take: limit,
       }),
       prisma.connections.count({
-        where: {
-          status: 'accepted',
-          OR: [
-            { requesterId: userId },
-            { addresseeId: userId },
-          ],
-        },
+        where: relationshipWhere,
       }),
     ]);
 

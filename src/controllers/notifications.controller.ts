@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { collapseInboxNotifications, notificationService } from '../services/notification.service';
+import { getBlockedUserIds } from '../services/trust-safety.service';
 import {
   clampPageSize,
   createdAtDescKeysetWhere,
@@ -74,7 +75,13 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
     const limit = clampPageSize(req.query.limit, 20, 50);
     const unreadOnly = req.query.unreadOnly === 'true';
 
-    const whereClause: any = { userId };
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const whereClause: any = {
+      userId,
+      AND: blockedUserIds.length > 0
+        ? [{ OR: [{ actorId: null }, { actorId: { notIn: blockedUserIds } }] }]
+        : [],
+    };
     
     if (unreadOnly) {
       whereClause.isRead = false;
@@ -83,9 +90,9 @@ export const getNotifications = async (req: AuthRequest, res: Response): Promise
     const newerWhere = dateAscKeysetWhere(afterCursor, 'createdAt');
     const cursorWhere = createdAtDescKeysetWhere(cursor);
     if (newerWhere) {
-      whereClause.AND = [newerWhere];
+      whereClause.AND.push(newerWhere);
     } else if (cursorWhere) {
-      whereClause.AND = [cursorWhere];
+      whereClause.AND.push(cursorWhere);
     } else if (legacyCursorDate) {
       whereClause.createdAt = { lt: legacyCursorDate };
     }
@@ -141,7 +148,16 @@ export const getUnreadCount = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const count = await notificationService.getUnreadCount(userId);
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const count = await prisma.notifications.count({
+      where: {
+        userId,
+        isRead: false,
+        ...(blockedUserIds.length > 0
+          ? { OR: [{ actorId: null }, { actorId: { notIn: blockedUserIds } }] }
+          : {}),
+      },
+    });
     res.json({ count });
   } catch (error) {
     console.error('Failed to fetch unread count:', error);

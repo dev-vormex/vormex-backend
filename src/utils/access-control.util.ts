@@ -1,4 +1,5 @@
 import { prismaRead } from '../config/prisma';
+import { areUsersBlocked, getBlockedUserIds } from '../services/trust-safety.service';
 
 type PrismaLike = {
   connections: {
@@ -120,8 +121,13 @@ export async function buildPostVisibilityWhere(
       });
     }
   }
-
-  return { OR: visibilityOr };
+  const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+  return {
+    AND: [
+      { OR: visibilityOr },
+      ...(blockedUserIds.length > 0 ? [{ authorId: { notIn: blockedUserIds } }] : []),
+    ],
+  };
 }
 
 export async function canViewPost(
@@ -138,6 +144,9 @@ export async function canViewPost(
   }
 
   const viewerId = normalizeUserId(viewerUserId);
+  if (viewerId && viewerId !== post.authorId && await areUsersBlocked(viewerId, post.authorId)) {
+    return false;
+  }
   if (viewerId && post.authorId === viewerId) {
     return true;
   }
@@ -200,8 +209,13 @@ export async function buildReelVisibilityWhere(
       });
     }
   }
-
-  return { OR: visibilityOr };
+  const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+  return {
+    AND: [
+      { OR: visibilityOr },
+      ...(blockedUserIds.length > 0 ? [{ authorId: { notIn: blockedUserIds } }] : []),
+    ],
+  };
 }
 
 export async function canViewReel(
@@ -220,6 +234,9 @@ export async function canViewReel(
   }
 
   const viewerId = normalizeUserId(viewerUserId);
+  if (viewerId && viewerId !== reel.authorId && await areUsersBlocked(viewerId, reel.authorId)) {
+    return false;
+  }
   const isOwner = Boolean(viewerId && reel.authorId === viewerId);
   if (isOwner && options.allowOwnerDraft) {
     return true;
@@ -267,8 +284,13 @@ export async function buildStoryVisibilityWhere(
       });
     }
   }
-
-  return { OR: visibilityOr };
+  const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+  return {
+    AND: [
+      { OR: visibilityOr },
+      ...(blockedUserIds.length > 0 ? [{ authorId: { notIn: blockedUserIds } }] : []),
+    ],
+  };
 }
 
 export async function canViewStory(
@@ -285,6 +307,9 @@ export async function canViewStory(
   }
 
   const viewerId = normalizeUserId(viewerUserId);
+  if (viewerId && viewerId !== story.authorId && await areUsersBlocked(viewerId, story.authorId)) {
+    return false;
+  }
   if (viewerId && story.authorId === viewerId) {
     return true;
   }

@@ -5,7 +5,12 @@ import { prisma } from '../config/prisma';
 import { ensureString } from '../utils/request.util';
 import { notificationService } from '../services/notification.service';
 import { pushNotificationService } from '../services/push-notification.service';
-import { assertUsersCanInteract, safetyErrorResponse } from '../services/trust-safety.service';
+import {
+  areUsersBlocked,
+  assertUsersCanInteract,
+  getBlockedUserIds,
+  safetyErrorResponse,
+} from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -186,6 +191,10 @@ export const getFollowStatus = async (req: AuthRequest, res: Response): Promise<
       res.status(400).json({ error: 'User ID required' });
       return;
     }
+    if (userId !== req.user.userId && await areUsersBlocked(req.user.userId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
 
     const [isFollowing, isFollowedBy] = await Promise.all([
       prisma.follows.findUnique({
@@ -226,10 +235,20 @@ export const getFollowers = async (req: AuthRequest, res: Response): Promise<voi
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
     const skip = (page - 1) * limit;
+    const viewerId = req.user?.userId ? String(req.user.userId) : null;
+    if (viewerId && viewerId !== userId && await areUsersBlocked(viewerId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
+    const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+    const followerWhere: any = {
+      followingId: userId,
+      ...(blockedUserIds.length > 0 ? { followerId: { notIn: blockedUserIds } } : {}),
+    };
 
     const [followers, total] = await Promise.all([
       prisma.follows.findMany({
-        where: { followingId: userId },
+        where: followerWhere,
         include: {
           users_follows_followerIdTousers: {
             select: {
@@ -249,7 +268,7 @@ export const getFollowers = async (req: AuthRequest, res: Response): Promise<voi
         take: limit,
       }),
       prisma.follows.count({
-        where: { followingId: userId },
+        where: followerWhere,
       }),
     ]);
 
@@ -282,10 +301,20 @@ export const getFollowing = async (req: AuthRequest, res: Response): Promise<voi
     const page = parseInt(ensureString(req.query.page) || '1') || 1;
     const limit = parseInt(ensureString(req.query.limit) || '20') || 20;
     const skip = (page - 1) * limit;
+    const viewerId = req.user?.userId ? String(req.user.userId) : null;
+    if (viewerId && viewerId !== userId && await areUsersBlocked(viewerId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
+    const blockedUserIds = viewerId ? await getBlockedUserIds(viewerId) : [];
+    const followingWhere: any = {
+      followerId: userId,
+      ...(blockedUserIds.length > 0 ? { followingId: { notIn: blockedUserIds } } : {}),
+    };
 
     const [following, total] = await Promise.all([
       prisma.follows.findMany({
-        where: { followerId: userId },
+        where: followingWhere,
         include: {
           users_follows_followingIdTousers: {
             select: {
@@ -305,7 +334,7 @@ export const getFollowing = async (req: AuthRequest, res: Response): Promise<voi
         take: limit,
       }),
       prisma.follows.count({
-        where: { followerId: userId },
+        where: followingWhere,
       }),
     ]);
 

@@ -12,7 +12,9 @@ import {
 } from '../utils/access-control.util';
 import {
   assertUsersCanInteract,
+  areUsersBlocked,
   enforceTrustTierLimit,
+  getBlockedUserIds,
   safetyErrorResponse,
 } from '../services/trust-safety.service';
 import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
@@ -48,6 +50,14 @@ function storyFeedCacheKey(userId: string, limit: number, nowMs: number): string
 
 async function invalidateStoryFeedCaches(...tags: string[]): Promise<void> {
   await cacheService.invalidateTags(...Array.from(new Set(tags.filter(Boolean))));
+}
+
+function sendStoryUnavailable(res: Response): void {
+  res.status(404).json({
+    error: 'This resource is unavailable.',
+    code: 'resource_unavailable',
+    retryable: false,
+  });
 }
 
 function getStoryViewsCount(story: any) {
@@ -357,9 +367,19 @@ export const createStory = async (req: AuthRequest, res: Response): Promise<void
 
       io.to(`user:${userId}`).emit('story:created', storyCreatedPayload);
       if (visibility === 'PUBLIC') {
-        io.emit('story:created', storyCreatedPayload);
+        const blockedUserIds = new Set(await getBlockedUserIds(userId));
+        const sockets = await io.fetchSockets();
+        const recipientIds = new Set(
+          sockets
+            .map((socket) => String(socket.data?.userId || ''))
+            .filter((recipientId) => recipientId && recipientId !== userId && !blockedUserIds.has(recipientId))
+        );
+        recipientIds.forEach((recipientId) => {
+          io.to(`user:${recipientId}`).emit('story:created', storyCreatedPayload);
+        });
       } else if (visibility === 'CONNECTIONS') {
-        const peerIds = await getConnectedPeerIds(userId);
+        const blockedUserIds = new Set(await getBlockedUserIds(userId));
+        const peerIds = (await getConnectedPeerIds(userId)).filter((peerId) => !blockedUserIds.has(peerId));
         peerIds.forEach((peerId) => {
           io.to(`user:${peerId}`).emit('story:created', storyCreatedPayload);
         });
@@ -410,7 +430,7 @@ export const getStory = async (req: AuthRequest, res: Response): Promise<void> =
     });
 
     if (!story) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
       return;
     }
 
@@ -501,6 +521,10 @@ export const getUserStories = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     const currentUserId = req.user?.userId;
+    if (currentUserId && currentUserId !== userId && await areUsersBlocked(currentUserId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
 
     const stories = await prisma.stories.findMany({
       where: {
@@ -565,11 +589,11 @@ export const viewStory = async (req: AuthRequest, res: Response): Promise<void> 
       where: { id: storyId, expiresAt: { gt: new Date() } },
     });
     if (!story) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
     if (!(await canViewStory(story, viewerId))) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
 
@@ -655,26 +679,32 @@ export const getStoryViewers = async (req: AuthRequest, res: Response): Promise<
     // Pagination
     const cursor = req.query.cursor as string | undefined;
     const limit = parseInt(req.query.limit as string) || 50;
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const visibleViewWhere = {
+      storyId,
+      ...(blockedUserIds.length > 0 ? { viewerId: { notIn: blockedUserIds } } : {}),
+    };
 
-    const [views, totalCount] = await Promise.all([
+    const [views, totalCount, rawTotalCount] = await Promise.all([
       prisma.story_views.findMany({
-        where: { storyId },
+        where: visibleViewWhere,
         orderBy: { viewedAt: 'desc' },
         take: limit + 1,
         ...(cursor && { cursor: { id: cursor }, skip: 1 }),
       }),
       prisma.story_views.count({
-        where: { storyId },
+        where: visibleViewWhere,
       }),
+      prisma.story_views.count({ where: { storyId } }),
     ]);
 
     const hasMore = views.length > limit;
     const viewsToReturn = hasMore ? views.slice(0, -1) : views;
 
-    if (story.viewsCount !== totalCount) {
+    if (story.viewsCount !== rawTotalCount) {
       await prisma.stories.update({
         where: { id: storyId },
-        data: { viewsCount: totalCount },
+        data: { viewsCount: rawTotalCount },
       });
     }
 
@@ -729,11 +759,11 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
       include: { users: { select: { id: true, name: true, username: true } } },
     });
     if (!story) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
     if (!(await canViewStory(story, userId))) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
 
@@ -783,6 +813,9 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
         mediaUrl: story.mediaUrl,
         mediaType: story.mediaType,
         thumbnailUrl: story.thumbnailUrl,
+        textContent: story.textContent,
+        backgroundColor: story.backgroundColor,
+        expiresAt: story.expiresAt.toISOString(),
         reaction: emoji,
       };
       
@@ -796,6 +829,7 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
           contentType: 'story_reaction',
           mediaUrl: story.thumbnailUrl || story.mediaUrl,
           mediaType: 'story',
+          fileName: JSON.stringify(storyData),
           status: 'SENT',
           updatedAt: new Date(),
         },
@@ -820,6 +854,16 @@ export const reactToStory = async (req: AuthRequest, res: Response): Promise<voi
           mediaUrl: chatMessage.mediaUrl,
           mediaType: 'story',
           storyData,
+          story: {
+            id: story.id,
+            mediaUrl: story.mediaUrl,
+            mediaType: story.mediaType,
+            thumbnailUrl: story.thumbnailUrl,
+            textContent: story.textContent,
+            backgroundColor: story.backgroundColor,
+            expiresAt: story.expiresAt.toISOString(),
+            available: true,
+          },
           status: 'SENT',
           createdAt: chatMessage.createdAt.toISOString(),
           sender,
@@ -879,11 +923,11 @@ export const removeStoryReaction = async (req: AuthRequest, res: Response): Prom
     }
     const story = await prisma.stories.findFirst({ where: { id: storyId } });
     if (!story) {
-      res.status(404).json({ error: 'Story not found' });
+      sendStoryUnavailable(res);
       return;
     }
     if (!(await canViewStory(story, userId))) {
-      res.status(404).json({ error: 'Story not found' });
+      sendStoryUnavailable(res);
       return;
     }
 
@@ -925,11 +969,11 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
       include: { users: { select: { id: true, name: true, username: true } } },
     });
     if (!story) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
     if (!(await canViewStory(story, userId))) {
-      res.status(404).json({ error: 'Story not found or expired' });
+      sendStoryUnavailable(res);
       return;
     }
     
@@ -973,6 +1017,9 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
       mediaUrl: story.mediaUrl,
       mediaType: story.mediaType,
       thumbnailUrl: story.thumbnailUrl,
+      textContent: story.textContent,
+      backgroundColor: story.backgroundColor,
+      expiresAt: story.expiresAt.toISOString(),
     };
     
     const chatMessage = await prisma.messages.create({
@@ -985,6 +1032,7 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
         contentType: 'story_reply',
         mediaUrl: mediaUrl || story.thumbnailUrl || story.mediaUrl,
         mediaType: 'story',
+        fileName: JSON.stringify(storyData),
         status: 'SENT',
         updatedAt: new Date(),
       },
@@ -1009,6 +1057,16 @@ export const replyToStory = async (req: AuthRequest, res: Response): Promise<voi
         mediaUrl: chatMessage.mediaUrl,
         mediaType: 'story',
         storyData,
+        story: {
+          id: story.id,
+          mediaUrl: story.mediaUrl,
+          mediaType: story.mediaType,
+          thumbnailUrl: story.thumbnailUrl,
+          textContent: story.textContent,
+          backgroundColor: story.backgroundColor,
+          expiresAt: story.expiresAt.toISOString(),
+          available: true,
+        },
         status: 'SENT',
         createdAt: chatMessage.createdAt.toISOString(),
         sender,

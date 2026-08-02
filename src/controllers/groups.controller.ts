@@ -9,6 +9,12 @@ import { pushNotificationService } from '../services/push-notification.service';
 import { cacheService } from '../services/cache.service';
 import { getIO } from '../sockets';
 import { buildGroupVisibilityWhere, canViewGroup } from '../utils/access-control.util';
+import {
+  areUsersBlocked,
+  assertUsersCanInteract,
+  getBlockedUserIds,
+  safetyErrorResponse,
+} from '../services/trust-safety.service';
 
 type GroupPrivacy = 'PUBLIC' | 'PRIVATE' | 'SECRET';
 type GroupMemberRole = 'OWNER' | 'ADMIN' | 'MODERATOR' | 'MEMBER';
@@ -848,6 +854,7 @@ export const getUserPendingInvites = async (
     }
 
     const userId = String(req.user.userId);
+    const blockedUserIds = await getBlockedUserIds(userId);
     await prisma.group_invites.updateMany({
       where: {
         invitedUserId: userId,
@@ -860,6 +867,7 @@ export const getUserPendingInvites = async (
     const invites = await prisma.group_invites.findMany({
       where: {
         invitedUserId: userId,
+        ...(blockedUserIds.length > 0 ? { invitedById: { notIn: blockedUserIds } } : {}),
         status: 'pending',
         expiresAt: { gt: new Date() },
       },
@@ -1199,6 +1207,7 @@ export const createGroupInvite = async (
       res.status(400).json({ error: 'You cannot invite yourself' });
       return;
     }
+    await assertUsersCanInteract(invitedById, invitedUserId, 'group invitation');
 
     const [group, inviterMembership, invitedUser, existingMembership] = await Promise.all([
       prisma.groups.findUnique({ where: { id: groupId }, select: { id: true, name: true, creatorId: true, memberCount: true, maxMembers: true } }),
@@ -1254,10 +1263,17 @@ export const createGroupInvite = async (
       },
     });
 
-    pushNotificationService.pushStudyGroupInvite(invitedUserId, group.name, 'Someone', groupId).catch(() => undefined);
+    if (!(await areUsersBlocked(invitedById, invitedUserId))) {
+      pushNotificationService.pushStudyGroupInvite(invitedUserId, group.name, 'Someone', groupId).catch(() => undefined);
+    }
 
     res.status(201).json({ invite: mapGroupInvite(invite) });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('Error creating group invite:', error);
     res.status(500).json({ error: 'Failed to create group invite' });
   }
@@ -1292,6 +1308,10 @@ export const respondToGroupInvite = async (
 
     if (!invite || invite.invitedUserId !== userId) {
       res.status(404).json({ error: 'Group invite not found' });
+      return;
+    }
+    if (await areUsersBlocked(userId, invite.invitedById)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false } as any);
       return;
     }
     if (invite.status !== 'pending') {

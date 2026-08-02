@@ -37,6 +37,7 @@ import {
 import { processConnectionAcceptedSideEffects } from '../services/connection-accepted-side-effects.service';
 import { socialProofService } from '../services/social-proof.service';
 import { isUUID } from '../utils/username.util';
+import { areUsersBlocked } from '../services/trust-safety.service';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -112,6 +113,14 @@ async function processNotificationDelivery(job: Job<{ event: { payload: Notifica
         messageId: payload.messageId,
         conversationId: payload.conversationId,
         messageCreatedAt: payload.messageCreatedAt,
+      });
+      return;
+    }
+    if (payload.senderId && await areUsersBlocked(payload.senderId, payload.userId)) {
+      logger.info({
+        event: 'chat.message.push_skipped_blocked',
+        messageId: payload.messageId,
+        conversationId: payload.conversationId,
       });
       return;
     }

@@ -267,7 +267,11 @@ const redisStartupPromise = shouldStartApiRedis()
 // Import activity service for engagement tracking
 import { recordActivity } from './services/activity.service';
 import { updateEngagementStreak } from './controllers/engagement.controller';
-import { safetyErrorResponse } from './services/trust-safety.service';
+import {
+  assertUsersCanInteract,
+  getBlockedUserIds,
+  safetyErrorResponse,
+} from './services/trust-safety.service';
 
 // Track user socket mappings
 const userSockets = new Map<string, Set<string>>(); // userId -> Set of socketIds
@@ -513,7 +517,7 @@ const emitToUser = (userId: string, event: string, data: any) => {
 // Peers who should receive chat presence updates for a user: recent conversation
 // partners plus accepted connections. Independent of location sharing.
 async function getChatPresencePeerIds(userId: string): Promise<string[]> {
-  const [conversations, connectionIds] = await Promise.all([
+  const [conversations, connectionIds, blockedUserIds] = await Promise.all([
     prisma.conversations.findMany({
       where: {
         OR: [
@@ -526,15 +530,16 @@ async function getChatPresencePeerIds(userId: string): Promise<string[]> {
       take: 300,
     }),
     getAcceptedConnectionIdsForRealtime(userId),
+    getBlockedUserIds(userId),
   ]);
 
-  const peerIds = new Set<string>(connectionIds);
+  const blockedSet = new Set(blockedUserIds);
+  const peerIds = new Set<string>(connectionIds.filter((peerId) => !blockedSet.has(peerId)));
   for (const conversation of conversations) {
-    peerIds.add(
-      conversation.participant1Id === userId
+    const peerId = conversation.participant1Id === userId
         ? conversation.participant2Id
-        : conversation.participant1Id
-    );
+        : conversation.participant1Id;
+    if (!blockedSet.has(peerId)) peerIds.add(peerId);
   }
   peerIds.delete(userId);
   return Array.from(peerIds);
@@ -1634,6 +1639,12 @@ io.on('connection', async (socket) => {
           socket.emit('error', { message: 'Conversation not found' });
           return;
         }
+        const peerId = await getConversationPeerId(conversationId, userId);
+        if (!peerId) {
+          socket.emit('error', { message: 'Conversation not found' });
+          return;
+        }
+        await assertUsersCanInteract(userId, peerId, 'conversation');
 
         socket.join(`chat:${conversationId}`);
         logger.info({
@@ -1646,6 +1657,11 @@ io.on('connection', async (socket) => {
         });
         void warmChatSendPath(conversationId, userId).catch(() => undefined);
       } catch (error) {
+        const safety = safetyErrorResponse(error);
+        if (safety) {
+          socket.emit('error', safety.body);
+          return;
+        }
         console.error('chat:join error:', error);
         socket.emit('error', { message: 'Failed to join conversation' });
       }
@@ -1773,6 +1789,7 @@ io.on('connection', async (socket) => {
     try {
       const peerId = await getConversationPeerId(targetConversationId, userId);
       if (!peerId) return;
+      await assertUsersCanInteract(userId, peerId, 'typing indicator');
       void warmChatSendPath(targetConversationId, userId).catch(() => undefined);
       if (!(await allowChatTypingBroadcast(userId, targetConversationId))) return;
 
@@ -1797,7 +1814,9 @@ io.on('connection', async (socket) => {
         isTyping: Boolean(isTyping),
       });
     } catch (error) {
-      console.error('chat:typing error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:typing error:', error);
     }
   });
 
@@ -1811,6 +1830,7 @@ io.on('connection', async (socket) => {
 
       const senderId = await getConversationPeerId(conversationId, userId);
       if (!senderId) return;
+      await assertUsersCanInteract(userId, senderId, 'read receipt');
 
       // Update unread messages for unread counts; premium only controls who can see receipts.
       const updated = await prisma.messages.updateMany({
@@ -1838,7 +1858,9 @@ io.on('connection', async (socket) => {
         });
       }
     } catch (error) {
-      console.error('chat:mark_read error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:mark_read error:', error);
     }
   });
 
@@ -1856,6 +1878,7 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Cannot delete this message' });
         return;
       }
+      await assertUsersCanInteract(userId, message.receiverId, 'message deletion');
 
       const actualConversationId = message.conversationId;
       if (forEveryone) {
@@ -1877,7 +1900,9 @@ io.on('connection', async (socket) => {
         forEveryone,
       });
     } catch (error) {
-      console.error('chat:delete_message error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:delete_message error:', error);
     }
   });
 
@@ -1899,6 +1924,7 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Cannot edit this message' });
         return;
       }
+      await assertUsersCanInteract(userId, message.receiverId, 'message edit');
 
       const editedAt = new Date();
       await prisma.messages.update({
@@ -1914,7 +1940,9 @@ io.on('connection', async (socket) => {
         editedAt,
       });
     } catch (error) {
-      console.error('chat:edit_message error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:edit_message error:', error);
     }
   });
 
@@ -1937,6 +1965,8 @@ io.on('connection', async (socket) => {
         return;
       }
       const conversationId = message.conversationId;
+      const peerId = message.senderId === userId ? message.receiverId : message.senderId;
+      await assertUsersCanInteract(userId, peerId, 'message reaction');
 
       const existingReaction = await prisma.message_reactions.findUnique({
         where: {
@@ -1975,7 +2005,9 @@ io.on('connection', async (socket) => {
         action,
       });
     } catch (error) {
-      console.error('chat:react error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:react error:', error);
     }
   });
 
@@ -1992,6 +2024,7 @@ io.on('connection', async (socket) => {
     try {
       const peerId = await getConversationPeerId(conversationId, userId);
       if (!peerId) return;
+      await assertUsersCanInteract(userId, peerId, 'delivery receipt');
 
       const now = new Date();
       const updated = await prisma.messages.updateMany({
@@ -2018,7 +2051,9 @@ io.on('connection', async (socket) => {
         deliveredAt: now,
       });
     } catch (error) {
-      console.error('chat:delivered error:', error);
+      const safety = safetyErrorResponse(error);
+      if (safety) socket.emit('error', safety.body);
+      else console.error('chat:delivered error:', error);
     }
   });
 
@@ -2032,6 +2067,7 @@ io.on('connection', async (socket) => {
     if (!targetUserId || targetUserId === requesterId) return;
 
     try {
+      await assertUsersCanInteract(requesterId, targetUserId, 'presence');
       const conversation = await prisma.conversations.findFirst({
         where: {
           OR: [
@@ -2070,7 +2106,8 @@ io.on('connection', async (socket) => {
         lastActiveAt: targetUser.lastActiveAt ? targetUser.lastActiveAt.toISOString() : null,
       });
     } catch (error) {
-      console.error('user:check_status error:', error);
+      const safety = safetyErrorResponse(error);
+      if (!safety) console.error('user:check_status error:', error);
     }
   });
 

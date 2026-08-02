@@ -4,9 +4,11 @@ import { canViewGroup, canViewPost } from '../utils/access-control.util';
 import {
   createUserBlockWithDeviceScope,
   enforceTrustTierLimit,
+  invalidateBlockedUserIdsCache,
   recordSafetyEvent,
   safetyErrorResponse,
 } from '../services/trust-safety.service';
+import { getIO } from '../sockets';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -37,6 +39,15 @@ const truncateText = (value: unknown, max = 1200): string | null => {
 
 const wantsBlockAfterReport = (raw: unknown): boolean => raw === true || raw === 'true';
 
+const emitSafetyStateChanged = (userIds: string[]): void => {
+  const io = getIO();
+  if (!io) return;
+  const payload = { reason: 'interaction_policy_changed', occurredAt: new Date().toISOString() };
+  Array.from(new Set(userIds.filter(Boolean))).forEach((userId) => {
+    io.to(`user:${userId}`).emit('safety:state_changed', payload);
+  });
+};
+
 const handleReportError = (res: Response, error: unknown, label: string): void => {
   const safety = safetyErrorResponse(error);
   if (safety) {
@@ -62,7 +73,7 @@ async function createReportWithSafety(params: {
       : Promise.resolve(0),
   ]);
 
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const canBlock = Boolean(
       params.blockUser &&
         params.reportedUserId &&
@@ -78,13 +89,15 @@ async function createReportWithSafety(params: {
       } as any,
     });
 
+    let blockEffects: Awaited<ReturnType<typeof createUserBlockWithDeviceScope>> | null = null;
     if (canBlock && params.reportedUserId) {
-      const { block, deviceScopeCount } = await createUserBlockWithDeviceScope({
+      blockEffects = await createUserBlockWithDeviceScope({
         blockerId: params.reporterId,
         blockedId: params.reportedUserId,
         reason: `Report ${row.id}`,
         tx,
       });
+      const { block, deviceScopeCount } = blockEffects;
       await recordSafetyEvent({
         actorId: params.reporterId,
         targetUserId: params.reportedUserId,
@@ -111,8 +124,14 @@ async function createReportWithSafety(params: {
       tx,
     });
 
-    return row;
+    return { row, blockEffects };
   });
+
+  if (result.blockEffects) {
+    await invalidateBlockedUserIdsCache(params.reporterId, ...result.blockEffects.affectedUserIds);
+    emitSafetyStateChanged([params.reporterId, ...result.blockEffects.affectedUserIds]);
+  }
+  return result.row;
 }
 
 export const getReportReasons = async (_req: Request, res: Response): Promise<void> => {
@@ -299,13 +318,14 @@ export const reportChat = async (req: AuthRequest, res: Response): Promise<void>
     if (existingOpenReport) {
       let blockedUserAfterReport = existingOpenReport.blockedUserAfterReport;
       if (wantsBlockAfterReport(blockUser) && !blockedUserAfterReport) {
-        await prisma.$transaction(async (tx) => {
-          const { block, deviceScopeCount } = await createUserBlockWithDeviceScope({
+        const blockEffects = await prisma.$transaction(async (tx) => {
+          const effects = await createUserBlockWithDeviceScope({
             blockerId: userId,
             blockedId: reportedUserId,
             reason: `Report ${existingOpenReport.id}`,
             tx,
           });
+          const { block, deviceScopeCount } = effects;
           await tx.moderation_reports.update({
             where: { id: existingOpenReport.id },
             data: { blockedUserAfterReport: true },
@@ -320,7 +340,10 @@ export const reportChat = async (req: AuthRequest, res: Response): Promise<void>
             metadata: { deviceScopeCount },
             tx,
           });
+          return effects;
         });
+        await invalidateBlockedUserIdsCache(userId, ...blockEffects.affectedUserIds);
+        emitSafetyStateChanged([userId, ...blockEffects.affectedUserIds]);
         blockedUserAfterReport = true;
       }
 

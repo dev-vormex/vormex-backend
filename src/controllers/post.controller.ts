@@ -45,7 +45,7 @@ import {
 } from '../utils/post.util';
 import { parseStoredMusicAttachment } from '../utils/music.util';
 import { buildPostVisibilityWhere, canViewPost } from '../utils/access-control.util';
-import { enforceTrustTierLimit, getBlockedUserIds, safetyErrorResponse } from '../services/trust-safety.service';
+import { assertUsersCanInteract, enforceTrustTierLimit, getBlockedUserIds, safetyErrorResponse } from '../services/trust-safety.service';
 import { selectManagedAdPlacements } from '../services/managed-ad.service';
 import {
   createStorageUploadIntent,
@@ -1014,7 +1014,7 @@ export const getPost = async (req: AuthRequest, res: Response): Promise<void> =>
     });
 
     if (!post) {
-      res.status(404).json({ error: 'Post not found' });
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
       return;
     }
 
@@ -1917,7 +1917,12 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const where = { postId: postId as string, parentId: parentId || null };
+    const blockedUserIds = await getBlockedUserIds(currentUserId);
+    const where = {
+      postId: postId as string,
+      parentId: parentId || null,
+      ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
+    };
     const [comments, total] = await Promise.all([
       prismaRead.post_comments.findMany({
         where,
@@ -1960,7 +1965,11 @@ export const getComments = async (req: AuthRequest, res: Response): Promise<void
     
     if (!parentId && topLevelCommentIds.length > 0) {
       const replies = await prismaRead.post_comments.findMany({
-        where: { postId: postId as string, parentId: { in: topLevelCommentIds } },
+        where: {
+          postId: postId as string,
+          parentId: { in: topLevelCommentIds },
+          ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
+        },
         include: {
           users: {
             select: {
@@ -2077,12 +2086,13 @@ export const createComment = async (req: AuthRequest, res: Response): Promise<vo
     if (parentId) {
       const parentComment = await prismaRead.post_comments.findFirst({
         where: { id: String(parentId), postId },
-        select: { id: true },
+        select: { id: true, authorId: true },
       });
       if (!parentComment) {
         res.status(400).json({ error: 'Parent comment is invalid for this post' });
         return;
       }
+      await assertUsersCanInteract(userId, parentComment.authorId, 'comment reply');
     }
 
     const { comment, commentsCount, mapped } = await prisma.$transaction(async (tx) => {
@@ -2245,6 +2255,7 @@ export const toggleCommentLike = async (req: AuthRequest, res: Response): Promis
       select: {
         id: true,
         postId: true,
+        authorId: true,
         posts: {
           select: { id: true, authorId: true, visibility: true, isActive: true },
         },
@@ -2255,6 +2266,7 @@ export const toggleCommentLike = async (req: AuthRequest, res: Response): Promis
       res.status(404).json({ error: 'Comment not found' });
       return;
     }
+    await assertUsersCanInteract(userId, comment.authorId, 'comment reaction');
 
     const existing = await prismaRead.comment_likes.findUnique({
       where: { commentId_userId: { commentId, userId } },
@@ -2303,6 +2315,11 @@ export const toggleCommentLike = async (req: AuthRequest, res: Response): Promis
 
     res.json({ isLiked: liked, liked, likesCount });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('toggleCommentLike error:', error);
     res.status(500).json({ error: 'Failed to toggle comment like' });
   }

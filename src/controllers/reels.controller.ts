@@ -26,6 +26,7 @@ import {
 } from '../utils/keyset-pagination.util';
 import { decorateSurfaceRecommendations } from '../services/surface-recommendation.service';
 import { recordAuthoritativeRecommendationOutcome } from '../services/recommendation-platform.service';
+import { areUsersBlocked, getBlockedUserIds } from '../services/trust-safety.service';
 
 interface AuthRequest extends Request {
   user?: { userId: string };
@@ -508,7 +509,7 @@ export const getReel = async (req: AuthRequest, res: Response): Promise<void> =>
     });
 
     if (!reel) {
-      res.status(404).json({ error: 'Reel not found' });
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
       return;
     }
 
@@ -543,7 +544,7 @@ export const getReelPreloadData = async (req: AuthRequest, res: Response): Promi
     });
 
     if (!reel || !(await canViewReel(reel, req.user?.userId))) {
-      res.status(404).json({ error: 'Reel not found or not ready' });
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
       return;
     }
 
@@ -595,7 +596,7 @@ export const getReelAudio = async (req: AuthRequest, res: Response): Promise<voi
     });
 
     if (!reel || !(await canViewReel(reel, req.user?.userId))) {
-      res.status(404).json({ error: 'Reel not found or not ready' });
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
       return;
     }
 
@@ -2396,10 +2397,12 @@ export const getReelsByHashtag = async (req: AuthRequest, res: Response): Promis
     const cursor = ensureString(req.query.cursor);
     const limit = Math.min(Math.max(parseInt(ensureString(req.query.limit) || '20', 10), 1), 50);
 
+    const blockedUserIds = currentUserId ? await getBlockedUserIds(currentUserId) : [];
     const whereClause: any = {
         status: 'ready',
         visibility: 'public',
         hashtags: { has: hashtag },
+        ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
     };
     const scope = `reels.hashtag:${hashtag}`;
     applyDateCursor(whereClause, cursor, scope);
@@ -2432,10 +2435,12 @@ export const getReelsByAudio = async (req: AuthRequest, res: Response): Promise<
     const cursor = ensureString(req.query.cursor);
     const limit = clampPageSize(req.query.limit, 20, 50);
 
+    const blockedUserIds = currentUserId ? await getBlockedUserIds(currentUserId) : [];
     const whereClause: any = {
         status: 'ready',
         visibility: 'public',
         audioId,
+        ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
     };
     const scope = `reels.audio:${audioId}`;
     applyDateCursor(whereClause, cursor, scope);
@@ -2467,6 +2472,11 @@ export const getUserReels = async (req: AuthRequest, res: Response): Promise<voi
     const userId = ensureString(req.params.userId);
     const cursor = ensureString(req.query.cursor);
     const limit = clampPageSize(req.query.limit, 20, 50);
+
+    if (currentUserId && currentUserId !== userId && await areUsersBlocked(currentUserId, userId)) {
+      res.status(404).json({ error: 'This resource is unavailable.', code: 'resource_unavailable', retryable: false });
+      return;
+    }
 
     const whereClause: any = {
       authorId: userId,

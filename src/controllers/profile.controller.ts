@@ -20,6 +20,7 @@ import {
   getPremiumProfileCustomizationFields,
 } from '../services/premium-feature-gates.service';
 import { reindexPublicProfile } from '../services/public-discovery.service';
+import { areUsersBlocked } from '../services/trust-safety.service';
 
 const PROFILE_BADGE_STYLES = new Set(['student', 'professional']);
 
@@ -70,6 +71,33 @@ function profileInterestArraysEqual(left: string[], right: string[]): boolean {
 
 const uniqueCacheTags = (tags: string[]): string[] => Array.from(new Set(tags.filter(Boolean)));
 
+const resolveProfileTargetId = async (userIdOrUsername: string): Promise<string | null> => {
+  const user = await prisma.user.findFirst({
+    where: isUUID(userIdOrUsername)
+      ? { id: userIdOrUsername }
+      : { username: userIdOrUsername.toLowerCase() },
+    select: { id: true },
+  });
+  return user?.id || null;
+};
+
+const isProfileUnavailable = async (
+  requestingUserId: string | null,
+  userIdOrUsername: string
+): Promise<boolean> => {
+  if (!requestingUserId) return false;
+  const targetId = await resolveProfileTargetId(userIdOrUsername);
+  return Boolean(targetId && targetId !== requestingUserId && await areUsersBlocked(requestingUserId, targetId));
+};
+
+const sendResourceUnavailable = (res: Response): void => {
+  res.status(404).json({
+    error: 'This resource is unavailable.',
+    code: 'resource_unavailable',
+    retryable: false,
+  });
+};
+
 /**
  * Get full user profile
  * GET /api/users/:userId/profile
@@ -105,6 +133,12 @@ export const getProfile = async (
         return;
       }
       userId = requestingUserId;
+    }
+
+    // Enforce the bilateral block boundary before either cached profile path.
+    if (await isProfileUnavailable(requestingUserId, userId)) {
+      sendResourceUnavailable(res);
+      return;
     }
 
     const includes = (ensureString(req.query.include) || '')
@@ -165,6 +199,11 @@ export const getProfileSections = async (
       userId = requestingUserId;
     }
 
+    if (await isProfileUnavailable(requestingUserId, userId)) {
+      sendResourceUnavailable(res);
+      return;
+    }
+
     const sections = await profileService.getProfileSections(userId);
     res.status(200).json(sections);
   } catch (error) {
@@ -217,6 +256,11 @@ export const getProfileFeed = async (
       userId = requestingUserId;
     }
 
+    if (await isProfileUnavailable(requestingUserId, userId)) {
+      sendResourceUnavailable(res);
+      return;
+    }
+
     // Validate filter
     const validFilters = ['all', 'posts', 'articles', 'forum', 'videos'];
     if (!validFilters.includes(filter)) {
@@ -237,6 +281,11 @@ export const getProfileFeed = async (
       res.status(404).json({
         error: 'User not found',
       });
+      return;
+    }
+
+    if (requestingUserId && user.id !== requestingUserId && await areUsersBlocked(requestingUserId, user.id)) {
+      sendResourceUnavailable(res);
       return;
     }
 
@@ -788,6 +837,7 @@ export const getUserActivity = async (
 ): Promise<void> => {
   try {
     let userId = ensureString(req.params.userId);
+    const requestingUserId = req.user?.userId ? String(req.user.userId) : null;
     const yearParam = ensureString(req.query.year);
 
     if (!userId) {
@@ -838,6 +888,11 @@ export const getUserActivity = async (
       return;
     }
 
+    if (requestingUserId && user.id !== requestingUserId && await areUsersBlocked(requestingUserId, user.id)) {
+      sendResourceUnavailable(res);
+      return;
+    }
+
     // Validate year is not before user joined
     if (year !== undefined) {
       const joinedYear = user.createdAt.getUTCFullYear();
@@ -873,6 +928,7 @@ export const getUserActivityYears = async (
 ): Promise<void> => {
   try {
     let userId = ensureString(req.params.userId);
+    const requestingUserId = req.user?.userId ? String(req.user.userId) : null;
 
     if (!userId) {
       res.status(400).json({
@@ -898,6 +954,11 @@ export const getUserActivityYears = async (
       res.status(404).json({
         error: 'User not found',
       });
+      return;
+    }
+
+    if (requestingUserId && user.id !== requestingUserId && await areUsersBlocked(requestingUserId, user.id)) {
+      sendResourceUnavailable(res);
       return;
     }
 

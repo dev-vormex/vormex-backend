@@ -1,6 +1,7 @@
 import { prisma } from '../config/prisma';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { getQueue } from '../infrastructure/queue/queues';
+import { getBlockedUserIds } from './trust-safety.service';
 
 export const CHAT_DELIVERY_RECONCILIATION_BATCH_SIZE = 500;
 export const CHAT_DELIVERY_RECONCILIATION_JOB = 'chat_delivery_reconcile';
@@ -19,8 +20,14 @@ export interface ChatDeliveryReconciliationResult {
 export async function reconcilePendingMessageDeliveries(
   userId: string
 ): Promise<ChatDeliveryReconciliationResult> {
+  const blockedUserIds = await getBlockedUserIds(userId);
   const pending = await prisma.messages.findMany({
-    where: { receiverId: userId, status: 'SENT', isDeleted: false },
+    where: {
+      receiverId: userId,
+      status: 'SENT',
+      isDeleted: false,
+      ...(blockedUserIds.length > 0 ? { senderId: { notIn: blockedUserIds } } : {}),
+    },
     select: { id: true, conversationId: true, senderId: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     take: CHAT_DELIVERY_RECONCILIATION_BATCH_SIZE + 1,

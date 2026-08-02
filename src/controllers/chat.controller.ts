@@ -20,7 +20,9 @@ import {
 import {
   assertUsersCanInteract,
   enforceTrustTierLimit,
+  getBlockedUserIds,
   publicTrustFields,
+  SafetyActionError,
   safetyErrorResponse,
   trustLevelRank,
 } from '../services/trust-safety.service';
@@ -73,6 +75,50 @@ function encodeChatSyncState(state: ChatSyncCursorState): string {
 interface AuthRequest extends Request {
   user?: { userId: string };
 }
+
+const unavailableConversationIdsForUser = async (userId: string): Promise<string[]> => {
+  const blockedUserIds = await getBlockedUserIds(userId);
+  if (blockedUserIds.length === 0) return [];
+  const rows = await prismaRead.conversations.findMany({
+    where: {
+      OR: [
+        { participant1Id: userId, participant2Id: { in: blockedUserIds } },
+        { participant1Id: { in: blockedUserIds }, participant2Id: userId },
+      ],
+    },
+    select: { id: true },
+  });
+  return rows.map((row) => row.id);
+};
+
+const blockedPeerIdsForUser = async (userId: string): Promise<string[]> => getBlockedUserIds(userId);
+
+const assertConversationReadAvailable = async (
+  conversation: { participant1Id: string; participant2Id: string },
+  viewerId: string
+): Promise<void> => {
+  const peerId = conversation.participant1Id === viewerId
+    ? conversation.participant2Id
+    : conversation.participant1Id;
+  try {
+    await assertUsersCanInteract(viewerId, peerId, 'conversation');
+  } catch (error) {
+    if (error instanceof SafetyActionError && error.code === 'user_blocked') {
+      throw new SafetyActionError('This resource is unavailable.', 'resource_unavailable', 404, undefined, false);
+    }
+    throw error;
+  }
+};
+
+const sendControllerError = (res: Response, error: unknown, fallback: string): void => {
+  const safety = safetyErrorResponse(error);
+  if (safety) {
+    res.status(safety.statusCode).json(safety.body);
+    return;
+  }
+  console.error(`${fallback}:`, error);
+  res.status(500).json({ error: fallback });
+};
 
 const userSelect = {
   id: true,
@@ -171,6 +217,35 @@ const toIsoString = (value: unknown): string | undefined => {
   return undefined;
 };
 
+type StoryMessageReference = {
+  storyId: string;
+  mediaUrl: string | null;
+  mediaType: string | null;
+  thumbnailUrl: string | null;
+  textContent: string | null;
+  backgroundColor: string | null;
+  expiresAt: string;
+};
+
+const parseStoryMessageReference = (value: unknown): StoryMessageReference | null => {
+  if (typeof value !== 'string' || !value.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<StoryMessageReference>;
+    if (!parsed.storyId || !parsed.expiresAt || Number.isNaN(Date.parse(parsed.expiresAt))) return null;
+    return {
+      storyId: parsed.storyId,
+      mediaUrl: parsed.mediaUrl ?? null,
+      mediaType: parsed.mediaType ?? null,
+      thumbnailUrl: parsed.thumbnailUrl ?? null,
+      textContent: parsed.textContent ?? null,
+      backgroundColor: parsed.backgroundColor ?? null,
+      expiresAt: parsed.expiresAt,
+    };
+  } catch {
+    return null;
+  }
+};
+
 // Memoized in chat-message.service: this check fans out into several queries
 // and runs on every conversation/messages list request.
 const getReadReceiptVisibility = getReadReceiptVisibilityCached;
@@ -195,6 +270,31 @@ const mapMessagePayload = (
     options.viewerUserId,
     Boolean(options.viewerCanUseReadReceipts)
   );
+  const isStoryMessage = visibleMessage.contentType === 'story_reply' || visibleMessage.contentType === 'story_reaction';
+  const storyMetadata = isStoryMessage ? parseStoryMessageReference(visibleMessage.fileName) : null;
+  const storyReference = isStoryMessage
+    ? storyMetadata
+      ? {
+          id: storyMetadata.storyId,
+          mediaUrl: storyMetadata.mediaUrl,
+          mediaType: storyMetadata.mediaType,
+          thumbnailUrl: storyMetadata.thumbnailUrl,
+          textContent: storyMetadata.textContent,
+          backgroundColor: storyMetadata.backgroundColor,
+          expiresAt: storyMetadata.expiresAt,
+          available: Date.parse(storyMetadata.expiresAt) > Date.now(),
+        }
+      : {
+          id: null,
+          mediaUrl: null,
+          mediaType: null,
+          thumbnailUrl: null,
+          textContent: null,
+          backgroundColor: null,
+          expiresAt: null,
+          available: false,
+        }
+    : undefined;
 
   return {
     id: visibleMessage.id,
@@ -216,6 +316,7 @@ const mapMessagePayload = (
     isDeleted: visibleMessage.isDeleted,
     replyToId: visibleMessage.replyToId,
     replyTo: (visibleMessage as typeof visibleMessage & { messages: unknown }).messages,
+    story: storyReference,
     sender: sender || buildFallbackChatUser(visibleMessage.senderId),
     reactions: reactions.map((reaction) => ({
       id: reaction.id,
@@ -259,11 +360,19 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
     const cursorValue = req.query.cursor as string | undefined;
     const cursor = decodeKeysetCursor(cursorValue, 'chat.conversations');
     const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
+    const blockedUserIds = await blockedPeerIdsForUser(req.user.userId);
+    const unavailableConversationIds = await unavailableConversationIdsForUser(req.user.userId);
 
     const whereClause: any = {
       OR: [
-        { participant1Id: req.user.userId },
-        { participant2Id: req.user.userId },
+        {
+          participant1Id: req.user.userId,
+          ...(blockedUserIds.length > 0 ? { participant2Id: { notIn: blockedUserIds } } : {}),
+        },
+        {
+          participant2Id: req.user.userId,
+          ...(blockedUserIds.length > 0 ? { participant1Id: { notIn: blockedUserIds } } : {}),
+        },
       ],
     };
 
@@ -357,6 +466,7 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
 
     res.status(200).json({
       conversations: formatted,
+      unavailableConversationIds,
       hasMore,
       nextCursor: hasMore && results.length > 0
         ? encodeKeysetCursor({
@@ -532,6 +642,15 @@ export const getConversationStatusWithUser = async (req: AuthRequest, res: Respo
       return;
     }
 
+    try {
+      await assertUsersCanInteract(req.user.userId, participantId, 'conversation');
+    } catch (error) {
+      if (error instanceof SafetyActionError && error.code === 'user_blocked') {
+        throw new SafetyActionError('This resource is unavailable.', 'resource_unavailable', 404, undefined, false);
+      }
+      throw error;
+    }
+
     const participant = await prismaRead.user.findUnique({
       where: { id: participantId },
       select: userSelect,
@@ -630,6 +749,11 @@ export const getConversationStatusWithUser = async (req: AuthRequest, res: Respo
       },
     });
   } catch (error) {
+    const safety = safetyErrorResponse(error);
+    if (safety) {
+      res.status(safety.statusCode).json(safety.body);
+      return;
+    }
     console.error('getConversationStatusWithUser error:', error);
     if (isPrismaConnectionError(error)) {
       res.status(503).json({ error: 'Database is temporarily unavailable. Please try again in a moment.' });
@@ -683,6 +807,8 @@ export const getConversation = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
+    await assertConversationReadAvailable(conversation, req.user.userId);
+
     const convWithRelations = conversation as typeof conversation & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown; messages: unknown[] };
     const viewerCanUseReadReceipts = await getReadReceiptVisibility(req.user.userId);
     const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
@@ -728,8 +854,7 @@ export const getConversation = async (req: AuthRequest, res: Response): Promise<
       updatedAt: conversation.updatedAt.toISOString(),
     });
   } catch (error) {
-    console.error('getConversation error:', error);
-    res.status(500).json({ error: 'Failed to get conversation' });
+    sendControllerError(res, error, 'Failed to get conversation');
   }
 };
 
@@ -740,6 +865,8 @@ export const syncChat = async (req: AuthRequest, res: Response): Promise<void> =
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+    const blockedUserIds = await blockedPeerIdsForUser(userId);
+    const unavailableConversationIds = await unavailableConversationIdsForUser(userId);
 
     const sinceValue = ensureString(req.query.since);
     if (!sinceValue) {
@@ -748,6 +875,7 @@ export const syncChat = async (req: AuthRequest, res: Response): Promise<void> =
         messages: [],
         statusChanges: [],
         conversations: [],
+        unavailableConversationIds,
         cursor: encodeChatSyncState({
           messages: { t: now, id: '' },
           conversations: { t: now, id: '' },
@@ -777,7 +905,18 @@ export const syncChat = async (req: AuthRequest, res: Response): Promise<void> =
       prismaRead.messages.findMany({
         where: {
           AND: [
-            { OR: [{ senderId: userId }, { receiverId: userId }] },
+            {
+              OR: [
+                {
+                  senderId: userId,
+                  ...(blockedUserIds.length > 0 ? { receiverId: { notIn: blockedUserIds } } : {}),
+                },
+                {
+                  receiverId: userId,
+                  ...(blockedUserIds.length > 0 ? { senderId: { notIn: blockedUserIds } } : {}),
+                },
+              ],
+            },
             ...(messageCursorWhere ? [messageCursorWhere] : []),
           ],
         },
@@ -793,7 +932,18 @@ export const syncChat = async (req: AuthRequest, res: Response): Promise<void> =
       prismaRead.conversations.findMany({
         where: {
           AND: [
-            { OR: [{ participant1Id: userId }, { participant2Id: userId }] },
+            {
+              OR: [
+                {
+                  participant1Id: userId,
+                  ...(blockedUserIds.length > 0 ? { participant2Id: { notIn: blockedUserIds } } : {}),
+                },
+                {
+                  participant2Id: userId,
+                  ...(blockedUserIds.length > 0 ? { participant1Id: { notIn: blockedUserIds } } : {}),
+                },
+              ],
+            },
             ...(conversationCursorWhere ? [conversationCursorWhere] : []),
           ],
         },
@@ -921,6 +1071,7 @@ export const syncChat = async (req: AuthRequest, res: Response): Promise<void> =
       messages: newMessages,
       statusChanges,
       conversations: formattedConversations,
+      unavailableConversationIds,
       cursor: encodeChatSyncState(nextState),
       hasMore,
     });
@@ -961,6 +1112,8 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Conversation not found' });
       return;
     }
+
+    await assertConversationReadAvailable(conversation, req.user.userId);
 
     const whereClause: any = { conversationId };
     const cursorWhere = createdAtDescKeysetWhere(cursor);
@@ -1017,8 +1170,7 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
         : undefined,
     });
   } catch (error) {
-    console.error('getMessages error:', error);
-    res.status(500).json({ error: 'Failed to get messages' });
+    sendControllerError(res, error, 'Failed to get messages');
   }
 };
 
@@ -1087,6 +1239,21 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       res.status(400).json({ error: 'Conversation ID is required' });
       return;
     }
+    const availabilityConversation = await prismaRead.conversations.findFirst({
+      where: {
+        id: conversationId,
+        OR: [{ participant1Id: req.user.userId }, { participant2Id: req.user.userId }],
+      },
+      select: { participant1Id: true, participant2Id: true },
+    });
+    if (!availabilityConversation) {
+      res.status(404).json({ error: 'Conversation not found' });
+      return;
+    }
+    const availabilityPeerId = availabilityConversation.participant1Id === req.user.userId
+      ? availabilityConversation.participant2Id
+      : availabilityConversation.participant1Id;
+    await assertUsersCanInteract(req.user.userId, availabilityPeerId, 'read receipt');
     const now = new Date();
     let realtimeEnvelopes: RealtimeEnvelope[] = [];
     let cacheTags: string[] = [];
@@ -1194,8 +1361,7 @@ export const markAsRead = async (req: AuthRequest, res: Response): Promise<void>
       readAt: now.toISOString(),
     });
   } catch (error) {
-    console.error('markAsRead error:', error);
-    res.status(500).json({ error: 'Failed to mark messages as read' });
+    sendControllerError(res, error, 'Failed to mark messages as read');
   }
 };
 
@@ -1226,6 +1392,7 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
       res.status(403).json({ error: 'Not authorized to delete this message' });
       return;
     }
+    await assertUsersCanInteract(req.user.userId, message.receiverId, 'message deletion');
 
     const realtimeEnvelopes: RealtimeEnvelope[] = [
       {
@@ -1272,8 +1439,7 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ success: true });
   } catch (error) {
-    console.error('deleteMessage error:', error);
-    res.status(500).json({ error: 'Failed to delete message' });
+    sendControllerError(res, error, 'Failed to delete message');
   }
 };
 
@@ -1371,6 +1537,7 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       res.status(403).json({ error: 'Not authorized to edit this message' });
       return;
     }
+    await assertUsersCanInteract(req.user.userId, message.receiverId, 'message edit');
 
     const senderRecord = await prismaRead.user.findUnique({
       where: { id: req.user.userId },
@@ -1438,8 +1605,7 @@ export const editMessage = async (req: AuthRequest, res: Response): Promise<void
       viewerCanUseReadReceipts,
     }));
   } catch (error) {
-    console.error('editMessage error:', error);
-    res.status(500).json({ error: 'Failed to edit message' });
+    sendControllerError(res, error, 'Failed to edit message');
   }
 };
 
@@ -1474,6 +1640,8 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Message not found' });
       return;
     }
+    const reactionPeerId = message.senderId === req.user.userId ? message.receiverId : message.senderId;
+    await assertUsersCanInteract(req.user.userId, reactionPeerId, 'message reaction');
 
     const existingReaction = await prisma.message_reactions.findUnique({
       where: {
@@ -1584,8 +1752,7 @@ export const addReaction = async (req: AuthRequest, res: Response): Promise<void
     emitRealtimeEnvelopes(realtimeEnvelopes);
     res.status(200).json({ action: 'added', emoji });
   } catch (error) {
-    console.error('addReaction error:', error);
-    res.status(500).json({ error: 'Failed to add reaction' });
+    sendControllerError(res, error, 'Failed to add reaction');
   }
 };
 
@@ -1596,9 +1763,11 @@ export const getUnreadCount = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const blockedUserIds = await blockedPeerIdsForUser(req.user.userId);
     const unreadCount = await prismaRead.messages.count({
       where: {
         receiverId: req.user.userId,
+        ...(blockedUserIds.length > 0 ? { senderId: { notIn: blockedUserIds } } : {}),
         status: { not: 'READ' },
       },
     });
@@ -1625,11 +1794,18 @@ export const searchMessages = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const blockedUserIds = await blockedPeerIdsForUser(req.user.userId);
     const conversations = await prismaRead.conversations.findMany({
       where: {
         OR: [
-          { participant1Id: req.user.userId },
-          { participant2Id: req.user.userId },
+          {
+            participant1Id: req.user.userId,
+            ...(blockedUserIds.length > 0 ? { participant2Id: { notIn: blockedUserIds } } : {}),
+          },
+          {
+            participant2Id: req.user.userId,
+            ...(blockedUserIds.length > 0 ? { participant1Id: { notIn: blockedUserIds } } : {}),
+          },
         ],
       },
       select: { id: true },
@@ -1672,6 +1848,8 @@ export const getMessageLimitStatus = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
+    await assertUsersCanInteract(req.user.userId, userId, 'message');
+
     const isConnected = await prismaRead.connections.findFirst({
       where: {
         status: 'accepted',
@@ -1711,8 +1889,7 @@ export const getMessageLimitStatus = async (req: AuthRequest, res: Response): Pr
       limit,
     });
   } catch (error) {
-    console.error('getMessageLimitStatus error:', error);
-    res.status(500).json({ error: 'Failed to get message limit status' });
+    sendControllerError(res, error, 'Failed to get message limit status');
   }
 };
 
@@ -1725,6 +1902,7 @@ export const getMessageRequests = async (req: AuthRequest, res: Response): Promi
 
     const limit = parseInt(req.query.limit as string) || 20;
     const cursor = req.query.cursor as string | undefined;
+    const blockedUserIds = await blockedPeerIdsForUser(req.user.userId);
 
     const myConnectionIds = await prismaRead.connections.findMany({
       where: {
@@ -1744,8 +1922,14 @@ export const getMessageRequests = async (req: AuthRequest, res: Response): Promi
 
     const whereClause: any = {
       OR: [
-        { participant1Id: req.user.userId },
-        { participant2Id: req.user.userId },
+        {
+          participant1Id: req.user.userId,
+          ...(blockedUserIds.length > 0 ? { participant2Id: { notIn: blockedUserIds } } : {}),
+        },
+        {
+          participant2Id: req.user.userId,
+          ...(blockedUserIds.length > 0 ? { participant1Id: { notIn: blockedUserIds } } : {}),
+        },
       ],
     };
 
@@ -1848,12 +2032,19 @@ export const getMessageRequestsCount = async (req: AuthRequest, res: Response): 
       myConnectionIds.flatMap((c) => [c.requesterId, c.addresseeId])
     );
     connectedUserIds.delete(req.user.userId);
+    const blockedUserIds = await blockedPeerIdsForUser(req.user.userId);
 
     const conversations = await prismaRead.conversations.findMany({
       where: {
         OR: [
-          { participant1Id: req.user.userId },
-          { participant2Id: req.user.userId },
+          {
+            participant1Id: req.user.userId,
+            ...(blockedUserIds.length > 0 ? { participant2Id: { notIn: blockedUserIds } } : {}),
+          },
+          {
+            participant2Id: req.user.userId,
+            ...(blockedUserIds.length > 0 ? { participant1Id: { notIn: blockedUserIds } } : {}),
+          },
         ],
       },
       select: { participant1Id: true, participant2Id: true },
@@ -1906,6 +2097,11 @@ export const acceptMessageRequest = async (req: AuthRequest, res: Response): Pro
       return;
     }
 
+    const requestPeerId = conversation.participant1Id === req.user.userId
+      ? conversation.participant2Id
+      : conversation.participant1Id;
+    await assertUsersCanInteract(req.user.userId, requestPeerId, 'message request');
+
     const convWithRelations = conversation as typeof conversation & { users_conversations_participant1IdTousers: unknown; users_conversations_participant2IdTousers: unknown };
     const premiumVisibilityByUser = await getChatPremiumVisibilityByUserIds([
       conversation.participant1Id,
@@ -1941,8 +2137,7 @@ export const acceptMessageRequest = async (req: AuthRequest, res: Response): Pro
       },
     });
   } catch (error) {
-    console.error('acceptMessageRequest error:', error);
-    res.status(500).json({ error: 'Failed to accept message request' });
+    sendControllerError(res, error, 'Failed to accept message request');
   }
 };
 

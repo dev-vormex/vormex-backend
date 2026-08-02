@@ -5,6 +5,7 @@
  */
 
 import { prisma } from '../config/prisma';
+import { areUsersBlocked } from './trust-safety.service';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { enqueueOutboxEvent } from '../outbox/service';
 import { cacheService } from './cache.service';
@@ -317,6 +318,9 @@ class NotificationService {
     if (actorId && actorId === userId) {
       return false;
     }
+    if (actorId && await areUsersBlocked(actorId, userId)) {
+      return false;
+    }
 
     try {
       await prisma.$transaction(async (tx) => {
@@ -356,6 +360,9 @@ class NotificationService {
   ): Promise<void> {
     const viewerId = viewer?.id;
     if (!userId || !viewerId || userId === viewerId) {
+      return;
+    }
+    if (await areUsersBlocked(viewerId, userId)) {
       return;
     }
 

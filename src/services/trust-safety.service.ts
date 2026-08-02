@@ -100,13 +100,21 @@ export class SafetyActionError extends Error {
   statusCode: number;
   code: string;
   retryAfterSeconds?: number;
+  retryable: boolean;
 
-  constructor(message: string, code: string, statusCode = 403, retryAfterSeconds?: number) {
+  constructor(
+    message: string,
+    code: string,
+    statusCode = 403,
+    retryAfterSeconds?: number,
+    retryable?: boolean
+  ) {
     super(message);
     this.name = 'SafetyActionError';
     this.code = code;
     this.statusCode = statusCode;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.retryable = retryable ?? (statusCode === 429 || statusCode >= 500);
   }
 }
 
@@ -499,9 +507,18 @@ export async function createUserBlockWithDeviceScope(params: {
   blockedId: string;
   reason?: string | null;
   tx?: PrismaClient | any;
-}): Promise<{ block: any; deviceScopeCount: number }> {
-  const client = db(params.tx);
-  const block = await client.user_blocks.upsert({
+}): Promise<{
+  block: any;
+  deviceScopeCount: number;
+  affectedUserIds: string[];
+  affectedConversationIds: string[];
+  connectionRemoved: boolean;
+  removedConnectionCount: number;
+  removedFollowCount: number;
+  removedNotificationCount: number;
+}> {
+  const execute = async (client: any) => {
+    const block = await client.user_blocks.upsert({
     where: {
       blockerId_blockedId: {
         blockerId: params.blockerId,
@@ -518,39 +535,136 @@ export async function createUserBlockWithDeviceScope(params: {
     },
   });
 
-  const blockedDevices = await client.user_devices.findMany({
+    const blockedDevices = await client.user_devices.findMany({
     where: { userId: params.blockedId },
     select: { installHash: true, platform: true },
     distinct: ['installHash'],
   });
-  const uniqueDevices = Array.from(
-    new Map(blockedDevices.map((device: any) => [device.installHash, device])).values()
-  ).filter((device: any) => Boolean(device.installHash));
+    const uniqueDevices = Array.from(
+      new Map(blockedDevices.map((device: any) => [device.installHash, device])).values()
+    ).filter((device: any) => Boolean(device.installHash));
 
-  await Promise.all(uniqueDevices.map((device: any) => (
-    client.user_block_device_scopes.upsert({
-      where: {
-        blockId_installHash: {
-          blockId: block.id,
-          installHash: device.installHash,
-        },
-      },
-      create: {
+    if (uniqueDevices.length > 0) {
+      await client.user_block_device_scopes.createMany({
+        data: uniqueDevices.map((device: any) => ({
         blockId: block.id,
         blockerId: params.blockerId,
         installHash: device.installHash,
         platform: device.platform || null,
-      },
-      update: {
-        platform: device.platform || null,
-      },
-    })
-  )));
+        })),
+        skipDuplicates: true,
+      });
+    }
+
+    const installHashes = uniqueDevices.map((device: any) => device.installHash);
+    const linkedUsers = installHashes.length > 0
+      ? await client.user_devices.findMany({
+          where: { installHash: { in: installHashes } },
+          select: { userId: true },
+          distinct: ['userId'],
+        })
+      : [];
+    const affectedUserIds = Array.from(new Set([
+      params.blockedId,
+      ...linkedUsers.map((row: any) => String(row.userId)),
+    ])).filter((id) => id && id !== params.blockerId);
+
+    const pairWhere = {
+      OR: [
+        { requesterId: params.blockerId, addresseeId: { in: affectedUserIds } },
+        { requesterId: { in: affectedUserIds }, addresseeId: params.blockerId },
+      ],
+    };
+    const followWhere = {
+      OR: [
+        { followerId: params.blockerId, followingId: { in: affectedUserIds } },
+        { followerId: { in: affectedUserIds }, followingId: params.blockerId },
+      ],
+    };
+    const conversationWhere = {
+      OR: [
+        { participant1Id: params.blockerId, participant2Id: { in: affectedUserIds } },
+        { participant1Id: { in: affectedUserIds }, participant2Id: params.blockerId },
+      ],
+    };
+
+    const [connectionsToDelete, followsToDelete, conversations] = await Promise.all([
+      client.connections.findMany({
+        where: pairWhere,
+        select: { id: true, requesterId: true, addresseeId: true, status: true },
+      }),
+      client.follows.findMany({
+        where: followWhere,
+        select: { id: true, followerId: true, followingId: true },
+      }),
+      client.conversations.findMany({ where: conversationWhere, select: { id: true } }),
+    ]);
+
+    const [deletedConnections, deletedFollows, deletedNotifications] = await Promise.all([
+      connectionsToDelete.length > 0
+        ? client.connections.deleteMany({ where: { id: { in: connectionsToDelete.map((row: any) => row.id) } } })
+        : Promise.resolve({ count: 0 }),
+      followsToDelete.length > 0
+        ? client.follows.deleteMany({ where: { id: { in: followsToDelete.map((row: any) => row.id) } } })
+        : Promise.resolve({ count: 0 }),
+      client.notifications.deleteMany({
+        where: {
+          OR: [
+            { userId: params.blockerId, actorId: { in: affectedUserIds } },
+            { userId: { in: affectedUserIds }, actorId: params.blockerId },
+          ],
+        },
+      }),
+    ]);
+
+    // Recompute only the users whose rows were affected. This keeps counters exact,
+    // cannot go below zero, and makes repeat block requests safely idempotent.
+    const counterUserIds = Array.from(new Set([
+      ...connectionsToDelete.flatMap((row: any) => [row.requesterId, row.addresseeId]),
+      ...followsToDelete.flatMap((row: any) => [row.followerId, row.followingId]),
+    ].filter(Boolean)));
+    await Promise.all(counterUserIds.map(async (userId) => {
+      const [connectionsCount, followersCount, followingCount] = await Promise.all([
+        client.connections.count({
+          where: {
+            status: 'accepted',
+            OR: [{ requesterId: userId }, { addresseeId: userId }],
+          },
+        }),
+        client.follows.count({ where: { followingId: userId } }),
+        client.follows.count({ where: { followerId: userId } }),
+      ]);
+      await client.userStats.updateMany({
+        where: { userId },
+        data: { connectionsCount, followersCount, followingCount },
+      });
+    }));
+
+    return {
+      block,
+      deviceScopeCount: uniqueDevices.length,
+      affectedUserIds,
+      affectedConversationIds: conversations.map((row: any) => String(row.id)),
+      connectionRemoved: connectionsToDelete.length > 0,
+      removedConnectionCount: deletedConnections.count,
+      removedFollowCount: deletedFollows.count,
+      removedNotificationCount: deletedNotifications.count,
+    };
+  };
+
+  const result = params.tx
+    ? await execute(db(params.tx))
+    : await prisma.$transaction((tx) => execute(tx), {
+        maxWait: 10_000,
+        timeout: 30_000,
+      });
 
   invalidateMessageInteractionCache(params.blockerId, params.blockedId);
-  await invalidateBlockedUserIdsCache(params.blockerId, params.blockedId);
+  if (!params.tx) {
+    await invalidateBlockedUserIdsCache(params.blockerId, ...result.affectedUserIds);
+  }
 
-  return { block, deviceScopeCount: uniqueDevices.length };
+  return result;
 }
 
 export async function findBlockBetween(userAId: string, userBId: string) {
@@ -658,6 +772,15 @@ export async function invalidateBlockedUserIdsCache(...userIds: string[]): Promi
       `safety:blocked:${userId}`,
       `feed:${userId}`,
       `stories:${userId}`,
+      `reels:${userId}`,
+      `reels:feed`,
+      `chat:user:${userId}`,
+      `profile:${userId}`,
+      `people:user:${userId}`,
+      `matching:user:${userId}`,
+      `notifications:${userId}`,
+      `relationships:${userId}`,
+      `user:${userId}`,
     ])
   );
 }
@@ -766,7 +889,7 @@ export async function getIdentityTrustLevelCached(userId: string): Promise<Ident
 
 export function safetyErrorResponse(error: unknown): {
   statusCode: number;
-  body: { error: string; code: string; retryAfterSeconds?: number };
+  body: { error: string; code: string; retryable: boolean; retryAfterSeconds?: number };
 } | null {
   if (!(error instanceof SafetyActionError)) return null;
   return {
@@ -774,6 +897,9 @@ export function safetyErrorResponse(error: unknown): {
     body: {
       error: error.message,
       code: error.code,
+      retryable: error.code === 'user_blocked' || error.code === 'resource_unavailable'
+        ? false
+        : error.retryable,
       retryAfterSeconds: error.retryAfterSeconds,
     },
   };

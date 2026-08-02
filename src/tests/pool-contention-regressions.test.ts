@@ -27,7 +27,7 @@ test('profile defaults to core and keeps the legacy bundle behind include=all', 
   const service = source('src/services/profile.service.ts');
   const core = service.slice(
     service.indexOf('export async function getCoreProfile'),
-    service.indexOf('/**\n * Get full profile')
+    service.indexOf('/**\n * Load the independently cacheable lower profile sections')
   );
 
   assert.match(controller, /includes\.includes\('all'\)/);
