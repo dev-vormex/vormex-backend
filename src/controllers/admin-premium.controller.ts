@@ -22,7 +22,7 @@ interface AuthRequest extends Request {
 }
 
 type PremiumUsersFilter = 'all' | 'premium' | 'overrides';
-type PremiumEventsFilter = 'all' | 'clicked' | 'failed' | 'success';
+type PremiumEventsFilter = 'all' | 'clicked' | 'failed' | 'success' | 'payments';
 
 const chatUserSelect = {
   id: true,
@@ -51,11 +51,36 @@ const mapEventFilterToWhere = (filter: PremiumEventsFilter) => {
   if (filter === 'failed') {
     return { outcome: 'failure' };
   }
+  if (filter === 'payments') {
+    return { eventType: 'CHECKOUT_VERIFIED', outcome: 'success' };
+  }
   if (filter === 'success') {
     return { outcome: 'success' };
   }
   return {};
 };
+
+const readMetadataString = (metadata: unknown, key: string): string | null => {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return null;
+  }
+  const value = (metadata as Record<string, unknown>)[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
+/**
+ * Payment references live in the event metadata JSON, so admin responses lift them into
+ * named fields. Without these, a verified payment cannot be reconciled against Razorpay.
+ */
+const buildEventPaymentRef = (metadata: unknown) => ({
+  provider: readMetadataString(metadata, 'provider'),
+  orderId: readMetadataString(metadata, 'orderId'),
+  paymentId: readMetadataString(metadata, 'paymentId'),
+  plan: readMetadataString(metadata, 'plan'),
+  billingCycle: readMetadataString(metadata, 'billingCycle'),
+  paymentMethod: readMetadataString(metadata, 'paymentMethod'),
+  source: readMetadataString(metadata, 'source'),
+});
 
 async function getOrCreateConversationForUsers(userId: string, otherUserId: string) {
   let conversation = await prisma.conversations.findFirst({
@@ -117,6 +142,10 @@ export const getPremiumAdminOverview = async (
     }
 
     const settings = await getOrCreateAppFeatureSettings();
+    const now = new Date();
+    const monthStart = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0)
+    );
     const [
       subscriptions,
       customPriceUsers,
@@ -125,11 +154,17 @@ export const getPremiumAdminOverview = async (
       clickCount,
       failureCount,
       successCount,
+      paymentTotals,
+      paymentTotalsThisMonth,
+      lastPayment,
     ] = await Promise.all([
       prisma.subscriptions.findMany({
         select: {
           plan: true,
           status: true,
+          provider: true,
+          amount: true,
+          currency: true,
           currentPeriodEnd: true,
           cancelledAt: true,
         },
@@ -166,11 +201,47 @@ export const getPremiumAdminOverview = async (
           outcome: 'success',
         },
       }),
+      prisma.premium_checkout_events.aggregate({
+        where: { eventType: 'CHECKOUT_VERIFIED', outcome: 'success' },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      prisma.premium_checkout_events.aggregate({
+        where: {
+          eventType: 'CHECKOUT_VERIFIED',
+          outcome: 'success',
+          createdAt: { gte: monthStart },
+        },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      prisma.premium_checkout_events.findFirst({
+        where: { eventType: 'CHECKOUT_VERIFIED', outcome: 'success' },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          createdAt: true,
+          amountMinor: true,
+          currency: true,
+          metadata: true,
+          user: { select: { id: true, name: true, email: true } },
+        },
+      }),
     ]);
 
     const activePremiumUsers = subscriptions.filter((subscription) =>
       isPremiumSubscriptionActive(subscription)
     ).length;
+    const paidSubscriptions = subscriptions.filter(
+      (subscription) =>
+        isPremiumSubscriptionActive(subscription) &&
+        ['razorpay', 'google_play'].includes(subscription.provider)
+    );
+    const activeRecurringRevenueMinor = paidSubscriptions.reduce(
+      (total, subscription) => total + (subscription.amount || 0),
+      0
+    );
+    const revenueMinor = paymentTotals._sum.amountMinor || 0;
+    const revenueThisMonthMinor = paymentTotalsThisMonth._sum.amountMinor || 0;
 
     res.json({
       settings: {
@@ -184,12 +255,41 @@ export const getPremiumAdminOverview = async (
       },
       stats: {
         activePremiumUsers,
+        paidPremiumUsers: paidSubscriptions.length,
         customPriceUsers,
         agentSelectedUsers,
         profileCustomizationGrantedUsers,
         clickCount,
         failureCount,
         successCount,
+        paymentCount: paymentTotals._count._all,
+        paymentCountThisMonth: paymentTotalsThisMonth._count._all,
+      },
+      revenue: {
+        currency: settings.premiumCurrency,
+        totalMinor: revenueMinor,
+        totalDisplay: formatCurrency(revenueMinor, settings.premiumCurrency),
+        thisMonthMinor: revenueThisMonthMinor,
+        thisMonthDisplay: formatCurrency(revenueThisMonthMinor, settings.premiumCurrency),
+        activeRecurringMinor: activeRecurringRevenueMinor,
+        activeRecurringDisplay: formatCurrency(
+          activeRecurringRevenueMinor,
+          settings.premiumCurrency
+        ),
+        lastPayment:
+          lastPayment == null
+            ? null
+            : {
+                createdAt: lastPayment.createdAt,
+                amountMinor: lastPayment.amountMinor,
+                currency: lastPayment.currency,
+                displayAmount:
+                  typeof lastPayment.amountMinor === 'number' && lastPayment.currency
+                    ? formatCurrency(lastPayment.amountMinor, lastPayment.currency)
+                    : null,
+                user: lastPayment.user,
+                ...buildEventPaymentRef(lastPayment.metadata),
+              },
       },
     });
   } catch (error) {
@@ -320,8 +420,10 @@ export const getPremiumAdminUsers = async (
             select: {
               plan: true,
               status: true,
+              provider: true,
               amount: true,
               currency: true,
+              billingCycle: true,
               currentPeriodStart: true,
               currentPeriodEnd: true,
               cancelledAt: true,
@@ -402,6 +504,16 @@ export const getPremiumAdminUsers = async (
           createdAt: user.createdAt,
           isPremium,
           premiumStatus: user.subscriptions?.status || 'inactive',
+          premiumPlan: user.subscriptions?.plan || 'free',
+          premiumProvider: user.subscriptions?.provider || null,
+          premiumBillingCycle: user.subscriptions?.billingCycle || null,
+          premiumPaidAmountDisplay:
+            typeof user.subscriptions?.amount === 'number'
+              ? formatCurrency(
+                  user.subscriptions.amount,
+                  user.subscriptions.currency || settings.premiumCurrency
+                )
+              : null,
           premiumStartedAt: user.subscriptions?.currentPeriodStart || null,
           premiumEndsAt,
           premiumDaysRemaining: isPremium ? getPremiumDaysRemaining(premiumEndsAt) : 0,
@@ -680,6 +792,7 @@ export const getPremiumAdminEvents = async (
           message: true,
           amountMinor: true,
           currency: true,
+          metadata: true,
           createdAt: true,
           user: {
             select: {
@@ -701,6 +814,7 @@ export const getPremiumAdminEvents = async (
           typeof event.amountMinor === 'number' && event.currency
             ? formatCurrency(event.amountMinor, event.currency)
             : null,
+        payment: buildEventPaymentRef(event.metadata),
       })),
       pagination: {
         page,
@@ -731,8 +845,18 @@ export const getPremiumAdminUserDetail = async (
       return;
     }
 
-    const [snapshot, user, agentMessagesAllTime, lastAgentMessage, premiumEventsCount, lastPremiumEvent, chatMessagesSent, conversationsCount] =
-      await Promise.all([
+    const [
+      snapshot,
+      user,
+      agentMessagesAllTime,
+      lastAgentMessage,
+      premiumEventsCount,
+      lastPremiumEvent,
+      chatMessagesSent,
+      conversationsCount,
+      paymentEvents,
+      paymentTotals,
+    ] = await Promise.all([
         getPremiumAccessSnapshot(userId),
         prisma.user.findUnique({
           where: { id: userId },
@@ -794,12 +918,31 @@ export const getPremiumAdminUserDetail = async (
             OR: [{ participant1Id: userId }, { participant2Id: userId }],
           },
         }),
+        prisma.premium_checkout_events.findMany({
+          where: { userId, eventType: 'CHECKOUT_VERIFIED', outcome: 'success' },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          select: {
+            id: true,
+            createdAt: true,
+            amountMinor: true,
+            currency: true,
+            metadata: true,
+          },
+        }),
+        prisma.premium_checkout_events.aggregate({
+          where: { userId, eventType: 'CHECKOUT_VERIFIED', outcome: 'success' },
+          _sum: { amountMinor: true },
+          _count: { _all: true },
+        }),
       ]);
 
     if (!user) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
+
+    const lifetimeValueMinor = paymentTotals._sum.amountMinor || 0;
 
     res.json({
       user: {
@@ -831,6 +974,42 @@ export const getPremiumAdminUserDetail = async (
         profileCustomizationBlocked: Boolean(snapshot.override?.profileCustomizationBlocked),
         canAccessProfileCustomization: snapshot.canAccessProfileCustomization,
         canCancelPremium: snapshot.canCancelPremium,
+        billing: {
+          plan: snapshot.subscription?.plan || 'free',
+          provider: snapshot.provider,
+          billingCycle: snapshot.subscription?.billingCycle || null,
+          amountMinor: snapshot.subscription?.amount ?? null,
+          currency: snapshot.subscription?.currency || snapshot.premiumCurrency,
+          amountDisplay:
+            typeof snapshot.subscription?.amount === 'number'
+              ? formatCurrency(
+                  snapshot.subscription.amount,
+                  snapshot.subscription.currency || snapshot.premiumCurrency
+                )
+              : null,
+          autoPayEnabled: snapshot.autoPayEnabled,
+          currentPeriodStart: snapshot.premiumStartedAt,
+          currentPeriodEnd: snapshot.premiumEndsAt,
+          lastProviderSyncAt: snapshot.subscription?.lastProviderSyncAt || null,
+          googlePlayProductId: snapshot.subscription?.googlePlayProductId || null,
+          paymentCount: paymentTotals._count._all,
+          lifetimeValueMinor,
+          lifetimeValueDisplay: formatCurrency(
+            lifetimeValueMinor,
+            snapshot.subscription?.currency || snapshot.premiumCurrency
+          ),
+          payments: paymentEvents.map((event) => ({
+            id: event.id,
+            createdAt: event.createdAt,
+            amountMinor: event.amountMinor,
+            currency: event.currency,
+            displayAmount:
+              typeof event.amountMinor === 'number' && event.currency
+                ? formatCurrency(event.amountMinor, event.currency)
+                : null,
+            ...buildEventPaymentRef(event.metadata),
+          })),
+        },
         usage: {
           creditsUsedCurrentCycle: snapshot.creditsUsed,
           agentMessagesAllTime,

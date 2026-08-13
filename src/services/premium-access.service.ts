@@ -41,7 +41,12 @@ const DEFAULT_AGENT_PROMPT_LIMIT = 5;
 const DEFAULT_YEARLY_PREMIUM_AMOUNT_MINOR = 99900;
 const DEFAULT_CREATOR_PRO_MONTHLY_AMOUNT_MINOR = 49900;
 const DEFAULT_CREATOR_PRO_YEARLY_AMOUNT_MINOR = 299900;
-const DEVELOPER_PREMIUM_PROVIDER = 'developer_override';
+/**
+ * Provider value written by the removed developer/test premium override. Rows that still
+ * carry it are leftover test grants, so they are treated as inactive everywhere premium
+ * access is evaluated. Real access must come from a captured Razorpay or Google Play payment.
+ */
+export const LEGACY_TEST_PREMIUM_PROVIDER = 'developer_override';
 
 export const ACTIVE_PREMIUM_STATUSES = new Set(['active', 'captured', 'authorized']);
 
@@ -110,10 +115,10 @@ export interface PremiumCheckoutEventInput {
     | 'CHECKOUT_FAILED'
     | 'CHECKOUT_BLOCKED'
     | 'CHECKOUT_VERIFIED'
+    | 'CHECKOUT_WEBHOOK'
     | 'SUBSCRIPTION_CANCELLED'
     | 'ADMIN_CANCELLED_SUBSCRIPTION'
-    | 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED'
-    | 'DEVELOPER_CREATOR_PRO_OVERRIDE_UPDATED'
+    | 'TEST_PREMIUM_REVOKED'
     | 'PROFILE_BOOST_ACTIVATED';
   outcome?: 'info' | 'success' | 'failure';
   message?: string;
@@ -249,47 +254,10 @@ export function getPremiumSupportLabel() {
   return DEFAULT_SUPPORT_LABEL;
 }
 
-export function isDeveloperPremiumOverrideAvailable() {
-  const explicitFlag = String(process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE || '')
-    .trim()
-    .toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(explicitFlag)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'off'].includes(explicitFlag)) {
-    return false;
-  }
-
-  return process.env.NODE_ENV !== 'production';
-}
-
-function getAdminAllowedEmailSet() {
-  return new Set(
-    String(process.env.ADMIN_ALLOWED_EMAILS || '')
-      .split(',')
-      .map((email) => email.trim().toLowerCase())
-      .filter(Boolean)
-  );
-}
-
-export function isDeveloperPremiumOverrideAvailableForUser(
-  user: Pick<AccessUserRecord, 'email' | 'isAdmin'> | null | undefined
-) {
-  if (isDeveloperPremiumOverrideAvailable()) {
-    return true;
-  }
-
-  if (!user) {
-    return false;
-  }
-
-  return user.isAdmin || getAdminAllowedEmailSet().has(user.email.trim().toLowerCase());
-}
-
-export function isDeveloperPremiumOverrideSubscription(
+export function isLegacyTestPremiumSubscription(
   subscription: Pick<NonNullable<SubscriptionRecord>, 'provider'> | null | undefined
 ) {
-  return subscription?.provider === DEVELOPER_PREMIUM_PROVIDER;
+  return subscription?.provider === LEGACY_TEST_PREMIUM_PROVIDER;
 }
 
 export function getAgentPromptLimit() {
@@ -453,13 +421,17 @@ export function isPremiumSubscriptionActive(
   subscription:
     | Pick<
         NonNullable<SubscriptionRecord>,
-        'plan' | 'status' | 'currentPeriodEnd' | 'cancelledAt'
+        'plan' | 'status' | 'provider' | 'currentPeriodEnd' | 'cancelledAt'
       >
     | null
     | undefined,
   now = new Date()
 ) {
   if (!subscription) {
+    return false;
+  }
+
+  if (isLegacyTestPremiumSubscription(subscription)) {
     return false;
   }
 
@@ -481,13 +453,17 @@ export function isCreatorProSubscriptionActive(
   subscription:
     | Pick<
         NonNullable<SubscriptionRecord>,
-        'plan' | 'status' | 'currentPeriodEnd' | 'cancelledAt'
+        'plan' | 'status' | 'provider' | 'currentPeriodEnd' | 'cancelledAt'
       >
     | null
     | undefined,
   now = new Date()
 ) {
   if (!subscription) {
+    return false;
+  }
+
+  if (isLegacyTestPremiumSubscription(subscription)) {
     return false;
   }
 
@@ -546,103 +522,32 @@ export async function cancelPremiumSubscription(
   });
 }
 
-export async function setDeveloperPremiumOverride(
-  userId: string,
-  enabled: boolean,
-  plan = getPremiumPlan()
-): Promise<SubscriptionRecord | null> {
+/**
+ * Revokes any premium row that was created by the removed test/developer override so
+ * leftover grants stop unlocking paid features. Returns the number of rows revoked.
+ */
+export async function revokeLegacyTestPremiumSubscriptions(): Promise<string[]> {
   const now = new Date();
-  const existing = await prisma.subscriptions.findUnique({ where: { userId } });
-  const overridePlan = normalizePremiumCheckoutPlan(plan);
+  const legacyRows = await prisma.subscriptions.findMany({
+    where: { provider: LEGACY_TEST_PREMIUM_PROVIDER },
+    select: { userId: true },
+  });
 
-  if (enabled) {
-    if (
-      existing &&
-      !isDeveloperPremiumOverrideSubscription(existing) &&
-      isPremiumSubscriptionActive(existing, now)
-    ) {
-      return existing;
-    }
-
-    const currentPeriodEnd = getPremiumPeriodEnd(
-      now,
-      getPremiumDurationDaysForBillingCycle('yearly')
-    );
-
-    const subscription = await prisma.subscriptions.upsert({
-      where: { userId },
-      create: {
-        id: randomUUID(),
-        userId,
-        plan: overridePlan,
-        status: 'active',
-        amount: 0,
-        currency: getDefaultPremiumCurrency(),
-        billingCycle: 'yearly',
-        provider: DEVELOPER_PREMIUM_PROVIDER,
-        currentPeriodStart: now,
-        currentPeriodEnd,
-        cancelledAt: null,
-        trialEndsAt: null,
-        razorpaySubscriptionId: null,
-        razorpayCustomerId: null,
-        razorpayPlanId: null,
-        googlePlayPurchaseToken: null,
-        googlePlayOrderId: null,
-        googlePlayProductId: null,
-        googlePlayBasePlanId: null,
-        googlePlaySubscriptionState: null,
-        googlePlayAcknowledgementState: null,
-        lastProviderSyncAt: now,
-      },
-      update: {
-        plan: overridePlan,
-        status: 'active',
-        amount: 0,
-        currency: getDefaultPremiumCurrency(),
-        billingCycle: 'yearly',
-        provider: DEVELOPER_PREMIUM_PROVIDER,
-        currentPeriodStart: now,
-        currentPeriodEnd,
-        cancelledAt: null,
-        trialEndsAt: null,
-        razorpaySubscriptionId: null,
-        razorpayCustomerId: null,
-        razorpayPlanId: null,
-        googlePlayPurchaseToken: null,
-        googlePlayOrderId: null,
-        googlePlayProductId: null,
-        googlePlayBasePlanId: null,
-        googlePlaySubscriptionState: null,
-        googlePlayAcknowledgementState: null,
-        lastProviderSyncAt: now,
-      },
-    });
-
-    await prisma.user_feature_access_overrides.updateMany({
-      where: { userId },
-      data: {
-        agentBlocked: false,
-        profileCustomizationBlocked: false,
-      },
-    });
-
-    return subscription;
+  if (legacyRows.length === 0) {
+    return [];
   }
 
-  if (!existing || !isDeveloperPremiumOverrideSubscription(existing)) {
-    return existing;
-  }
-
-  return prisma.subscriptions.update({
-    where: { userId },
+  await prisma.subscriptions.updateMany({
+    where: { provider: LEGACY_TEST_PREMIUM_PROVIDER },
     data: {
-      status: 'cancelled',
+      status: 'revoked',
       currentPeriodEnd: now,
       cancelledAt: now,
       lastProviderSyncAt: now,
     },
   });
+
+  return legacyRows.map((row) => row.userId);
 }
 
 export async function getPremiumAccessSnapshot(userId: string): Promise<PremiumAccessSnapshot> {
@@ -812,9 +717,6 @@ export function serializePremiumSubscription(
     googlePlayProductId: snapshot.subscription?.googlePlayProductId || null,
     googlePlayBasePlanId: snapshot.subscription?.googlePlayBasePlanId || null,
     googlePlaySubscriptionState: snapshot.subscription?.googlePlaySubscriptionState || null,
-    developerPremiumOverrideAvailable: isDeveloperPremiumOverrideAvailableForUser(snapshot.user),
-    developerPremiumOverrideActive:
-      snapshot.isPremium && isDeveloperPremiumOverrideSubscription(snapshot.subscription),
     planOptions: getPremiumPlanOptions(snapshot.premiumCurrency),
     creatorPro: {
       plan: getCreatorProPlan(),

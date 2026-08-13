@@ -46,6 +46,45 @@ test('person cards and mutations expose canonical relationship state', () => {
   assert.match(connections, /message: 'Connection request already accepted'/);
 });
 
+test('withdrawing a request settles the relationship instead of failing on a stale id', () => {
+  const connections = source('src/controllers/connection.controller.ts');
+  const routes = source('src/routes/connection.routes.ts');
+  const block = connections.slice(
+    connections.indexOf('const withdrawSentRequest'),
+    connections.indexOf('export const cancelConnectionRequest')
+  );
+
+  /*
+   * Cancelling used to 404 on a missing row and 400 on a non-pending one. Both
+   * clients read any non-2xx as "the cancel failed" and roll back to Pending, so
+   * an id that had outlived its row — a cached profile payload, a second tab that
+   * already cancelled — left a Pending button that no retry could ever clear.
+   */
+  assert.doesNotMatch(block, /res\.status\(404\)/);
+  assert.match(block, /if \(!connection\) \{\s*res\.status\(200\)/);
+  assert.match(block, /message: 'Connection request already cancelled'/);
+  assert.match(block, /connection\.status !== 'pending'[\s\S]{0,120}res\.status\(200\)/);
+
+  // "Nothing of yours to withdraw" still describes where the pair stands, so the
+  // client repaints instead of reverting to a phantom Pending. Only a row that
+  // belongs to neither party is a real authorization failure.
+  assert.match(block, /message: 'Already connected'[\s\S]{0,120}canonicalRelationship\('connected'/);
+  assert.match(block, /message: 'Connection request was sent to you'/);
+  assert.equal((block.match(/res\.status\(403\)/g) || []).length, 1);
+
+  // A surface that never learned the id can still withdraw by recipient, and the
+  // literal segment has to be declared before the bare `/:connectionId` delete.
+  assert.match(connections, /export const cancelSentRequestToUser/);
+  assert.ok(
+    routes.indexOf(`delete('/user/:userId/request'`) < routes.indexOf(`delete('/:connectionId'`),
+    'by-user cancel must be declared before the catch-all connection id delete'
+  );
+
+  // Deleting under the requester+pending predicate keeps a concurrent accept
+  // from being withdrawn out from under the other side.
+  assert.match(block, /deleteMany\(\{[\s\S]{0,200}requesterId: viewerId, status: 'pending'/);
+});
+
 test('profile sections remain separate from feed and activity endpoints', () => {
   const service = source('src/services/profile.service.ts');
   const routes = source('src/routes/profile.routes.ts');

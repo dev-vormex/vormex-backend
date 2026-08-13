@@ -23,6 +23,7 @@ export type RazorpayPaymentEntity = {
   amount_refunded?: number;
   captured?: boolean;
   currency?: string;
+  method?: string;
   order_id?: string;
   refund_status?: string | null;
   status?: string;
@@ -66,6 +67,32 @@ export function verifyRazorpaySignature(
     .digest('hex');
 
   const expected = Buffer.from(generatedSignature, 'utf8');
+  const received = Buffer.from(signature, 'utf8');
+
+  if (expected.length !== received.length) {
+    return false;
+  }
+
+  return timingSafeEqual(expected, received);
+}
+
+/**
+ * Razorpay signs webhook deliveries with an HMAC of the exact raw request body, so callers
+ * must pass the untouched buffer rather than a re-serialized object.
+ */
+export function verifyRazorpayWebhookSignature(
+  rawBody: Buffer | string,
+  signature: string | undefined,
+  secret: string | undefined
+): boolean {
+  if (!secret || !signature) {
+    return false;
+  }
+
+  const expected = Buffer.from(
+    createHmac('sha256', secret).update(rawBody).digest('hex'),
+    'utf8'
+  );
   const received = Buffer.from(signature, 'utf8');
 
   if (expected.length !== received.length) {

@@ -10,6 +10,7 @@ import {
 } from '../middleware/upload-security.middleware';
 import {
   getFeed,
+  recordFeedImpressions,
   getPost,
   createPost,
   updatePost,
@@ -73,6 +74,8 @@ router.use(authenticate);
 
 // Feed
 router.get('/feed', getFeed);
+// Declared before the '/:postId' patterns so the literal segment wins.
+router.post('/feed/impressions', recordFeedImpressions);
 
 // CRUD
 router.post('/upload-url', mediaWriteLimit, getPostUploadUrl);

@@ -1,34 +1,30 @@
-import { randomUUID } from 'crypto';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { isThirdPartyHttpError } from '../utils/http-client-with-breaker.util';
+import { verifyRazorpaySignature } from '../services/premium-checkout.service';
 import {
-  isThirdPartyHttpError,
-  requestWithBreaker,
-} from '../utils/http-client-with-breaker.util';
-import {
-  type PremiumPlanConfig,
-  type RazorpayOrderEntity,
-  type RazorpayPaymentEntity,
-  validatePremiumCheckoutPayment,
-  verifyRazorpaySignature,
-} from '../services/premium-checkout.service';
+  activatePremiumFromRazorpayPayment,
+  createRazorpayOrder,
+  fetchRazorpayOrder,
+  fetchRazorpayPayment,
+  getRazorpayWebhookSecret,
+  invalidatePremiumEntitlementCaches,
+  isRazorpayConfigured,
+  readOrderUserId,
+  verifyRazorpayWebhookSignature,
+} from '../services/premium-razorpay.service';
 import {
   buildPremiumPlanConfig,
   cancelPremiumSubscription,
   formatCurrency,
-  getCreatorProPlan,
   getPremiumAccessSnapshot,
   getPremiumDurationDaysForBillingCycle,
-  getPremiumPlan,
-  getPremiumPeriodEnd,
-  isDeveloperPremiumOverrideAvailableForUser,
   isCreatorProPlan,
   logPremiumCheckoutEvent,
   normalizePremiumCheckoutPlan,
   normalizePremiumBillingCycle,
   serializePremiumSubscription,
-  setDeveloperPremiumOverride,
 } from '../services/premium-access.service';
 import {
   activateProfileBoostForUser,
@@ -41,7 +37,6 @@ import {
   verifyGooglePlayPremiumPurchase,
 } from '../services/google-play-premium.service';
 import { FREE_CONNECTION_REQUESTS_PER_DAY } from '../services/tier-limits.service';
-import { cacheService } from '../services/cache.service';
 import {
   getCreatorProState,
   updateCreatorProSettings,
@@ -51,20 +46,15 @@ interface AuthRequest extends Request {
   user?: { userId: string };
 }
 
-function invalidatePremiumEntitlementCaches(userId: string, label: string): void {
-  cacheService
-    .invalidateTags(
-      'people:global',
-      'matching:global',
-      'feed:global',
-      `people:user:${userId}`,
-      `matching:user:${userId}`,
-      `chat:user:${userId}`,
-      `feed:${userId}`,
-      `user:${userId}`
-    )
-    .catch((error) => console.error(`${label} cache invalidation failed:`, error));
-}
+type WebhookRequest = Request & { rawBody?: Buffer };
+
+type RazorpayWebhookPayload = {
+  event?: string;
+  payload?: {
+    payment?: { entity?: { id?: string; order_id?: string } };
+    order?: { entity?: { id?: string } };
+  };
+};
 
 type SafeRazorpayError = {
   statusCode: number;
@@ -74,23 +64,8 @@ type SafeRazorpayError = {
   metadata: { [key: string]: string | number | null };
 };
 
-function isRazorpayConfigured() {
-  return Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
-}
-
 function isPremiumCheckoutConfigured() {
   return isRazorpayConfigured() || isGooglePlayPremiumConfigured();
-}
-
-function getRazorpayAuth() {
-  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
-    throw new Error('Razorpay is not configured on the server.');
-  }
-
-  return {
-    username: process.env.RAZORPAY_KEY_ID,
-    password: process.env.RAZORPAY_KEY_SECRET,
-  };
 }
 
 function getRazorpayResponseError(error: unknown) {
@@ -222,24 +197,6 @@ function getSafeRazorpayError(error: unknown): SafeRazorpayError {
     logMessage: providerDescription || `Razorpay checkout failed with status ${providerStatus}.`,
     metadata,
   };
-}
-
-async function fetchRazorpayOrder(orderId: string) {
-  const response = await requestWithBreaker<RazorpayOrderEntity>('razorpay', 'fetch_order', {
-    method: 'GET',
-    url: `https://api.razorpay.com/v1/orders/${orderId}`,
-    auth: getRazorpayAuth(),
-  }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
-  return response.data;
-}
-
-async function fetchRazorpayPayment(paymentId: string) {
-  const response = await requestWithBreaker<RazorpayPaymentEntity>('razorpay', 'fetch_payment', {
-    method: 'GET',
-    url: `https://api.razorpay.com/v1/payments/${paymentId}`,
-    auth: getRazorpayAuth(),
-  }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
-  return response.data;
 }
 
 export const getPremiumSubscription = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -388,17 +345,7 @@ export const activateMyProfileBoost = async (req: AuthRequest, res: Response): P
       },
     });
 
-    cacheService
-      .invalidateTags(
-        'people:global',
-        'matching:global',
-        'feed:global',
-        `people:user:${userId}`,
-        `matching:user:${userId}`,
-        `feed:${userId}`,
-        `user:${userId}`
-      )
-      .catch((error) => console.error('profile boost cache invalidation failed:', error));
+    invalidatePremiumEntitlementCaches(userId, 'profile boost');
 
     const [snapshot, profileBoost] = await Promise.all([
       getPremiumAccessSnapshot(userId),
@@ -417,145 +364,6 @@ export const activateMyProfileBoost = async (req: AuthRequest, res: Response): P
   } catch (error) {
     console.error('Failed to activate profile boost', error);
     res.status(500).json({ error: 'Failed to activate profile boost' });
-  }
-};
-
-export const setDeveloperPremiumOverrideForMe = async (
-  req: AuthRequest,
-  res: Response
-): Promise<void> => {
-  try {
-    const userId = req.user?.userId;
-
-    if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
-      return;
-    }
-
-    const currentSnapshot = await getPremiumAccessSnapshot(userId);
-    if (!isDeveloperPremiumOverrideAvailableForUser(currentSnapshot.user)) {
-      res.status(403).json({
-        error: 'Developer premium override is not enabled on this server.',
-        code: 'developer_premium_override_disabled',
-      });
-      return;
-    }
-
-    if (typeof req.body?.enabled !== 'boolean') {
-      res.status(400).json({
-        error: 'enabled must be a boolean.',
-        code: 'developer_premium_override_invalid_payload',
-      });
-      return;
-    }
-
-    await setDeveloperPremiumOverride(userId, req.body.enabled);
-    await logPremiumCheckoutEvent({
-      userId,
-      eventType: 'DEVELOPER_PREMIUM_OVERRIDE_UPDATED',
-      outcome: 'success',
-      message: req.body.enabled
-        ? 'Developer premium override enabled.'
-        : 'Developer premium override disabled.',
-      metadata: {
-        enabled: req.body.enabled,
-      },
-    });
-    invalidatePremiumEntitlementCaches(userId, 'premium override');
-
-    const [snapshot, profileBoost] = await Promise.all([
-      getPremiumAccessSnapshot(userId),
-      getMyProfileBoostState(userId),
-    ]);
-    res.json({
-      message: snapshot.isPremium
-        ? 'Premium mode is on for this account.'
-        : 'Premium mode is off for this account.',
-      subscription: {
-        ...serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()),
-        entitlements: getPremiumEntitlements(FREE_CONNECTION_REQUESTS_PER_DAY),
-        profileBoost,
-      },
-    });
-  } catch (error) {
-    console.error('Failed to update developer premium override', error);
-    res.status(500).json({ error: 'Failed to update premium mode' });
-  }
-};
-
-export const setDeveloperCreatorProOverrideForMe = async (
-  req: AuthRequest,
-  res: Response
-): Promise<void> => {
-  try {
-    const userId = req.user?.userId;
-
-    if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
-      return;
-    }
-
-    const currentSnapshot = await getPremiumAccessSnapshot(userId);
-    if (!isDeveloperPremiumOverrideAvailableForUser(currentSnapshot.user)) {
-      res.status(403).json({
-        error: 'Developer Creator Pro override is not enabled on this server.',
-        code: 'developer_creator_pro_override_disabled',
-      });
-      return;
-    }
-
-    if (typeof req.body?.enabled !== 'boolean') {
-      res.status(400).json({
-        error: 'enabled must be a boolean.',
-        code: 'developer_creator_pro_override_invalid_payload',
-      });
-      return;
-    }
-
-    await setDeveloperPremiumOverride(userId, req.body.enabled, getCreatorProPlan());
-    await logPremiumCheckoutEvent({
-      userId,
-      eventType: 'DEVELOPER_CREATOR_PRO_OVERRIDE_UPDATED',
-      outcome: 'success',
-      message: req.body.enabled
-        ? 'Developer Creator Pro override enabled.'
-        : 'Developer Creator Pro override disabled.',
-      metadata: {
-        enabled: req.body.enabled,
-      },
-    });
-
-    cacheService
-      .invalidateTags(
-        'people:global',
-        'matching:global',
-        'feed:global',
-        `people:user:${userId}`,
-        `matching:user:${userId}`,
-        `feed:${userId}`,
-        `user:${userId}`
-      )
-      .catch((error) => console.error('creator pro override cache invalidation failed:', error));
-
-    const [snapshot, profileBoost, creatorProState] = await Promise.all([
-      getPremiumAccessSnapshot(userId),
-      getMyProfileBoostState(userId),
-      getCreatorProState(userId),
-    ]);
-    res.json({
-      message: snapshot.isCreatorPro
-        ? 'Creator Pro mode is on for this account.'
-        : 'Creator Pro mode is off for this account.',
-      ...creatorProState,
-      subscription: {
-        ...serializePremiumSubscription(snapshot, isPremiumCheckoutConfigured()),
-        entitlements: getPremiumEntitlements(FREE_CONNECTION_REQUESTS_PER_DAY),
-        profileBoost,
-      },
-    });
-  } catch (error) {
-    console.error('Failed to update developer Creator Pro override', error);
-    res.status(500).json({ error: 'Failed to update Creator Pro mode' });
   }
 };
 
@@ -640,17 +448,12 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       durationDays: String(durationDays),
     };
 
-    const orderResponse = await requestWithBreaker<RazorpayOrderEntity>('razorpay', 'create_order', {
-      method: 'POST',
-      url: 'https://api.razorpay.com/v1/orders',
-      data: {
-        amount: config.amountMinor,
-        currency: config.currency,
-        receipt,
-        notes,
-      },
-      auth: getRazorpayAuth(),
-    }, { connectTimeoutMs: 5_000, requestTimeoutMs: 10_000 });
+    const order = await createRazorpayOrder({
+      amount: config.amountMinor,
+      currency: config.currency,
+      receipt,
+      notes,
+    });
 
     await logPremiumCheckoutEvent({
       userId,
@@ -660,18 +463,21 @@ export const createPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       amountMinor: config.amountMinor,
       currency: config.currency,
       metadata: {
-        orderId: orderResponse.data.id,
+        provider: 'razorpay',
+        orderId: order.id,
         receipt,
+        plan: config.plan,
         billingCycle: config.billingCycle,
       },
     });
 
     res.json({
       keyId: process.env.RAZORPAY_KEY_ID,
-      orderId: orderResponse.data.id,
+      orderId: order.id,
       amountMinor: config.amountMinor,
       currency: config.currency,
       displayAmount: formatCurrency(config.amountMinor, config.currency),
+      plan: config.plan,
       title: config.title,
       description: config.description,
       billingCycle: config.billingCycle,
@@ -759,129 +565,32 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
-    const snapshot = await getPremiumAccessSnapshot(userId);
     const [order, payment] = await Promise.all([
       fetchRazorpayOrder(razorpayOrderId),
       fetchRazorpayPayment(razorpayPaymentId),
     ]);
 
-    const configuredAmountMinor = Number(order.notes?.amountMinor || order.amount || snapshot.premiumAmountMinor);
-    const config: PremiumPlanConfig = {
-      amountMinor:
-        Number.isFinite(configuredAmountMinor) && configuredAmountMinor > 0
-          ? Math.round(configuredAmountMinor)
-          : snapshot.premiumAmountMinor,
-      currency: String(order.notes?.currency || order.currency || snapshot.premiumCurrency).toUpperCase(),
-      plan: String(order.notes?.plan || getPremiumPlan()),
-      billingCycle: normalizePremiumBillingCycle(String(order.notes?.billingCycle || 'monthly')),
-    };
-
-    const validation = validatePremiumCheckoutPayment({
+    const activation = await activatePremiumFromRazorpayPayment({
       userId,
-      expectedOrderId: razorpayOrderId,
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
       order,
       payment,
-      config,
+      source: 'checkout',
     });
 
-    if (validation.ok === false) {
-      await logPremiumCheckoutEvent({
-        userId,
-        eventType: 'CHECKOUT_FAILED',
-        outcome: 'failure',
-        message: validation.error,
-        amountMinor: config.amountMinor,
-        currency: config.currency,
-        metadata: {
-          orderId: razorpayOrderId,
-          paymentId: razorpayPaymentId,
-        },
-      });
-      res.status(validation.statusCode).json({ error: validation.error });
+    if (activation.ok === false) {
+      res.status(activation.statusCode).json({ error: activation.error });
       return;
     }
-
-    const now = new Date();
-    const durationDays = Number(order.notes?.durationDays) || getPremiumDurationDaysForBillingCycle(config.billingCycle);
-    const currentPeriodEnd = getPremiumPeriodEnd(now, durationDays);
-
-    const subscription = await prisma.subscriptions.upsert({
-      where: { userId },
-      create: {
-        id: randomUUID(),
-        userId,
-        plan: config.plan,
-        status: validation.subscriptionStatus,
-        amount: config.amountMinor,
-        currency: config.currency,
-        billingCycle: config.billingCycle,
-        provider: 'razorpay',
-        currentPeriodStart: now,
-        currentPeriodEnd,
-        cancelledAt: null,
-        trialEndsAt: null,
-        razorpaySubscriptionId: null,
-        razorpayCustomerId: null,
-        razorpayPlanId: null,
-        googlePlayPurchaseToken: null,
-        googlePlayOrderId: null,
-        googlePlayProductId: null,
-        googlePlayBasePlanId: null,
-        googlePlaySubscriptionState: null,
-        googlePlayAcknowledgementState: null,
-        lastProviderSyncAt: now,
-      },
-      update: {
-        plan: config.plan,
-        status: validation.subscriptionStatus,
-        amount: config.amountMinor,
-        currency: config.currency,
-        billingCycle: config.billingCycle,
-        provider: 'razorpay',
-        currentPeriodStart: now,
-        currentPeriodEnd,
-        cancelledAt: null,
-        trialEndsAt: null,
-        razorpaySubscriptionId: null,
-        razorpayCustomerId: null,
-        razorpayPlanId: null,
-        googlePlayPurchaseToken: null,
-        googlePlayOrderId: null,
-        googlePlayProductId: null,
-        googlePlayBasePlanId: null,
-        googlePlaySubscriptionState: null,
-        googlePlayAcknowledgementState: null,
-        lastProviderSyncAt: now,
-      },
-    });
-
-    await prisma.user_feature_access_overrides.updateMany({
-      where: { userId },
-      data: {
-        agentBlocked: false,
-        profileCustomizationBlocked: false,
-      },
-    });
-
-    await logPremiumCheckoutEvent({
-      userId,
-      eventType: 'CHECKOUT_VERIFIED',
-      outcome: 'success',
-      message: 'Premium unlocked successfully.',
-      amountMinor: config.amountMinor,
-      currency: config.currency,
-      metadata: {
-        orderId: razorpayOrderId,
-        paymentId: razorpayPaymentId,
-        subscriptionId: subscription.id,
-      },
-    });
-    invalidatePremiumEntitlementCaches(userId, 'premium checkout');
 
     const updatedSnapshot = await getPremiumAccessSnapshot(userId);
 
     res.json({
-      message: 'Premium unlocked successfully.',
+      message: activation.alreadyActivated
+        ? 'This payment was already applied to your account.'
+        : 'Premium unlocked successfully.',
+      alreadyActivated: activation.alreadyActivated,
       subscription: serializePremiumSubscription(updatedSnapshot, isPremiumCheckoutConfigured()),
     });
   } catch (error) {
@@ -909,6 +618,119 @@ export const verifyPremiumCheckout = async (req: AuthRequest, res: Response): Pr
           ? 'premium_verification_failed'
           : safeError.code,
     });
+  }
+};
+
+/**
+ * Razorpay webhook receiver. The browser verify call is best-effort — a user can pay and
+ * then close the tab before it runs — so this is the authoritative path that still grants
+ * premium for a captured payment. Configure the endpoint plus RAZORPAY_WEBHOOK_SECRET in
+ * the Razorpay dashboard for `payment.captured` and `order.paid`.
+ */
+export const handleRazorpayWebhook = async (
+  req: WebhookRequest,
+  res: Response
+): Promise<void> => {
+  const webhookSecret = getRazorpayWebhookSecret();
+
+  if (!webhookSecret || !isRazorpayConfigured()) {
+    res.status(503).json({ error: 'Razorpay webhooks are not configured on this server.' });
+    return;
+  }
+
+  const signature = req.header('x-razorpay-signature') || undefined;
+  const rawBody = req.rawBody;
+
+  if (!rawBody) {
+    res.status(400).json({ error: 'Webhook body could not be read.' });
+    return;
+  }
+
+  if (!verifyRazorpayWebhookSignature(rawBody, signature, webhookSecret)) {
+    console.warn('Rejected a Razorpay webhook with an invalid signature.');
+    res.status(400).json({ error: 'Invalid webhook signature.' });
+    return;
+  }
+
+  // Read from the verified raw body rather than the parsed/sanitised copy: only the raw
+  // bytes are covered by the signature we just checked.
+  let payload: RazorpayWebhookPayload;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8')) as RazorpayWebhookPayload;
+  } catch {
+    res.status(400).json({ error: 'Webhook body is not valid JSON.' });
+    return;
+  }
+
+  const event = String(payload.event || '');
+  const paymentEntity = payload.payload?.payment?.entity;
+  const orderEntity = payload.payload?.order?.entity;
+  const paymentId = String(paymentEntity?.id || '').trim();
+  const orderId = String(paymentEntity?.order_id || orderEntity?.id || '').trim();
+
+  // Acknowledge everything else so Razorpay stops retrying events we do not act on.
+  if (!['payment.captured', 'order.paid'].includes(event) || !paymentId || !orderId) {
+    res.status(200).json({ received: true, handled: false });
+    return;
+  }
+
+  try {
+    const [order, payment] = await Promise.all([
+      fetchRazorpayOrder(orderId),
+      fetchRazorpayPayment(paymentId),
+    ]);
+
+    const userId = readOrderUserId(order);
+    if (!userId) {
+      console.warn(`Razorpay webhook order ${orderId} has no userId note; skipping.`);
+      res.status(200).json({ received: true, handled: false });
+      return;
+    }
+
+    // A deleted account can never be activated, so answer 200 instead of letting the
+    // downstream "user not found" throw turn into an endless Razorpay retry loop.
+    const userExists = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+    if (!userExists) {
+      console.warn(`Razorpay webhook order ${orderId} references a missing user; skipping.`);
+      res.status(200).json({ received: true, handled: false });
+      return;
+    }
+
+    const activation = await activatePremiumFromRazorpayPayment({
+      userId,
+      orderId,
+      paymentId,
+      order,
+      payment,
+      source: 'webhook',
+    });
+
+    if (activation.ok === false) {
+      await logPremiumCheckoutEvent({
+        userId,
+        eventType: 'CHECKOUT_WEBHOOK',
+        outcome: 'failure',
+        message: `Razorpay webhook could not unlock premium: ${activation.error}`,
+        metadata: { event, orderId, paymentId },
+      });
+      // 200 keeps Razorpay from retrying a payload we have permanently rejected.
+      res.status(200).json({ received: true, handled: false });
+      return;
+    }
+
+    res.status(200).json({
+      received: true,
+      handled: true,
+      alreadyActivated: activation.alreadyActivated,
+    });
+  } catch (error) {
+    const safeError = getSafeRazorpayError(error);
+    console.error('Failed to process Razorpay webhook', safeError.logMessage, safeError.metadata);
+    // 5xx asks Razorpay to retry, which is what we want for transient upstream failures.
+    res.status(502).json({ error: 'Could not process the webhook right now.' });
   }
 };
 

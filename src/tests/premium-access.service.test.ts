@@ -8,10 +8,10 @@ import {
   getPremiumDurationDaysForBillingCycle,
   getPremiumPlanOptions,
   getPremiumPeriodEnd,
-  isDeveloperPremiumOverrideAvailable,
-  isDeveloperPremiumOverrideAvailableForUser,
   isCreatorProSubscriptionActive,
+  isLegacyTestPremiumSubscription,
   isPremiumSubscriptionActive,
+  LEGACY_TEST_PREMIUM_PROVIDER,
 } from '../services/premium-access.service';
 
 test('getPremiumPeriodEnd returns a date 31 days after the start date by default', () => {
@@ -53,6 +53,7 @@ test('isPremiumSubscriptionActive returns false when the subscription has expire
     {
       plan: 'premium',
       status: 'active',
+      provider: 'razorpay',
       currentPeriodEnd: new Date('2026-05-02T00:00:00.000Z'),
       cancelledAt: null,
     },
@@ -68,6 +69,7 @@ test('isPremiumSubscriptionActive returns false when the subscription was cancel
     {
       plan: 'premium',
       status: 'active',
+      provider: 'razorpay',
       currentPeriodEnd: new Date('2026-05-02T00:00:00.000Z'),
       cancelledAt: new Date('2026-04-19T00:00:00.000Z'),
     },
@@ -82,12 +84,34 @@ test('creator pro subscriptions include premium access and creator pro access', 
   const subscription = {
     plan: 'creator_pro',
     status: 'active',
+    provider: 'razorpay',
     currentPeriodEnd: new Date('2026-05-20T00:00:00.000Z'),
     cancelledAt: null,
   };
 
   assert.equal(isPremiumSubscriptionActive(subscription, now), true);
   assert.equal(isCreatorProSubscriptionActive(subscription, now), true);
+});
+
+test('leftover test premium rows never grant premium or creator pro access', () => {
+  const now = new Date('2026-04-20T00:00:00.000Z');
+  const subscription = {
+    plan: 'creator_pro',
+    status: 'active',
+    provider: LEGACY_TEST_PREMIUM_PROVIDER,
+    currentPeriodEnd: new Date('2027-04-20T00:00:00.000Z'),
+    cancelledAt: null,
+  };
+
+  assert.equal(isLegacyTestPremiumSubscription(subscription), true);
+  assert.equal(isPremiumSubscriptionActive(subscription, now), false);
+  assert.equal(isCreatorProSubscriptionActive(subscription, now), false);
+});
+
+test('paid razorpay subscriptions are not treated as leftover test premium', () => {
+  assert.equal(isLegacyTestPremiumSubscription({ provider: 'razorpay' }), false);
+  assert.equal(isLegacyTestPremiumSubscription({ provider: 'google_play' }), false);
+  assert.equal(isLegacyTestPremiumSubscription(null), false);
 });
 
 test('getPremiumDaysRemaining rounds partial remaining days up', () => {
@@ -174,79 +198,4 @@ test('getAgentAccessDeniedMessage points free users to Premium Power Mode', () =
 
   assert.match(message, /Premium feature/);
   assert.match(message, /Power Mode/);
-});
-
-test('developer premium override is disabled in production unless explicitly enabled', () => {
-  const originalNodeEnv = process.env.NODE_ENV;
-  const originalOverride = process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-
-  try {
-    process.env.NODE_ENV = 'production';
-    delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-    assert.equal(isDeveloperPremiumOverrideAvailable(), false);
-
-    process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = 'true';
-    assert.equal(isDeveloperPremiumOverrideAvailable(), true);
-  } finally {
-    if (originalNodeEnv === undefined) {
-      delete process.env.NODE_ENV;
-    } else {
-      process.env.NODE_ENV = originalNodeEnv;
-    }
-    if (originalOverride === undefined) {
-      delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-    } else {
-      process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = originalOverride;
-    }
-  }
-});
-
-test('developer premium override is available for configured owner email in production', () => {
-  const originalNodeEnv = process.env.NODE_ENV;
-  const originalOverride = process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-  const originalAdminEmails = process.env.ADMIN_ALLOWED_EMAILS;
-
-  try {
-    process.env.NODE_ENV = 'production';
-    delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-    process.env.ADMIN_ALLOWED_EMAILS = 'owner@example.com';
-
-    assert.equal(
-      isDeveloperPremiumOverrideAvailableForUser({
-        email: 'owner@example.com',
-        isAdmin: false,
-      }),
-      true
-    );
-    assert.equal(
-      isDeveloperPremiumOverrideAvailableForUser({
-        email: 'student@example.com',
-        isAdmin: false,
-      }),
-      false
-    );
-    assert.equal(
-      isDeveloperPremiumOverrideAvailableForUser({
-        email: 'admin@example.com',
-        isAdmin: true,
-      }),
-      true
-    );
-  } finally {
-    if (originalNodeEnv === undefined) {
-      delete process.env.NODE_ENV;
-    } else {
-      process.env.NODE_ENV = originalNodeEnv;
-    }
-    if (originalOverride === undefined) {
-      delete process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE;
-    } else {
-      process.env.VORMEX_ENABLE_PREMIUM_OVERRIDE = originalOverride;
-    }
-    if (originalAdminEmails === undefined) {
-      delete process.env.ADMIN_ALLOWED_EMAILS;
-    } else {
-      process.env.ADMIN_ALLOWED_EMAILS = originalAdminEmails;
-    }
-  }
 });

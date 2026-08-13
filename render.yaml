@@ -75,24 +75,26 @@ services:
         sync: false
       - key: PAGINATION_CURSOR_SECRET
         sync: false
+      - key: CROSSED_PATHS_FORCE_DISABLED
+        value: "false"
       - key: CROSSED_PATHS_ENTRY_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_EVENT_MODE_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_PUBLIC_PRESENCE_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_LIVE_MAP_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_LIVE_LIST_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_ACCUMULATION_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_SUMMARY_NOTIFICATIONS_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_PERSISTENCE_ENABLED
-        value: "false"
+        value: "true"
       - key: PROXIMITY_ROLLOUT_PERCENT
-        value: "0"
+        value: "100"
   # These background processes must use the same secret env vars as the web service
   # (DATABASE_URL, REDIS_URL, Firebase creds, etc.) for re-engagement notifications to run.
   - type: worker
@@ -170,12 +172,14 @@ services:
         sync: false
       - key: FIREBASE_PRIVATE_KEY
         sync: false
+      - key: CROSSED_PATHS_FORCE_DISABLED
+        value: "false"
       - key: CROSSED_PATHS_ACCUMULATION_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_SUMMARY_NOTIFICATIONS_ENABLED
-        value: "false"
+        value: "true"
       - key: CROSSED_PATHS_PERSISTENCE_ENABLED
-        value: "false"
+        value: "true"
       - key: PROXIMITY_ACCUMULATION_CONCURRENCY
         value: "8"
       - key: PROXIMITY_PERSISTENCE_CONCURRENCY

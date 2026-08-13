@@ -89,26 +89,41 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
-    const receiver = await prisma.user.findUnique({
-      where: { id: receiverId },
-      select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
-    });
+    /*
+     * One round trip instead of four. These reads do not depend on each other:
+     * the receiver record, the requester's display name (needed only for the
+     * notifications below), any existing connection row, and the safety gate.
+     * Running them in series was a large part of why the client sat on a
+     * spinner for seconds per click.
+     *
+     * `assertUsersCanInteract` rejects for blocked/banned/suspended pairs; a
+     * missing receiver is not something it throws on, so the 404 below still
+     * takes precedence for that case.
+     */
+    const [receiver, requester, existingConnection] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: receiverId },
+        select: { id: true, username: true, name: true, profileImage: true, headline: true, college: true, isVerified: true, profileBadgeStyle: true },
+      }),
+      prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: { name: true },
+      }),
+      prisma.connections.findFirst({
+        where: {
+          OR: [
+            { requesterId: req.user.userId, addresseeId: receiverId },
+            { requesterId: receiverId, addresseeId: req.user.userId },
+          ],
+        },
+      }),
+      assertUsersCanInteract(req.user.userId, receiverId, 'connection request'),
+    ]);
 
     if (!receiver) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
-
-    await assertUsersCanInteract(req.user.userId, receiverId, 'connection request');
-
-    const existingConnection = await prisma.connections.findFirst({
-      where: {
-        OR: [
-          { requesterId: req.user.userId, addresseeId: receiverId },
-          { requesterId: receiverId, addresseeId: req.user.userId },
-        ],
-      },
-    });
 
     if (existingConnection) {
       if (existingConnection.status === 'accepted') {
@@ -178,12 +193,6 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
           },
         });
 
-    // Get requester info for notification
-    const requester = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: { name: true },
-    });
-
     // Send in-app notification (non-blocking)
     notificationService.notifyConnectionRequest(
       receiverId,
@@ -198,8 +207,6 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       connection.id
     ).catch(console.error);
 
-    await invalidateDiscoveryCaches(req.user.userId, receiverId);
-
     res.status(201).json({
       message: 'Connection request sent',
       connection: {
@@ -211,6 +218,14 @@ export const sendConnectionRequest = async (req: AuthRequest, res: Response): Pr
       },
       relationship: canonicalRelationship('pending_sent', connection.id),
     });
+
+    /*
+     * Cache eviction happens after the response. The write is already durable,
+     * and tag invalidation fans out across every discovery list both users
+     * appear in — the caller gained nothing by waiting for it. It swallows its
+     * own errors, so nothing here can affect the response already sent.
+     */
+    void invalidateDiscoveryCaches(req.user.userId, receiverId);
   } catch (error) {
     const safety = safetyErrorResponse(error);
     if (safety) {
@@ -384,16 +399,111 @@ export const rejectConnectionRequest = async (req: AuthRequest, res: Response): 
       }),
     ]);
 
-    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
-
     res.status(200).json({
       message: 'Connection request rejected',
       relationship: canonicalRelationship('none', null),
     });
+
+    // Evict after responding; see sendConnectionRequest for the reasoning.
+    void invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
   } catch (error) {
     console.error('rejectConnectionRequest error:', error);
     res.status(500).json({ error: 'Failed to reject connection request' });
   }
+};
+
+/**
+ * Withdraw one outbound request, answering with the pair's settled relationship.
+ *
+ * Cancelling used to 404 when the row was already gone and 400 when it was no
+ * longer pending. Both clients read any non-2xx as "the cancel failed" and roll
+ * the button back to Pending, so a connection id that had outlived its row — a
+ * cached profile payload, a server-cached discovery list, a second tab that
+ * already cancelled — left the viewer with a Pending button that could never be
+ * cleared, because every retry answered 404 again.
+ *
+ * The viewer's intent is "leave no request of mine outstanding", and that intent
+ * is already satisfied when the row is missing. So this reports success and
+ * describes where the pair actually stands; the client publishes that verdict
+ * and converges even when the id it held was stale.
+ */
+const withdrawSentRequest = async (
+  viewerId: string,
+  connection: { id: string; requesterId: string; addresseeId: string; status: string } | null,
+  res: Response
+): Promise<void> => {
+  if (!connection) {
+    res.status(200).json({
+      message: 'Connection request already cancelled',
+      relationship: canonicalRelationship('none', null),
+    });
+    return;
+  }
+
+  // A row belonging to neither party is the one genuine authorization failure.
+  if (connection.requesterId !== viewerId && connection.addresseeId !== viewerId) {
+    res.status(403).json({ error: 'Not authorized to cancel this request' });
+    return;
+  }
+
+  /*
+   * Anything else means the viewer has no outbound request to withdraw — they
+   * are already connected, or the request points the other way and is theirs to
+   * accept or reject. Their intent is satisfied either way, so report success
+   * and say where the pair actually stands. Refusing here is what stranded the
+   * button: the client reverts on any error, so a profile that had drifted to a
+   * phantom "Pending" could never be talked out of it.
+   */
+  if (connection.status === 'accepted') {
+    res.status(200).json({
+      message: 'Already connected',
+      relationship: canonicalRelationship('connected', connection.id),
+    });
+    return;
+  }
+
+  if (connection.requesterId !== viewerId) {
+    res.status(200).json({
+      message: 'Connection request was sent to you',
+      relationship: canonicalRelationship(
+        connection.status === 'pending' ? 'pending_received' : 'none',
+        connection.status === 'pending' ? connection.id : null
+      ),
+    });
+    return;
+  }
+
+  if (connection.status !== 'pending') {
+    // rejected/blocked rows are not an outstanding request; nothing to withdraw.
+    res.status(200).json({
+      message: 'Connection request already cancelled',
+      relationship: canonicalRelationship('none', null),
+    });
+    return;
+  }
+
+  await prisma.$transaction([
+    prisma.notifications.deleteMany({
+      where: {
+        userId: connection.addresseeId,
+        type: 'connection_request',
+        actorId: connection.requesterId,
+      },
+    }),
+    prisma.connections.deleteMany({
+      // Scoped by requester and status so a concurrent accept cannot be deleted
+      // out from under the other side between the read above and this write.
+      where: { id: connection.id, requesterId: viewerId, status: 'pending' },
+    }),
+  ]);
+
+  res.status(200).json({
+    message: 'Connection request cancelled',
+    relationship: canonicalRelationship('none', null),
+  });
+
+  // Evict after responding; see sendConnectionRequest for the reasoning.
+  void invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
 };
 
 export const cancelConnectionRequest = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -413,42 +523,51 @@ export const cancelConnectionRequest = async (req: AuthRequest, res: Response): 
       where: { id: connectionId },
     });
 
-    if (!connection) {
-      res.status(404).json({ error: 'Connection request not found' });
-      return;
-    }
-
-    if (connection.requesterId !== req.user.userId) {
-      res.status(403).json({ error: 'Not authorized to cancel this request' });
-      return;
-    }
-
-    if (connection.status !== 'pending') {
-      res.status(400).json({ error: 'Can only cancel pending requests' });
-      return;
-    }
-
-    await prisma.$transaction([
-      prisma.notifications.deleteMany({
-        where: {
-          userId: connection.addresseeId,
-          type: 'connection_request',
-          actorId: connection.requesterId,
-        },
-      }),
-      prisma.connections.delete({
-        where: { id: connectionId },
-      }),
-    ]);
-
-    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
-
-    res.status(200).json({
-      message: 'Connection request cancelled',
-      relationship: canonicalRelationship('none', null),
-    });
+    await withdrawSentRequest(req.user.userId, connection, res);
   } catch (error) {
     console.error('cancelConnectionRequest error:', error);
+    res.status(500).json({ error: 'Failed to cancel connection request' });
+  }
+};
+
+/**
+ * Cancel by recipient rather than by connection id.
+ *
+ * Surfaces know who they are looking at long before they know which row holds
+ * the request — a profile opened from a cached snapshot paints "Pending" from a
+ * payload whose connection id is missing or stale. Without this the Cancel
+ * button had nothing to send and silently did nothing at all.
+ */
+export const cancelSentRequestToUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const userId = ensureString(req.params.userId);
+    if (!userId) {
+      res.status(400).json({ error: 'User ID required' });
+      return;
+    }
+
+    if (userId === req.user.userId) {
+      res.status(400).json({ error: 'Cannot cancel a connection request to yourself' });
+      return;
+    }
+
+    const connection = await prisma.connections.findFirst({
+      where: {
+        OR: [
+          { requesterId: req.user.userId, addresseeId: userId },
+          { requesterId: userId, addresseeId: req.user.userId },
+        ],
+      },
+    });
+
+    await withdrawSentRequest(req.user.userId, connection, res);
+  } catch (error) {
+    console.error('cancelSentRequestToUser error:', error);
     res.status(500).json({ error: 'Failed to cancel connection request' });
   }
 };
@@ -494,12 +613,13 @@ export const removeConnection = async (req: AuthRequest, res: Response): Promise
       data: { connectionsCount: { decrement: 1 } },
     });
 
-    await invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
-
     res.status(200).json({
       message: 'Connection removed',
       relationship: canonicalRelationship('none', null),
     });
+
+    // Evict after responding; see sendConnectionRequest for the reasoning.
+    void invalidateDiscoveryCaches(connection.requesterId, connection.addresseeId);
   } catch (error) {
     console.error('removeConnection error:', error);
     res.status(500).json({ error: 'Failed to remove connection' });

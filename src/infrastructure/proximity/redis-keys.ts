@@ -5,7 +5,9 @@ export const PROXIMITY_EVENT_TTL_SECONDS = 360;
 export const PROXIMITY_PUBLIC_TTL_SECONDS = 600;
 export const PROXIMITY_IDEMPOTENCY_TTL_SECONDS = 600;
 export const PROXIMITY_FLUSH_TTL_SECONDS = 86_400;
-export const PROXIMITY_LIVE_SNAPSHOT_TTL_SECONDS = 90;
+// Keep pagination snapshots brief enough for two newly active nearby users to
+// discover each other on the next client refresh while retaining cursor stability.
+export const PROXIMITY_LIVE_SNAPSHOT_TTL_SECONDS = 15;
 export const PROXIMITY_DIRTY_PARTITIONS = 32;
 
 export const proximityKeys = {

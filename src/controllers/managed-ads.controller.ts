@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import {
   recordManagedAdEvent,
+  selectManagedAdSidebarPlacement,
   type ManagedAdEventType,
   type ManagedAdPlacementName,
 } from '../services/managed-ad.service';
@@ -9,7 +10,7 @@ interface AuthRequest extends Request {
   user?: { userId: string; sessionId?: string };
 }
 
-const placements = new Set(['feed', 'reels']);
+const placements = new Set(['feed', 'reels', 'sidebar']);
 
 function getPlacement(value: unknown): ManagedAdPlacementName {
   const placement = String(value || '').trim().toLowerCase();
@@ -50,3 +51,22 @@ export const trackManagedAdImpression = (req: AuthRequest, res: Response): Promi
 
 export const trackManagedAdClick = (req: AuthRequest, res: Response): Promise<void> =>
   trackEvent(req, res, 'click');
+
+export const getSidebarManagedAd = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const ad = await selectManagedAdSidebarPlacement({
+      userId: String(req.user.userId),
+      sessionId: typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : null,
+    });
+
+    res.json({ ad });
+  } catch (error) {
+    console.error('get sidebar managed ad error:', error);
+    res.status(500).json({ error: 'Failed to load sidebar ad' });
+  }
+};

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import {
   type PremiumPlanConfig,
   validatePremiumCheckoutPayment,
   verifyRazorpaySignature,
+  verifyRazorpayWebhookSignature,
 } from '../services/premium-checkout.service';
 
 const baseConfig: PremiumPlanConfig = {
@@ -46,6 +48,31 @@ test('verifyRazorpaySignature accepts a valid server-generated signature', () =>
     verifyRazorpaySignature('order_123', 'pay_123', signature, secret),
     true
   );
+});
+
+test('verifyRazorpayWebhookSignature accepts an HMAC over the exact raw body', () => {
+  const secret = 'webhook_secret_value';
+  const rawBody = Buffer.from(
+    JSON.stringify({ event: 'payment.captured', payload: { payment: { entity: { id: 'pay_123' } } } })
+  );
+  const signature = createHmac('sha256', secret).update(rawBody).digest('hex');
+
+  assert.equal(verifyRazorpayWebhookSignature(rawBody, signature, secret), true);
+});
+
+test('verifyRazorpayWebhookSignature rejects tampered bodies, wrong secrets, and missing input', () => {
+  const secret = 'webhook_secret_value';
+  const rawBody = Buffer.from(JSON.stringify({ event: 'payment.captured' }));
+  const signature = createHmac('sha256', secret).update(rawBody).digest('hex');
+
+  assert.equal(
+    verifyRazorpayWebhookSignature(Buffer.from(JSON.stringify({ event: 'order.paid' })), signature, secret),
+    false
+  );
+  assert.equal(verifyRazorpayWebhookSignature(rawBody, signature, 'other_secret'), false);
+  assert.equal(verifyRazorpayWebhookSignature(rawBody, undefined, secret), false);
+  assert.equal(verifyRazorpayWebhookSignature(rawBody, signature, undefined), false);
+  assert.equal(verifyRazorpayWebhookSignature(rawBody, 'short', secret), false);
 });
 
 test('validatePremiumCheckoutPayment accepts a captured payment for the matching order and user', () => {

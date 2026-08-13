@@ -19,7 +19,12 @@ test('home feed uses a Redis-backed daily ranked snapshot and single-flight lock
   const post = source('src/controllers/post.controller.ts');
   const getFeed = between(post, 'export const getFeed', 'export const getPost');
 
-  assert.match(post, /HOME_FEED_SNAPSHOT_WINDOW_MS = 24 \* 60 \* 60 \* 1000/);
+  // The snapshot window is the rotation cadence, not a day. A 24h window meant
+  // every reload replayed the identical ranked page until the date changed.
+  assert.match(post, /const HOME_FEED_SNAPSHOT_WINDOW_MS = Math\.max\(/);
+  assert.doesNotMatch(post, /HOME_FEED_SNAPSHOT_WINDOW_MS = 24 \* 60 \* 60 \* 1000/);
+  // Cursor validity must not be tied to the short page-cache TTL.
+  assert.match(post, /const HOME_FEED_RECOMMENDATION_SESSION_TTL_MS = 48 \* 60 \* 60 \* 1000/);
   assert.match(getFeed, /cacheService\.getOrSet/);
   assert.match(getFeed, /snapshotWindow/);
   assert.match(getFeed, /lockTtlMs: 60_000/);

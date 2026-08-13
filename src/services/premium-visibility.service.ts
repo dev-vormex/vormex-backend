@@ -192,6 +192,7 @@ export async function getPremiumVisibilityByUserIds(
         userId: true,
         plan: true,
         status: true,
+        provider: true,
         currentPeriodEnd: true,
         cancelledAt: true,
       },

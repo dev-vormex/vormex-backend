@@ -37,6 +37,49 @@ test('profile defaults to core and keeps the legacy bundle behind include=all', 
   assert.match(core, /viewerContext: toProfileConnectionState/);
 });
 
+test('sending a connection request batches its independent reads', () => {
+  const controller = source('src/controllers/connection.controller.ts');
+  const send = controller.slice(
+    controller.indexOf('export const sendConnectionRequest'),
+    controller.indexOf('export const acceptConnectionRequest')
+  );
+
+  // The receiver record, the requester's display name, any existing connection
+  // row and the safety gate do not depend on each other. Awaiting them in
+  // series was several avoidable round trips on every click.
+  const batch = send.slice(send.indexOf('await Promise.all(['), send.indexOf(']);'));
+  assert.match(batch, /where: \{ id: receiverId \}/);
+  assert.match(batch, /select: \{ name: true \}/);
+  assert.match(batch, /prisma\.connections\.findFirst/);
+  assert.match(batch, /assertUsersCanInteract/);
+
+  // Only the batch itself and the write remain on the request path.
+  assert.equal((send.match(/await prisma\.user\.findUnique/g) || []).length, 0);
+});
+
+test('connection mutations answer before evicting discovery caches', () => {
+  const controller = source('src/controllers/connection.controller.ts');
+
+  // Tag invalidation fans out across every discovery list both users appear in
+  // and the write is already durable, so the caller gained nothing by waiting.
+  assert.doesNotMatch(controller, /await invalidateDiscoveryCaches/);
+  assert.equal((controller.match(/void invalidateDiscoveryCaches/g) || []).length, 4);
+
+  // Both cancel entry points — by connection id and by recipient — delegate to
+  // withdrawSentRequest, so the eviction is asserted once, where it now lives.
+  for (const handler of ['sendConnectionRequest', 'rejectConnectionRequest', 'withdrawSentRequest', 'removeConnection']) {
+    const start = controller.indexOf(`const ${handler}`);
+    assert.notEqual(start, -1, `${handler} not found`);
+    const body = controller.slice(start, controller.indexOf('\n};', start));
+    // Anchored on 2xx replies: the trailing catch block also writes a response,
+    // and that one legitimately sits after the eviction call.
+    assert.ok(
+      body.lastIndexOf('res.status(20') < body.indexOf('void invalidateDiscoveryCaches'),
+      `${handler} must respond before evicting caches`
+    );
+  }
+});
+
 test('connection acceptance only updates state and writes a transactional outbox event', () => {
   const controller = source('src/controllers/connection.controller.ts');
   const accept = controller.slice(

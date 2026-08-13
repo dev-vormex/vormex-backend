@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  MANAGED_AD_SIDEBAR_SLOT_KEY,
   isManagedAdCtaAllowed,
   managedAdSlotsForItemCount,
   matchesManagedAdTargeting,
@@ -66,6 +67,21 @@ test('managed ad slots support pagination offsets', () => {
       { sequence: 9, afterItemCount: 76, slotKey: 'feed_9' },
     ]
   );
+});
+
+test('sidebar is a single slot independent of item count and scroll offset', () => {
+  const expected = [{
+    placement: 'sidebar',
+    sequence: 0,
+    afterItemCount: 0,
+    slotKey: MANAGED_AD_SIDEBAR_SLOT_KEY,
+  }];
+
+  // The rail is persistent, so it must not gain slots as the viewer scrolls,
+  // and it must still resolve before any items have loaded.
+  assert.deepEqual(managedAdSlotsForItemCount('sidebar', 0), expected);
+  assert.deepEqual(managedAdSlotsForItemCount('sidebar', 20), expected);
+  assert.deepEqual(managedAdSlotsForItemCount('sidebar', 40, 40), expected);
 });
 
 test('targeting include dimensions are ANDed and values within a dimension are ORed', () => {

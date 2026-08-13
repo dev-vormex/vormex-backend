@@ -6,13 +6,17 @@ import {
   isPremiumSubscriptionActive,
 } from './premium-access.service';
 
-export type ManagedAdPlacementName = 'feed' | 'reels';
+export type ManagedAdPlacementName = 'feed' | 'reels' | 'sidebar';
 export type ManagedAdEventType = 'impression' | 'click';
 
 export const MANAGED_AD_FEED_FIRST_AFTER_ITEMS = 4;
 export const MANAGED_AD_FEED_INTERVAL_ITEMS = 8;
 export const MANAGED_AD_REELS_FIRST_AFTER_ITEMS = 5;
 export const MANAGED_AD_REELS_INTERVAL_ITEMS = 8;
+
+// The sidebar rail is a single persistent slot rather than an interleaved one,
+// so it has no item cadence — one creative for the whole column.
+export const MANAGED_AD_SIDEBAR_SLOT_KEY = 'sidebar_0';
 
 export interface ManagedAdSlot {
   placement: ManagedAdPlacementName;
@@ -54,6 +58,10 @@ interface SelectManagedAdPlacementsInput {
   itemOffset?: number | null;
   sessionId?: string | null;
   now?: Date;
+  // The sidebar rail refetches into the same single slot, so excluding
+  // campaigns already seen this session would empty the column whenever an
+  // advertiser is running alone. Interleaved placements keep the exclusion.
+  ignoreSessionHistory?: boolean;
 }
 
 interface TrackManagedAdEventInput {
@@ -225,6 +233,15 @@ export function managedAdSlotsForItemCount(
   itemCount: number,
   itemOffset: number = 0
 ): ManagedAdSlot[] {
+  if (placement === 'sidebar') {
+    return [{
+      placement,
+      sequence: 0,
+      afterItemCount: 0,
+      slotKey: MANAGED_AD_SIDEBAR_SLOT_KEY,
+    }];
+  }
+
   const count = Math.max(0, Math.floor(Number(itemCount) || 0));
   const offset = Math.max(0, Math.floor(Number(itemOffset) || 0));
   const firstAfter = placement === 'feed'
@@ -300,7 +317,9 @@ export function isManagedAdCtaAllowed(ctaKind: string | null | undefined, ctaUrl
 
 function campaignHasCreativeForPlacement(campaign: ManagedAdCampaignRecord, placement: ManagedAdPlacementName): boolean {
   if (!campaign.placements?.includes(placement)) return false;
-  if (placement === 'feed') {
+  // The sidebar rail renders the same copy/image as the in-feed card at a
+  // narrower size, so it shares the feed creative rather than adding fields.
+  if (placement === 'feed' || placement === 'sidebar') {
     return Boolean(campaign.feedTitle || campaign.feedBody || campaign.feedImageUrl);
   }
   return Boolean(campaign.reelsVideoUrl);
@@ -354,6 +373,7 @@ async function loadTargetProfile(userId: string): Promise<TargetProfile | null> 
         select: {
           plan: true,
           status: true,
+          provider: true,
           currentPeriodEnd: true,
           cancelledAt: true,
         },
@@ -501,7 +521,9 @@ export async function selectManagedAdPlacements(input: SelectManagedAdPlacements
   const campaignIds = eligibleCampaigns.map((campaign) => campaign.id);
   const [impressionsByCampaign, sessionSeenCampaignIds] = await Promise.all([
     dailyImpressionCounts(campaignIds, userId, now),
-    sessionImpressionCampaignIds(campaignIds, input.placement, input.sessionId),
+    input.ignoreSessionHistory
+      ? Promise.resolve(new Set<string>())
+      : sessionImpressionCampaignIds(campaignIds, input.placement, input.sessionId),
   ]);
 
   const usedCampaignIds = new Set<string>();
@@ -536,6 +558,27 @@ export async function selectManagedAdPlacements(input: SelectManagedAdPlacements
   });
 
   return placements;
+}
+
+/**
+ * Resolves the single creative for the feed sidebar rail, or null when no
+ * campaign targets this viewer. Unlike the interleaved placements this is not
+ * tied to how far the viewer has scrolled.
+ */
+export async function selectManagedAdSidebarPlacement(input: {
+  userId?: string | null;
+  sessionId?: string | null;
+  now?: Date;
+}): Promise<ManagedAdPlacement | null> {
+  const placements = await selectManagedAdPlacements({
+    userId: input.userId,
+    placement: 'sidebar',
+    itemCount: 1,
+    sessionId: input.sessionId,
+    now: input.now,
+    ignoreSessionHistory: true,
+  });
+  return placements[0] || null;
 }
 
 export async function recordManagedAdEvent(input: TrackManagedAdEventInput): Promise<void> {

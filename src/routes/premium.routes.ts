@@ -7,8 +7,6 @@ import {
   getCreatorProForMe,
   getMyProfileBoost,
   getPremiumSubscription,
-  setDeveloperCreatorProOverrideForMe,
-  setDeveloperPremiumOverrideForMe,
   updateCreatorProSettingsForMe,
   verifyGooglePlayPremiumCheckout,
   verifyPremiumCheckout,
@@ -36,8 +34,6 @@ router.get('/post-boosts', listMyPostBoosts);
 router.post('/post-boosts', paymentActionRateLimit, createMyPostBoost);
 router.get('/post-boosts/:campaignId', getMyPostBoost);
 router.post('/post-boosts/:campaignId/cancel', paymentActionRateLimit, cancelMyPostBoost);
-router.post('/debug-override', setDeveloperPremiumOverrideForMe);
-router.post('/creator-pro/debug-override', setDeveloperCreatorProOverrideForMe);
 router.post('/checkout', paymentActionRateLimit, createPremiumCheckout);
 router.post('/verify', paymentActionRateLimit, verifyPremiumCheckout);
 router.post('/play/verify', paymentActionRateLimit, verifyGooglePlayPremiumCheckout);

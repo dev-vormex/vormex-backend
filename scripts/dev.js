@@ -5,6 +5,25 @@ const { spawn, spawnSync } = require('child_process');
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
+// Crossed Paths is an active product feature in development. Keep explicit
+// local overrides authoritative while making the standard dev launcher usable
+// without duplicating the production rollout variables in a secret .env file.
+for (const key of [
+  'CROSSED_PATHS_ENTRY_ENABLED',
+  'CROSSED_PATHS_EVENT_MODE_ENABLED',
+  'CROSSED_PATHS_PUBLIC_PRESENCE_ENABLED',
+  'CROSSED_PATHS_LIVE_MAP_ENABLED',
+  'CROSSED_PATHS_LIVE_LIST_ENABLED',
+  'CROSSED_PATHS_ACCUMULATION_ENABLED',
+  'CROSSED_PATHS_SUMMARY_NOTIFICATIONS_ENABLED',
+  'CROSSED_PATHS_PERSISTENCE_ENABLED',
+]) {
+  if (process.env[key] === undefined) process.env[key] = 'true';
+}
+if (process.env.PROXIMITY_ROLLOUT_PERCENT === undefined) {
+  process.env.PROXIMITY_ROLLOUT_PERCENT = '100';
+}
+
 const { loadProtectedLocalDatabaseCredentials } = require('./local-neon-credentials');
 const localCredentialResult = loadProtectedLocalDatabaseCredentials();
 if (localCredentialResult.status === 'loaded') {
@@ -14,6 +33,7 @@ if (localCredentialResult.status === 'loaded') {
 const projectRoot = path.join(__dirname, '..');
 const databaseUrl = process.env.DATABASE_URL || '';
 const redisUrl = process.env.REDIS_URL || '';
+const proximityRedisUrl = process.env.PROXIMITY_REDIS_URL || '';
 const shouldKeepDbAwake =
   process.env.AUTO_KEEP_DB_AWAKE !== 'false' &&
   /neon\.tech/i.test(databaseUrl);
@@ -31,6 +51,8 @@ let serverProcess = null;
 let keepAliveProcess = null;
 let workerProcess = null;
 let schedulerProcess = null;
+let proximityWorkerProcess = null;
+let proximitySchedulerProcess = null;
 let shuttingDown = false;
 let forcedShutdownTimer = null;
 
@@ -89,7 +111,14 @@ function shutdown(exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  const children = [serverProcess, workerProcess, schedulerProcess, keepAliveProcess].filter(Boolean);
+  const children = [
+    serverProcess,
+    workerProcess,
+    schedulerProcess,
+    proximityWorkerProcess,
+    proximitySchedulerProcess,
+    keepAliveProcess,
+  ].filter(Boolean);
 
   for (const child of children) {
     if (child && !child.killed) {
@@ -148,9 +177,27 @@ if (shouldStartBackgroundJobs()) {
     [tsxCliPath, 'watch', 'src/scheduler.ts'],
     'scheduler'
   );
+
 } else {
   console.log(
     '[dev] Background workers skipped. Set DEV_BACKGROUND_JOBS=true to run BullMQ workers and schedulers.'
+  );
+}
+
+// Durable Crossed Paths processing needs dedicated BullMQ connections. Do not
+// attach these workers to the shared development Redis fallback; the API can
+// still provide live presence there, while a dedicated PROXIMITY_REDIS_URL
+// enables encounter accumulation, history persistence, and summaries.
+if (proximityRedisUrl) {
+  proximityWorkerProcess = spawnChild(
+    process.execPath,
+    [tsxCliPath, 'watch', 'src/proximity-worker.ts'],
+    'proximity worker'
+  );
+  proximitySchedulerProcess = spawnChild(
+    process.execPath,
+    [tsxCliPath, 'watch', 'src/proximity-scheduler.ts'],
+    'proximity scheduler'
   );
 }
 
@@ -159,7 +206,7 @@ serverProcess.on('exit', (code, signal) => {
   shutdown(signal ? 0 : code || 0);
 });
 
-for (const child of [workerProcess, schedulerProcess].filter(Boolean)) {
+for (const child of [workerProcess, schedulerProcess, proximityWorkerProcess, proximitySchedulerProcess].filter(Boolean)) {
   child.on('exit', (code, signal) => {
     if (shuttingDown) return;
     shutdown(signal ? 0 : code || 0);

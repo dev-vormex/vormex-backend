@@ -32,7 +32,9 @@ const TOP_NETWORKERS_CACHE_TAG = 'engagement:leaderboard';
 const TOP_NETWORKERS_CACHE_TTL_SECONDS = 300;
 const TOP_NETWORKERS_DEFAULT_LIMIT = 100;
 const TOP_NETWORKERS_MAX_LIMIT = 100;
-const DAILY_MATCH_CACHE_VERSION = 'v2';
+// v3: the match payload now forwards `interests`. Bumped so cached v2 snapshots
+// (which omit the field, TTL 48h) are not served for another two days.
+const DAILY_MATCH_CACHE_VERSION = 'v3';
 const DAILY_MATCH_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DAILY_MATCH_CACHE_TTL_SECONDS = 48 * 60 * 60;
 
@@ -470,6 +472,11 @@ export const getDailyMatches = async (req: AuthRequest, res: Response): Promise<
         isOnline: user.lastActiveAt
           ? new Date(user.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000)
           : false,
+        // Selected above but previously dropped here, so every client that read
+        // `match.interests` got undefined — shared-interest chips could never render.
+        interests: Array.isArray(user.interests) ? user.interests : [],
+        // FIXME: not a measured value. Clients display this as "N% reply rate"
+        // and push notifications repeat it verbatim. Needs a real metric or removal.
         replyRate: Math.floor(Math.random() * 40) + 60,
       }));
       const surpriseMessages = [
@@ -614,6 +621,9 @@ export const getPeopleLikeYou = async (req: AuthRequest, res: Response): Promise
         headline: user.headline,
         college: user.college,
         isOnline: user.lastActiveAt ? new Date(user.lastActiveAt) > new Date(Date.now() - 5 * 60 * 1000) : false,
+        // Selected above but previously dropped here — see the daily-matches mapping.
+        interests: Array.isArray(user.interests) ? user.interests : [],
+        // FIXME: not a measured value — same fabricated metric as daily matches.
         replyRate: Math.floor(Math.random() * 30) + 70, // 70-100%
         matchReason: user.matchReason,
       }));

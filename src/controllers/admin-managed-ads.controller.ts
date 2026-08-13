@@ -14,7 +14,7 @@ interface AuthRequest extends Request {
 }
 
 const AD_STATUSES = new Set(['draft', 'active', 'paused', 'archived']);
-const AD_PLACEMENTS = new Set(['feed', 'reels']);
+const AD_PLACEMENTS = new Set(['feed', 'reels', 'sidebar']);
 const CTA_KINDS = new Set(['external_url', 'vormex_deeplink']);
 
 function parseJsonData(req: Request): Record<string, any> {
@@ -220,6 +220,10 @@ function validateCampaignForSave(campaign: Record<string, any>) {
     }
     if (campaign.placements.includes('feed') && !(campaign.feedTitle || campaign.feedBody || campaign.feedImageUrl)) {
       throw new Error('Active feed campaigns need feed creative');
+    }
+    // The sidebar rail reuses the feed creative at a narrower size.
+    if (campaign.placements.includes('sidebar') && !(campaign.feedTitle || campaign.feedBody || campaign.feedImageUrl)) {
+      throw new Error('Active sidebar campaigns need feed creative');
     }
     if (campaign.placements.includes('reels') && !campaign.reelsVideoUrl) {
       throw new Error('Active reels campaigns need a reels video');

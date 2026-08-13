@@ -171,16 +171,22 @@ export class BunnyStorageService {
 
   // Upload story image
   async uploadStoryImage(buffer: Buffer, userId: string, mimeType: string): Promise<string> {
-    const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
+    const ext = mimeType.includes('png')
+      ? 'png'
+      : mimeType.includes('webp')
+        ? 'webp'
+        : mimeType.includes('gif')
+          ? 'gif'
+          : 'jpg';
     const filename = `${userId}-${Date.now()}.${ext}`;
-    return this.uploadFile(buffer, 'stories/images', filename);
+    return this.uploadFile(buffer, 'stories/images', filename, mimeType);
   }
 
   // Upload story video
   async uploadStoryVideo(buffer: Buffer, userId: string, mimeType: string): Promise<string> {
-    const ext = mimeType.includes('webm') ? 'webm' : mimeType.includes('mov') ? 'mov' : 'mp4';
+    const ext = mimeType.includes('webm') ? 'webm' : mimeType.includes('quicktime') ? 'mov' : 'mp4';
     const filename = `${userId}-${Date.now()}.${ext}`;
-    return this.uploadFile(buffer, 'stories/videos', filename);
+    return this.uploadFile(buffer, 'stories/videos', filename, mimeType);
   }
 
   // Upload group icon (1:1 ratio)

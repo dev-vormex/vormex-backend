@@ -24,6 +24,8 @@ import {
   enqueueNotificationDelivery,
   enqueueRealtimeFanout,
 } from '../outbox/helpers';
+import type { RealtimeEnvelope } from '../infrastructure/realtime/channels';
+import { emitRealtimeEnvelopes } from '../infrastructure/realtime/emitter';
 import {
   applyPremiumVisibilityToUser,
   getPremiumVisibilityByUserIds,
@@ -77,9 +79,29 @@ interface AuthRequest extends Request {
 const FEED_REALTIME_ROOM = 'feed:global';
 const FEED_IMPRESSION_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const FEED_IMPRESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-const HOME_FEED_SNAPSHOT_WINDOW_MS = 24 * 60 * 60 * 1000;
-const HOME_FEED_CACHE_TTL_SECONDS = 48 * 60 * 60;
-const HOME_FEED_RECOMMENDATION_SESSION_TTL_MS = HOME_FEED_CACHE_TTL_SECONDS * 1000;
+/*
+ * How often the ranked first page is recomputed.
+ *
+ * The window is part of the feed cache key, so it is also the rotation cadence:
+ * inside one window every reload replays the byte-identical ranked page, and a
+ * new window re-ranks with the viewer's latest impressions applied. This was
+ * 24 hours, which is why the home feed served the same posts in the same order
+ * all day no matter how many times it was reloaded.
+ */
+const HOME_FEED_SNAPSHOT_WINDOW_MS = Math.max(
+  15_000,
+  Number(process.env.HOME_FEED_SNAPSHOT_WINDOW_MS) || 60_000
+);
+// Only has to outlive the window it keys. A long TTL just pins dead snapshots
+// in Redis, one per user per window.
+const HOME_FEED_CACHE_TTL_SECONDS = 5 * 60;
+/*
+ * Deliberately independent of the page cache above: this bounds how long a
+ * pagination cursor stays resolvable. Tying it to the (now short) page TTL
+ * would make getRecommendationSessionPage reject cursors mid-scroll with
+ * "Invalid or expired recommendation cursor".
+ */
+const HOME_FEED_RECOMMENDATION_SESSION_TTL_MS = 48 * 60 * 60 * 1000;
 const HOME_FEED_CACHE_VERSION = 'v3';
 const HOME_FEED_CACHE_GLOBAL_TAG = 'feed:global';
 const HOME_FEED_DEFAULT_LIMIT = 40;
@@ -261,6 +283,53 @@ function writeRecommendedFeedImpressions(currentUserId: string, postIds: string[
     console.error('Failed to write feed impressions:', impressionError);
   });
 }
+
+const MAX_FEED_IMPRESSION_BATCH = 100;
+
+/**
+ * Ingests viewport impressions reported by a client.
+ *
+ * The ranker has always read `feed_impressions` to demote posts the viewer has
+ * already seen (see seenAtByPostId in getFeed), but nothing ever wrote the
+ * table and no route exposed it — so the signal was permanently empty and
+ * ranking was fully deterministic. This is the missing writer.
+ *
+ * Impressions are reported by the client rather than recorded when a row is
+ * served, because a served row is only a candidate: the viewer may never scroll
+ * to it. Counting served rows would demote posts nobody actually saw.
+ *
+ * Ranking itself stays entirely server-side. Clients only report what entered
+ * the viewport; they never influence ordering directly.
+ */
+export const recordFeedImpressions = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const rawPostIds = Array.isArray(req.body?.postIds) ? req.body.postIds : [];
+    const postIds = Array.from(
+      new Set(
+        rawPostIds
+          .map((value: unknown) => (typeof value === 'string' ? value.trim() : ''))
+          .filter((value: string) => value.length > 0)
+      )
+    ).slice(0, MAX_FEED_IMPRESSION_BATCH) as string[];
+
+    if (postIds.length === 0) {
+      res.json({ ok: true, recorded: 0 });
+      return;
+    }
+
+    // Fire-and-forget inside; the client does not wait on the write.
+    writeRecommendedFeedImpressions(String(req.user.userId), postIds);
+    res.json({ ok: true, recorded: postIds.length });
+  } catch (error) {
+    console.error('recordFeedImpressions error:', error);
+    res.status(500).json({ error: 'Failed to record feed impressions' });
+  }
+};
 
 const getPostRealtimeRooms = (postId: string, visibility?: string | null): string[] => (
   String(visibility || 'public').toLowerCase() === 'public'
@@ -773,16 +842,29 @@ export const getFeed = async (req: AuthRequest, res: Response): Promise<void> =>
 
     const computeFeedPayload = async () => {
       const accessWhere = await buildPostVisibilityWhere(currentUserId);
+      /*
+       * buildPostVisibilityWhere returns its gate under an `AND` key. Anything
+       * else that needs `AND` has to be merged into that same array — spreading
+       * a second `AND` into this object literal silently overwrites the gate
+       * and serves every author's connections/private posts. That is exactly
+       * what the `mode === 'latest'` keyset cursor used to do, so the leak only
+       * appeared from page 2 of the latest feed onward.
+       */
+      const accessAnd = Array.isArray(accessWhere.AND)
+        ? (accessWhere.AND as Array<Record<string, unknown>>)
+        : [accessWhere];
 
       const postsPromise = prismaRead.post.findMany({
         where: {
           isActive: true,
           ...(blockedUserIds.length > 0 ? { authorId: { notIn: blockedUserIds } } : {}),
-          ...accessWhere,
           ...(mode === 'recommended'
             ? { createdAt: { lte: new Date(recommendationSessionStartedAtMs + 5_000) } }
             : {}),
-          ...(mode === 'latest' && latestCursorWhere ? { AND: [latestCursorWhere] } : {}),
+          AND: [
+            ...accessAnd,
+            ...(mode === 'latest' && latestCursorWhere ? [latestCursorWhere] : []),
+          ],
         },
         include: postResponseInclude(currentUserId, { authorProfileSignals: mode === 'recommended' }),
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -1286,26 +1368,52 @@ export const createPost = async (req: AuthRequest, res: Response): Promise<void>
             }) : [],
           ]);
           const mentionerName = created.author?.name || created.author?.username || 'Someone';
-          const preview = content || `${mentionerName} tagged you in a ${mappedType} post`;
+          const genericPreview = `${mentionerName} tagged you in a ${mappedType} post`;
+          const postForAccess = { id: created.id, authorId: userId, visibility, isActive: true };
+          const recipientIds = Array.from(new Set([
+            ...mentionableUsers.map((mentionedUser) => mentionedUser.id),
+            ...collaboratorUsers.map((collaboratorUser) => collaboratorUser.id),
+          ]));
+          const canReadById = new Map(
+            await Promise.all(
+              recipientIds.map(
+                async (recipientId) => [recipientId, await canViewPost(postForAccess, recipientId)] as const
+              )
+            )
+          );
 
           await Promise.all([
-            ...mentionableUsers.map((mentionedUser) =>
-              notificationService.notifyMention(
-                mentionedUser.id,
-                userId,
-                mentionerName,
-                'post',
-                created.id,
-                preview
-              )
-            ),
+            /*
+             * A mention must not become a side channel around the post's own
+             * visibility. The preview carries the raw post body, so notifying
+             * someone who cannot open the post would publish private content
+             * into their notification list: an "Only me" post notifies nobody,
+             * and a connections-only post notifies connections only.
+             */
+            ...mentionableUsers
+              .filter((mentionedUser) => canReadById.get(mentionedUser.id))
+              .map((mentionedUser) =>
+                notificationService.notifyMention(
+                  mentionedUser.id,
+                  userId,
+                  mentionerName,
+                  'post',
+                  created.id,
+                  content || genericPreview
+                )
+              ),
+            /*
+             * Collaborator invites still go out — the author picked these users
+             * and accepting the invite is what grants access — but the invite
+             * withholds the body until the invitee can actually read the post.
+             */
             ...collaboratorUsers.map((collaboratorUser) =>
               notificationService.notifyPostCollabInvite(
                 collaboratorUser.id,
                 userId,
                 mentionerName,
                 created.id,
-                preview
+                canReadById.get(collaboratorUser.id) ? (content || genericPreview) : genericPreview
               )
             ),
           ]);
@@ -1547,10 +1655,18 @@ export const respondToPostCollabInvite = async (req: AuthRequest, res: Response)
       include: postResponseInclude(userId),
     });
 
+    /*
+     * Accepting is what grants access to a non-public post, so the body only
+     * comes back once that access actually holds. Rejecting leaves the invitee
+     * outside the audience, and returning the post anyway would hand them
+     * content that GET /posts/:postId now refuses them.
+     */
+    const canReadUpdatedPost = updatedPost ? await canViewPost(updatedPost, userId) : false;
+
     res.status(200).json({
       success: true,
       status: nextStatus,
-      post: updatedPost ? mapPostResponse(updatedPost, userId) : null,
+      post: updatedPost && canReadUpdatedPost ? mapPostResponse(updatedPost, userId) : null,
     });
   } catch (error) {
     console.error('respondToPostCollabInvite error:', error);
@@ -1650,7 +1766,7 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
 
     const requestedReaction = normalizeReactionType(req.body?.reactionType);
 
-    const { liked, likesCount, reactionType, reactionSummary, isNewReaction } =
+    const { liked, likesCount, reactionType, reactionSummary, isNewReaction, realtimeEnvelopes } =
       await prisma.$transaction(async (tx) => {
         const existingLike = await tx.postLike.findUnique({
           where: { postId_userId: { postId, userId } },
@@ -1689,24 +1805,39 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
         const summaries = await getReactionSummaries(tx as any, [postId]);
         const nextReactionSummary = summaries.get(postId) ?? [];
 
+        /*
+         * Built once and used twice: enqueued below for durable cross-instance
+         * fanout, and emitted straight to this instance's sockets after the
+         * transaction commits. The immediate emit is what makes reactions land
+         * in real time — the outbox is only the crash-recovery backstop (see
+         * processRealtimeFanout), and it is not drained at all in environments
+         * where the BullMQ worker is skipped.
+         *
+         * The dedupeKey is per-event rather than per (post, user): a viewer can
+         * react, unreact and re-react within the emitter's 120s dedupe window,
+         * and a stable key would silently swallow every event after the first.
+         */
+        const envelopes: RealtimeEnvelope[] = [
+          {
+            event: 'post:liked',
+            rooms: getPostRealtimeRooms(postId, post.visibility),
+            dedupeKey: `post:liked:${postId}:${randomUUID()}`,
+            payload: {
+              postId,
+              userId,
+              liked: nextLiked,
+              likesCount: nextLikesCount,
+              reactionType: nextReaction,
+              reactionSummary: nextReactionSummary,
+            },
+          },
+        ];
+
         await enqueueRealtimeFanout(tx as any, {
           aggregateType: 'post',
           aggregateId: postId,
           eventType: 'post.like.fanout',
-          envelopes: [
-            {
-              event: 'post:liked',
-              rooms: getPostRealtimeRooms(postId, post.visibility),
-              payload: {
-                postId,
-                userId,
-                liked: nextLiked,
-                likesCount: nextLikesCount,
-                reactionType: nextReaction,
-                reactionSummary: nextReactionSummary,
-              },
-            },
-          ],
+          envelopes,
         });
 
         await enqueueCacheInvalidation(tx as any, {
@@ -1743,8 +1874,14 @@ export const toggleLike = async (req: AuthRequest, res: Response): Promise<void>
           reactionType: nextReaction,
           reactionSummary: nextReactionSummary,
           isNewReaction: !existingLike && nextLiked,
+          realtimeEnvelopes: envelopes,
         };
       });
+
+    // After commit only: emitting inside the transaction would announce a
+    // reaction that a rollback then discards, and would race any client that
+    // refetches on the event.
+    emitRealtimeEnvelopes(realtimeEnvelopes);
 
     // Send notification on like (not unlike)
     if (isNewReaction && post.authorId !== userId) {

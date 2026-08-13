@@ -74,6 +74,7 @@ import dailyHooksRoutes from './routes/daily-hooks.routes';
 import publicDiscoveryRoutes from './routes/public-discovery.routes';
 import recommendationRoutes from './routes/recommendation.routes';
 import premiumRoutes from './routes/premium.routes';
+import { handleRazorpayWebhook } from './controllers/premium.controller';
 import { setupSwagger } from './swagger';
 import { setIO } from './sockets';
 import { register } from './infrastructure/metrics/registry';
@@ -111,6 +112,7 @@ import { pushNotificationService } from './services/push-notification.service';
 import { getReadReceiptVisibilityCached, sendChatMessage, warmChatSendPath } from './services/chat-message.service';
 import { getConversationPeerIdCached } from './services/chat-conversation-cache.service';
 import { TtlMemo } from './infrastructure/cache/ttl-memo';
+import type { RealtimeEnvelope } from './infrastructure/realtime/channels';
 import { emitRealtimeEnvelopes } from './infrastructure/realtime/emitter';
 import {
   getAgentAccessDeniedMessage,
@@ -653,7 +655,12 @@ async function togglePostReactionWithFanout(
   userId: string,
   reactionType: string | null,
   eventName: 'post:liked' | 'post:reacted'
-): Promise<{ liked: boolean; likesCount: number; reactionType: string | null } | null> {
+): Promise<{
+  liked: boolean;
+  likesCount: number;
+  reactionType: string | null;
+  realtimeEnvelopes: RealtimeEnvelope[];
+} | null> {
   const requestedReaction = normalizeReactionType(reactionType);
   return prisma.$transaction(async (tx) => {
     const post = await tx.post.findFirst({
@@ -704,24 +711,30 @@ async function togglePostReactionWithFanout(
       ? [feedRealtimeRoom, `post:${postId}`]
       : [`post:${postId}`];
 
+    // Same contract as the REST path in post.controller.ts: build once, enqueue
+    // for durability, and emit immediately after commit. See the comment there
+    // for why the dedupeKey must be unique per event.
+    const realtimeEnvelopes: RealtimeEnvelope[] = [
+      {
+        event: eventName,
+        rooms: postRooms,
+        dedupeKey: `${eventName}:${postId}:${randomUUID()}`,
+        payload: {
+          postId,
+          userId,
+          liked,
+          reactionType: nextReaction,
+          likesCount,
+          reactionSummary,
+        },
+      },
+    ];
+
     await enqueueRealtimeFanout(tx as any, {
       aggregateType: 'post',
       aggregateId: postId,
       eventType: `post.${eventName}.fanout`,
-      envelopes: [
-        {
-          event: eventName,
-          rooms: postRooms,
-          payload: {
-            postId,
-            userId,
-            liked,
-            reactionType: nextReaction,
-            likesCount,
-            reactionSummary,
-          },
-        },
-      ],
+      envelopes: realtimeEnvelopes,
     });
 
     await enqueueCacheInvalidation(tx as any, {
@@ -735,6 +748,7 @@ async function togglePostReactionWithFanout(
       liked,
       likesCount,
       reactionType: nextReaction,
+      realtimeEnvelopes,
     };
   }, {
     maxWait: 10_000,
@@ -1500,6 +1514,7 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Post not found' });
         return;
       }
+      emitRealtimeEnvelopes(result.realtimeEnvelopes);
       console.log(`Post ${postId} ${result.liked ? 'liked' : 'unliked'} by user ${reactorUserId}`);
     } catch (error) {
       console.error('post:react error:', error);
@@ -1521,6 +1536,7 @@ io.on('connection', async (socket) => {
         socket.emit('error', { message: 'Post not found' });
         return;
       }
+      emitRealtimeEnvelopes(result.realtimeEnvelopes);
       console.log(`Post ${postId} ${result.liked ? 'liked' : 'unliked'} by user ${userId}`);
     } catch (error) {
       console.error('post:like error:', error);
@@ -2709,6 +2725,13 @@ app.use(express.json({
   },
 }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+
+// Razorpay retries a webhook until it gets a 2xx, so it is mounted ahead of the shared
+// /api input sanitizer and the premium router's `authenticate`: a signed provider payload
+// must never be rejected by rules written for user-submitted content or missing sessions.
+// The handler authenticates the request by HMAC over the raw body instead.
+app.post('/api/premium/razorpay/webhook', handleRazorpayWebhook);
+
 app.use('/api', (_req: Request, res: Response, next) => {
   res.setHeader('Cache-Control', 'no-store, private');
   res.setHeader('Pragma', 'no-cache');
