@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -16,7 +16,7 @@ function between(text: string, start: string, end: string): string {
 }
 
 test('home feed uses a Redis-backed daily ranked snapshot and single-flight lock', () => {
-  const post = source('src/controllers/post.controller.ts');
+  const post = source('src/modules/content/controllers/post.controller.ts');
   const getFeed = between(post, 'export const getFeed', 'export const getPost');
 
   // The snapshot window is the rotation cadence, not a day. A 24h window meant
@@ -34,10 +34,10 @@ test('home feed uses a Redis-backed daily ranked snapshot and single-flight lock
 });
 
 test('ordinary engagement does not evict every user feed snapshot', () => {
-  const post = source('src/controllers/post.controller.ts');
+  const post = source('src/modules/content/controllers/post.controller.ts');
   const tagBuilder = between(post, 'const feedCacheTags', 'async function enqueuePostCreated');
   const engagement = between(post, 'export const toggleLike', 'export const getLikes');
-  const saved = source('src/controllers/saved.controller.ts');
+  const saved = source('src/modules/content/controllers/saved.controller.ts');
 
   assert.doesNotMatch(tagBuilder.slice(0, tagBuilder.indexOf('const feedSnapshotCacheTags')), /HOME_FEED_CACHE_GLOBAL_TAG/);
   assert.match(tagBuilder, /const feedSnapshotCacheTags/);
@@ -46,11 +46,11 @@ test('ordinary engagement does not evict every user feed snapshot', () => {
 });
 
 test('browser no-cache headers do not bypass the server snapshot', () => {
-  const post = source('src/controllers/post.controller.ts');
+  const post = source('src/modules/content/controllers/post.controller.ts');
   const bypass = between(
     post,
     'function shouldBypassHomeFeedCache',
-    'function writeRecommendedFeedImpressions'
+    'const MAX_FEED_IMPRESSION_BATCH'
   );
 
   assert.match(bypass, /x-vormex-feed-refresh/);
@@ -59,7 +59,7 @@ test('browser no-cache headers do not bypass the server snapshot', () => {
 });
 
 test('stories are Redis cached by viewer and daily window with mutation invalidation', () => {
-  const stories = source('src/controllers/stories.controller.ts');
+  const stories = source('src/modules/content/controllers/stories.controller.ts');
   const feed = between(stories, 'export const getStoriesFeed', 'export const createStory');
 
   assert.match(stories, /STORY_FEED_SNAPSHOT_WINDOW_MS = 24 \* 60 \* 60 \* 1000/);
@@ -70,8 +70,8 @@ test('stories are Redis cached by viewer and daily window with mutation invalida
 });
 
 test('daily and smart people matches share the 24-hour Redis snapshot contract', () => {
-  const engagement = source('src/controllers/engagement.controller.ts');
-  const matching = source('src/controllers/matching.controller.ts');
+  const engagement = source('src/modules/engagement/controllers/engagement.controller.ts');
+  const matching = source('src/modules/discovery/controllers/matching.controller.ts');
   const daily = between(engagement, 'export const getDailyMatches', 'export const getPeopleLikeYou');
   const smart = between(matching, 'export const getSmartMatches', 'export const getMentorMatches');
 
@@ -84,7 +84,7 @@ test('daily and smart people matches share the 24-hour Redis snapshot contract',
 });
 
 test('recommendation sessions and preferences can outlive a slow first request', () => {
-  const recommendations = source('src/services/recommendation-platform.service.ts');
+  const recommendations = source('src/modules/discovery/services/recommendation-platform.service.ts');
 
   assert.match(recommendations, /ttlMs\?: number/);
   assert.match(recommendations, /SESSION_VALIDATION_MS = 7 \* 24 \* 60 \* 60 \* 1000/);

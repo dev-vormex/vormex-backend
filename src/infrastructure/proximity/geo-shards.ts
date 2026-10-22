@@ -90,10 +90,6 @@ export function radiusShardSearchPlan(latitude: number, longitude: number, radiu
   return { shards: Array.from(shards), useActiveShardRegistry: false };
 }
 
-export function shardsForRadius(latitude: number, longitude: number, radiusM: number): string[] {
-  return radiusShardSearchPlan(latitude, longitude, radiusM).shards;
-}
-
 export function decodeGeohashBounds(hash: string): { latMin: number; latMax: number; lonMin: number; lonMax: number } {
   let latMin = -90; let latMax = 90; let lonMin = -180; let lonMax = 180; let even = true;
   for (const character of hash.toLowerCase()) {

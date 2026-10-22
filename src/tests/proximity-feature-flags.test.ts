@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getProximityFeatureFlagsForUser } from '../services/proximity-feature-flags.service';
+import { getProximityFeatureFlagsForUser } from '../modules/proximity/services/proximity-feature-flags.service';
 
 const legacyKeys = [
   'CROSSED_PATHS_ENTRY_ENABLED',

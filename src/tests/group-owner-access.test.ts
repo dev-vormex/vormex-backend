@@ -1,5 +1,5 @@
+import { readImplementationFile } from './helpers/implementation-source';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import {
@@ -10,7 +10,7 @@ import {
   hasGroupRoleAtLeast,
   normalizeInviteLinkVisibility,
   normalizeGroupRole,
-} from '../controllers/groups.controller';
+} from '../modules/groups/controllers/groups.controller';
 
 function sourceBetween(source: string, start: string, end: string): string {
   const startIndex = source.indexOf(start);
@@ -34,7 +34,7 @@ test('group owner backfill migration repairs missing and stale creator membershi
     process.cwd(),
     'prisma/migrations/20260520120000_group_owner_access_and_metadata/migration.sql',
   );
-  const sql = fs.readFileSync(migrationPath, 'utf8');
+  const sql = readImplementationFile(migrationPath, 'utf8');
 
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "category"/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "rules"/);
@@ -62,7 +62,7 @@ test('group invite migration adds link, direct invite, and join request storage'
     process.cwd(),
     'prisma/migrations/20260520133000_group_invites_and_links/migration.sql',
   );
-  const sql = fs.readFileSync(migrationPath, 'utf8');
+  const sql = readImplementationFile(migrationPath, 'utf8');
 
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "inviteCode"/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "inviteLinkVisibility"/);
@@ -93,8 +93,8 @@ test('anonymous group list cache keys normalize equivalent searches', () => {
 });
 
 test('group discovery lists use denormalized counts, read routing, and cache coordination', () => {
-  const controller = fs.readFileSync(
-    path.join(process.cwd(), 'src/controllers/groups.controller.ts'),
+  const controller = readImplementationFile(
+    path.join(process.cwd(), 'src/modules/groups/controllers/groups.controller.ts'),
     'utf8',
   );
   const discover = sourceBetween(controller, 'export const discoverGroups', 'export const getUserPendingInvites');
@@ -111,8 +111,8 @@ test('group discovery lists use denormalized counts, read routing, and cache coo
 });
 
 test('group discovery has an index for visibility and popularity ordering', () => {
-  const schema = fs.readFileSync(path.join(process.cwd(), 'prisma/schema.prisma'), 'utf8');
-  const migration = fs.readFileSync(
+  const schema = readImplementationFile(path.join(process.cwd(), 'prisma/schema.prisma'), 'utf8');
+  const migration = readImplementationFile(
     path.join(process.cwd(), 'prisma/migrations/20260729150000_optimize_group_discovery_indexes/migration.sql'),
     'utf8',
   );

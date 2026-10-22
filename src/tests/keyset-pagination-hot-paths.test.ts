@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -17,7 +17,7 @@ function functionBlock(text: string, exportName: string): string {
 }
 
 test('chat hot lists use signed keyset cursors and capped message page size', () => {
-  const controller = source('src/controllers/chat.controller.ts');
+  const controller = source('src/modules/chat/controllers/chat.controller.ts');
   const conversationsBlock = functionBlock(controller, 'getConversations');
   const messagesBlock = functionBlock(controller, 'getMessages');
 
@@ -30,7 +30,7 @@ test('chat hot lists use signed keyset cursors and capped message page size', ()
 });
 
 test('people discovery removed offset and count from the hot path', () => {
-  const controller = source('src/controllers/people.controller.ts');
+  const controller = source('src/modules/discovery/controllers/people.controller.ts');
   const getPeopleBlock = functionBlock(controller, 'getPeople');
 
   assert.match(getPeopleBlock, /decodePeopleCursor\(req\.query\.cursor\)/);
@@ -43,15 +43,15 @@ test('people discovery removed offset and count from the hot path', () => {
 });
 
 test('notifications and feed latest return signed keyset cursors without hot counts', () => {
-  const notifications = source('src/controllers/notifications.controller.ts');
+  const notifications = source('src/modules/notifications/controllers/notifications.controller.ts');
   const notificationListBlock = functionBlock(notifications, 'getNotifications');
-  const postController = source('src/controllers/post.controller.ts');
+  const postController = source('src/modules/content/controllers/post.controller.ts');
   const feedBlock = functionBlock(postController, 'getFeed');
 
   assert.match(notificationListBlock, /decodeKeysetCursor\(cursorValue, 'notifications'\)/);
   assert.match(notificationListBlock, /decodeKeysetCursor\(afterCursorValue, 'notifications'\)/);
   assert.match(notificationListBlock, /dateAscKeysetWhere\(afterCursor, 'createdAt'\)/);
-  assert.match(notificationListBlock, /latestCursor: results\.length > 0/);
+  assert.match(notificationListBlock, /latestCursor:\s*results\.length > 0/);
   assert.match(notificationListBlock, /orderBy: isIncrementalRequest/);
   assert.match(notificationListBlock, /hasMoreNewer: isIncrementalRequest && hasMore/);
   assert.match(notificationListBlock, /take: rawTake/);
@@ -63,7 +63,7 @@ test('notifications and feed latest return signed keyset cursors without hot cou
 });
 
 test('reels list endpoints use signed keyset cursors and matching migration indexes', () => {
-  const reels = source('src/controllers/reels.controller.ts');
+  const reels = source('src/modules/content/controllers/reels.controller.ts');
   const migration = source('prisma/migrations/20260608193000_keyset_pagination_indexes/migration.sql');
   const schema = source('prisma/schema.prisma');
 
@@ -82,7 +82,7 @@ test('reels list endpoints use signed keyset cursors and matching migration inde
 });
 
 test('reels feed uses limit plus one cursor pagination without offset or count', () => {
-  const reels = source('src/controllers/reels.controller.ts');
+  const reels = source('src/modules/content/controllers/reels.controller.ts');
   const feedBlock = functionBlock(reels, 'getReelsFeed');
 
   assert.match(feedBlock, /clampPageSize\(req\.query\.limit, 10, 30\)/);

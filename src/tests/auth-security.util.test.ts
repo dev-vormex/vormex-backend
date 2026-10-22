@@ -8,7 +8,7 @@ import {
   passwordHashNeedsRehash,
   validatePasswordStrength,
   verifyOpaqueToken,
-} from '../utils/auth-security.util';
+} from '../modules/auth/utils/auth-security.util';
 
 test('password policy accepts secure six-character passwords', () => {
   const previousMinLength = process.env.AUTH_PASSWORD_MIN_LENGTH;

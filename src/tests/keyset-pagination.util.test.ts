@@ -6,7 +6,7 @@ import {
   decodeKeysetCursor,
   encodeKeysetCursor,
   numberDescDateDescIdDescWhere,
-} from '../utils/keyset-pagination.util';
+} from '../shared/utils/keyset-pagination.util';
 
 async function withCursorSecret<T>(fn: () => T | Promise<T>): Promise<T> {
   const original = process.env.PAGINATION_CURSOR_SECRET;

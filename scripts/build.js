@@ -29,6 +29,8 @@ function runNodeScript(scriptPath, args, label) {
 }
 
 runNodeScript(prismaCli, ['generate'], 'Prisma CLI');
+// Renamed modules must not survive in reused generated-output caches.
+fs.rmSync(distDir, { recursive: true, force: true });
 runNodeScript(tscCli, ['-p', 'tsconfig.json'], 'TypeScript compiler');
 
 fs.mkdirSync(distDir, { recursive: true });

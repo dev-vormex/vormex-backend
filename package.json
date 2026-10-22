@@ -14,7 +14,7 @@
     "dev:scheduler": "tsx watch src/scheduler.ts",
     "postinstall": "npm run prisma:generate",
     "build": "node scripts/build.js",
-    "test": "npm run build && node --test dist/tests/*.test.js",
+    "test": "npm run build && node --test dist/tests/*.test.js dist/tests/cross-client/*.test.js",
     "start": "node scripts/run-compiled.js api",
     "migrate:deploy": "prisma migrate deploy",
     "start:api": "node scripts/run-compiled.js api",
@@ -33,11 +33,18 @@
     "contacts:backfill-email-hashes": "tsx src/scripts/backfill-user-email-hashes.ts",
     "encryption:rotate": "node dist/scripts/rotate-encryption-key.js",
     "neon:keep-alive": "node scripts/neon-keep-alive.js",
-    "docs:generate": "swagger-cli bundle -o src/openapi.json src/openapi.yaml",
-    "docs:validate": "swagger-cli validate src/openapi.yaml",
+    "docs:generate": "node scripts/openapi.js bundle",
+    "docs:validate": "node scripts/openapi.js validate",
     "docs:serve": "npm run docs:generate && npm start",
     "discovery:backfill": "npm run build && node dist/scripts/backfill-public-discovery.js",
-    "verify": "npm run build && npm run docs:validate"
+    "verify": "npm run check:architecture && npm run check:typesafety && npm run build && npm run docs:validate",
+    "check:architecture": "node scripts/check-architecture.js",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write src scripts",
+    "test:backend": "npm run build && npm run test:backend:compiled",
+    "test:backend:compiled": "node --test dist/tests/*.test.js",
+    "test:clients": "npm run build && node --test dist/tests/cross-client/*.test.js",
+    "check:typesafety": "node scripts/check-type-safety.js"
   },
   "keywords": [
     "social-networking",
@@ -62,7 +69,6 @@
     "@types/multer": "^2.0.0",
     "@types/node": "^22.7.9",
     "@types/qrcode": "^1.5.6",
-    "@types/sharp": "^0.32.0",
     "@types/speakeasy": "^2.0.10",
     "@types/swagger-ui-express": "^4.1.6",
     "axios": "^1.13.2",
@@ -94,12 +100,13 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "prettier": "3.9.9",
     "socket.io-client": "^4.8.3",
-    "swagger-cli": "^4.0.4",
-    "tsx": "^4.20.6"
+    "tsx": "^4.20.6",
+    "@apidevtools/swagger-parser": "^12.1.0"
   },
   "overrides": {
-    "brace-expansion": "5.0.8",
+    "brace-expansion": "5.0.12",
     "uuid": "11.1.1"
   }
 }

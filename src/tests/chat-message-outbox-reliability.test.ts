@@ -1,5 +1,6 @@
+import { realtimeSource } from './helpers/source';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -20,7 +21,7 @@ function between(text: string, start: string, end: string): string {
 }
 
 test('sendChatMessage writes message, conversation metadata, and outbox rows in one atomic statement', () => {
-  const service = source('src/services/chat-message.service.ts');
+  const service = source('src/modules/chat/services/chat-message.service.ts');
   const atomicWriteBlock = between(
     service,
     'await prisma.$executeRaw(Prisma.sql`',
@@ -43,7 +44,7 @@ test('sendChatMessage writes message, conversation metadata, and outbox rows in 
 });
 
 test('development sends chat push directly after commit while production defaults to outbox', () => {
-  const service = source('src/services/chat-message.service.ts');
+  const service = source('src/modules/chat/services/chat-message.service.ts');
 
   assert.match(service, /return nodeEnv === 'production' \? 'outbox' : 'direct'/);
   assert.match(service, /if \(pushDeliveryMode === 'direct'\)/);
@@ -55,7 +56,7 @@ test('development sends chat push directly after commit while production default
 });
 
 test('notification worker drops stale queued chat pushes before contacting Firebase', () => {
-  const worker = source('src/workers/index.ts');
+  const worker = source('src/jobs/workers/index.ts');
 
   assert.match(worker, /CHAT_PUSH_MAX_AGE_MS/);
   assert.match(worker, /export function isStaleChatPush/);
@@ -64,7 +65,7 @@ test('notification worker drops stale queued chat pushes before contacting Fireb
 });
 
 test('chat outbox events use deterministic idempotency keys only for chat side effects', () => {
-  const service = source('src/services/chat-message.service.ts');
+  const service = source('src/modules/chat/services/chat-message.service.ts');
 
   assert.match(service, /idempotencyKey: `chat:realtime:\$\{messageId\}`/);
   assert.match(service, /idempotencyKey: `chat:push:\$\{messageId\}`/);
@@ -72,7 +73,7 @@ test('chat outbox events use deterministic idempotency keys only for chat side e
 });
 
 test('duplicate clientMessageId path is race-safe and does not enqueue duplicate side effects', () => {
-  const service = source('src/services/chat-message.service.ts');
+  const service = source('src/modules/chat/services/chat-message.service.ts');
   const duplicateBlock = between(
     service,
     'if (clientMessageId && isPrismaUniqueViolation(error)) {',
@@ -85,7 +86,7 @@ test('duplicate clientMessageId path is race-safe and does not enqueue duplicate
 });
 
 test('socket chat send reuses shared service and has no inline push notification', () => {
-  const indexSource = source('src/index.ts');
+  const indexSource = realtimeSource();
   const handler = between(
     indexSource,
     "socket.on('chat:send_message'",
@@ -100,7 +101,7 @@ test('socket chat send reuses shared service and has no inline push notification
 });
 
 test('Socket.IO supports production fallback transport and requires authentication', () => {
-  const indexSource = source('src/index.ts');
+  const indexSource = realtimeSource();
 
   assert.match(indexSource, /transports: \['websocket', 'polling'\]/);
   assert.match(indexSource, /verifySocketAccessToken\(token\)/);
@@ -112,7 +113,7 @@ test('Socket.IO supports production fallback transport and requires authenticati
 });
 
 test('agent session rooms require server-side ownership before joining', () => {
-  const indexSource = source('src/index.ts');
+  const indexSource = realtimeSource();
   const handler = between(
     indexSource,
     "socket.on('agent:join_session'",
@@ -128,7 +129,7 @@ test('agent session rooms require server-side ownership before joining', () => {
 });
 
 test('REST chat send reuses shared service and does not invalidate cache inline', () => {
-  const controller = source('src/controllers/chat.controller.ts');
+  const controller = source('src/modules/chat/controllers/chat.controller.ts');
   const handler = between(
     controller,
     'export const sendMessage = async',
@@ -143,7 +144,7 @@ test('REST chat send reuses shared service and does not invalidate cache inline'
 
 test('outbox idempotency migration and insert use partial unique key conflict handling', () => {
   const migration = source('prisma/migrations/20260608173000_chat_send_outbox_idempotency/migration.sql');
-  const outbox = source('src/outbox/service.ts');
+  const outbox = source('src/infrastructure/outbox/service.ts');
 
   assert.match(migration, /ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT/);
   assert.match(migration, /WHERE "idempotencyKey" IS NOT NULL/);
@@ -153,7 +154,7 @@ test('outbox idempotency migration and insert use partial unique key conflict ha
 });
 
 test('one outbox event dispatches as one BullMQ job id', () => {
-  const dispatcher = source('src/outbox/dispatcher.ts');
+  const dispatcher = source('src/infrastructure/outbox/dispatcher.ts');
 
   assert.match(dispatcher, /jobId: event\.id/);
 });

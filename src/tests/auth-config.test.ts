@@ -4,7 +4,7 @@ import {
   findSensitivePublicEnvNames,
   validateAuthRuntimeConfig,
 } from '../config/auth-security.config';
-import { getAccessTokenTtlSeconds, isWeakAuthSecret } from '../utils/jwt.util';
+import { getAccessTokenTtlSeconds, isWeakAuthSecret } from '../modules/auth/utils/jwt.util';
 
 test('sensitive auth values are detected when placed in frontend-exposed env names', () => {
   assert.deepEqual(

@@ -168,13 +168,13 @@ serverProcess = spawnChild(
 if (shouldStartBackgroundJobs()) {
   workerProcess = spawnChild(
     process.execPath,
-    [tsxCliPath, 'watch', 'src/worker.ts'],
+    [tsxCliPath, 'watch', 'src/bootstrap/worker.ts'],
     'worker'
   );
 
   schedulerProcess = spawnChild(
     process.execPath,
-    [tsxCliPath, 'watch', 'src/scheduler.ts'],
+    [tsxCliPath, 'watch', 'src/bootstrap/scheduler.ts'],
     'scheduler'
   );
 
@@ -191,12 +191,12 @@ if (shouldStartBackgroundJobs()) {
 if (proximityRedisUrl) {
   proximityWorkerProcess = spawnChild(
     process.execPath,
-    [tsxCliPath, 'watch', 'src/proximity-worker.ts'],
+    [tsxCliPath, 'watch', 'src/bootstrap/proximity-worker.ts'],
     'proximity worker'
   );
   proximitySchedulerProcess = spawnChild(
     process.execPath,
-    [tsxCliPath, 'watch', 'src/proximity-scheduler.ts'],
+    [tsxCliPath, 'watch', 'src/bootstrap/proximity-scheduler.ts'],
     'proximity scheduler'
   );
 }

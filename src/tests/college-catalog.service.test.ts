@@ -6,7 +6,7 @@ import {
   fetchGooglePlacesSchoolSuggestions,
   mergeCollegeSuggestions,
   searchCatalogColleges,
-} from '../services/college-catalog.service';
+} from '../modules/education/services/college-catalog.service';
 
 test('buildCollegeLogoUrl returns a safe favicon URL for valid domains', () => {
   assert.equal(

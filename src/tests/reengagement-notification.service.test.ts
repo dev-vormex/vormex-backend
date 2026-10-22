@@ -7,7 +7,7 @@ import {
   getMeaningfulGrowthCount,
   hasMeaningfulGrowth,
   parseReengagementHours,
-} from '../services/reengagement-notification.service';
+} from '../modules/notifications/services/reengagement-notification.service';
 
 test('parseReengagementHours keeps order, removes duplicates, and ignores invalid values', () => {
   const hours = parseReengagementHours('15, 18, 21, 21, nope, 25, 0');

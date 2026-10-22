@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import { queueNames } from '../infrastructure/queue/queue-names';
 import { resolveRedisRoleUrls } from '../infrastructure/redis/client';
 import { evaluateBackgroundHeartbeat } from '../infrastructure/health/background-process-heartbeat';
-import { classifyOutboxEventForDispatch } from '../outbox/dispatch-policy';
+import { classifyOutboxEventForDispatch } from '../infrastructure/outbox/dispatch-policy';
 
 function source(path: string): string {
   return readFileSync(join(process.cwd(), path), 'utf8').replace(/\r\n/g, '\n');
@@ -33,7 +33,7 @@ test('Redis roles separate critical state from evictable application cache', () 
 
 test('sessions use the critical store while ordinary response caching uses the cache role', () => {
   const cache = source('src/infrastructure/cache/redis-cache.service.ts');
-  const sessions = source('src/services/auth-session.service.ts');
+  const sessions = source('src/modules/auth/services/auth-session.service.ts');
   const queues = source('src/infrastructure/queue/queues.ts');
 
   assert.match(cache, /redisCacheCommand/);
@@ -45,9 +45,9 @@ test('sessions use the critical store while ordinary response caching uses the c
 });
 
 test('browser-facing API responses do not expose health internals or raw server errors', () => {
-  const index = source('src/index.ts');
-  const errors = source('src/middleware/errorHandler.ts');
-  const sessionService = source('src/services/auth-session.service.ts');
+  const index = [source('src/http/middleware.ts'), source('src/http/operational-routes.ts')].join('\n');
+  const errors = source('src/shared/middleware/errorHandler.ts');
+  const sessionService = source('src/modules/auth/services/auth-session.service.ts');
 
   assert.match(index, /Cache-Control', 'no-store, private'/);
   assert.doesNotMatch(index, /database: 'connected'/);
@@ -81,9 +81,9 @@ test('background heartbeat evaluation distinguishes healthy, stale, and missing 
 });
 
 test('readiness includes worker and scheduler heartbeat state', () => {
-  const index = source('src/index.ts');
-  const worker = source('src/worker.ts');
-  const scheduler = source('src/scheduler.ts');
+  const index = [source('src/http/middleware.ts'), source('src/http/operational-routes.ts')].join('\n');
+  const worker = source('src/bootstrap/worker.ts');
+  const scheduler = source('src/bootstrap/scheduler.ts');
 
   assert.match(index, /getBackgroundProcessesHealth/);
   assert.match(index, /Object\.values\(redisHealth\.roles\)\.every/);
@@ -141,7 +141,7 @@ test('durable outbox side effects replay while unclassified historical work is q
 });
 
 test('dispatcher persists terminal age decisions before continuing the batch', () => {
-  const dispatcher = source('src/outbox/dispatcher.ts');
+  const dispatcher = source('src/infrastructure/outbox/dispatcher.ts');
 
   assert.match(dispatcher, /o\."createdAt"/);
   assert.match(dispatcher, /classifyOutboxEventForDispatch\(event\)/);

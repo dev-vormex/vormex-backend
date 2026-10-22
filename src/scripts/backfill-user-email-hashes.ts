@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { prisma, disconnectPrisma } from '../config/prisma';
-import { hashEmail } from '../utils/email-hash.util';
+import { hashEmail } from '../shared/utils/email-hash.util';
 
 async function main() {
   const users = await prisma.user.findMany({

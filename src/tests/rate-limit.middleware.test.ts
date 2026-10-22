@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { NextFunction, Response } from 'express';
 import type { Socket } from 'node:net';
-import { createRateLimitMiddleware } from '../middleware/rate-limit.middleware';
-import type { RateLimitRule, RateLimitResult } from '../services/rate-limit.service';
-import type { AuthenticatedRequest } from '../types/auth.types';
+import { createRateLimitMiddleware } from '../shared/middleware/rate-limit.middleware';
+import type { RateLimitRule, RateLimitResult } from '../infrastructure/security/rate-limit.service';
+import type { AuthenticatedRequest } from '../modules/auth/types/auth.types';
 import { register } from '../infrastructure/metrics/registry';
 
 type TestResponse = Response & {

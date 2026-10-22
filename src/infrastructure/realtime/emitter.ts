@@ -1,7 +1,7 @@
 import type { Server } from 'socket.io';
-import { getIO } from '../../sockets';
+import { getIO } from '../../realtime/socket-registry';
 import { markEnvelopeEmitted, type RealtimeEnvelope } from './channels';
-import { logger } from '../../lib/logger';
+import { logger } from '../logging/logger';
 
 // Per-instance guard against the same envelope being emitted twice to local
 // sockets (immediate API emit + outbox replay). Cross-instance suppression is
@@ -151,16 +151,6 @@ export function emitRealtimeEnvelopeToServer(
   if (envelope.dedupeKey && !options.localOnly) {
     markEnvelopeEmitted(envelope.dedupeKey);
   }
-}
-
-export function emitRealtimeEnvelope(envelope: RealtimeEnvelope): boolean {
-  const io = getIO();
-  if (!io) {
-    return false;
-  }
-
-  emitRealtimeEnvelopeToServer(io, envelope);
-  return true;
 }
 
 export function emitRealtimeEnvelopes(envelopes: RealtimeEnvelope[]): boolean {

@@ -6,8 +6,8 @@ import {
   isScriptLikeUserAgent,
   resolveGeneralApiRateLimitRules,
   resolveSensitiveActionRateLimitRules,
-} from '../services/abuse-protection.service';
-import type { AuthenticatedRequest } from '../types/auth.types';
+} from '../infrastructure/security/abuse-protection.service';
+import type { AuthenticatedRequest } from '../modules/auth/types/auth.types';
 
 function request(overrides: Partial<AuthenticatedRequest> = {}): AuthenticatedRequest {
   return {

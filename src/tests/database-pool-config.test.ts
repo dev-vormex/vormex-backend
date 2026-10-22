@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
@@ -56,7 +56,7 @@ test('read replica URL keeps write/read split and uses read connection limit', (
 test('Prisma config uses pooled runtime URLs, DIRECT_URL remains schema-only, and metrics collect DB connections', () => {
   const prismaConfig = readFileSync(join(process.cwd(), 'src/config/prisma.ts'), 'utf8');
   const schema = readFileSync(join(process.cwd(), 'prisma/schema.prisma'), 'utf8');
-  const index = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8');
+  const index = readFileSync(join(process.cwd(), 'src/http/operational-routes.ts'), 'utf8');
   const registry = readFileSync(join(process.cwd(), 'src/infrastructure/metrics/registry.ts'), 'utf8');
 
   assert.match(prismaConfig, /buildDatabasePoolConfig\(\{ env: process\.env, role: 'write' \}\)/);

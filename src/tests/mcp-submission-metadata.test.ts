@@ -9,7 +9,7 @@ import {
   getOpenAiAppsChallengeToken,
   OPENAI_APPS_CHALLENGE_PATH,
   registerPublicDiscoveryMcp,
-} from '../mcp/public-discovery.mcp';
+} from '../http/mcp/public-discovery.mcp';
 
 test('OpenAI app verification endpoint returns only the challenge token', async () => {
   const app = express();

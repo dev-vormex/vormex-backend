@@ -8,11 +8,7 @@
  * Usage: npx tsx src/scripts/revoke-test-premium.ts
  */
 import { prisma } from '../config/prisma';
-import {
-  LEGACY_TEST_PREMIUM_PROVIDER,
-  logPremiumCheckoutEvent,
-  revokeLegacyTestPremiumSubscriptions,
-} from '../services/premium-access.service';
+import { LEGACY_TEST_PREMIUM_PROVIDER, logPremiumCheckoutEvent, revokeLegacyTestPremiumSubscriptions } from '../modules/premium/services/premium-access.service';
 
 async function main() {
   const pending = await prisma.subscriptions.count({

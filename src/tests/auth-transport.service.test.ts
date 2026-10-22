@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { shouldReturnAuthTokensInBody } from '../services/auth-transport.service';
+import { shouldReturnAuthTokensInBody } from '../modules/auth/services/auth-transport.service';
 
 test('browser auth responses never include bearer or refresh tokens in the body', () => {
   assert.equal(

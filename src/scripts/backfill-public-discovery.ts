@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { disconnectPrisma, prismaRead } from '../config/prisma';
-import { reindexPublicProfile } from '../services/public-discovery.service';
+import { reindexPublicProfile } from '../modules/discovery/services/public-discovery.service';
 
 async function main(): Promise<void> {
   let cursor: string | undefined;

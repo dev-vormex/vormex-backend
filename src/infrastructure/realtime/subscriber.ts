@@ -2,7 +2,7 @@ import type { Server } from 'socket.io';
 import { isRedisEnabled, redisSub } from '../redis/client';
 import { REALTIME_CHANNEL, type RealtimeEnvelope } from './channels';
 import { emitRealtimeEnvelopeToServer } from './emitter';
-import { logger } from '../../lib/logger';
+import { logger } from '../logging/logger';
 
 let subscribed = false;
 

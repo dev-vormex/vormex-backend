@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -18,8 +18,8 @@ function between(text: string, start: string, end: string): string {
 }
 
 test('connection accept guards pending transition and enqueues idempotent stats side effects', () => {
-  const controller = source('src/controllers/connection.controller.ts');
-  const sideEffects = source('src/services/connection-accepted-side-effects.service.ts');
+  const controller = source('src/modules/connections/controllers/connection.controller.ts');
+  const sideEffects = source('src/modules/connections/services/connection-accepted-side-effects.service.ts');
   const handler = between(
     controller,
     'export const acceptConnectionRequest',
@@ -39,7 +39,7 @@ test('connection accept guards pending transition and enqueues idempotent stats 
 });
 
 test('follow and unfollow mutate follow row and counters atomically without swallowed stats errors', () => {
-  const controller = source('src/controllers/follow.controller.ts');
+  const controller = source('src/modules/connections/controllers/follow.controller.ts');
   const followHandler = between(controller, 'export const followUser', 'export const unfollowUser');
   const unfollowHandler = between(controller, 'export const unfollowUser', 'export const getFollowStatus');
 
@@ -58,9 +58,10 @@ test('follow and unfollow mutate follow row and counters atomically without swal
 });
 
 test('reel like/share/comment/report use guarded transactional counter updates', () => {
-  const controller = source('src/controllers/reels.controller.ts');
+  const controller = source('src/modules/content/controllers/reels.controller.ts');
   const likeHandler = between(controller, 'export const toggleLike', 'export const toggleSave');
   const shareHandler = between(controller, 'export const shareReel =', '// Share reel in chat');
+  const chatShareHandler = between(controller, 'export const shareReelInChat', 'const VIEW_BATCH_MAX_ITEMS');
   const commentHandler = between(controller, 'export const createComment', 'export const toggleCommentLike');
   const reportHandler = between(controller, 'export const reportReel', 'export const transcodingWebhook');
 
@@ -77,6 +78,13 @@ test('reel like/share/comment/report use guarded transactional counter updates',
   assert.match(shareHandler, /sharesCount: \{ increment: 1 \}/);
   assert.match(shareHandler, /createdShare && reel\.authorId !== userId/);
   assert.match(shareHandler, /isUniqueViolation/);
+
+  assert.match(chatShareHandler, /prisma\.\$transaction/);
+  assert.match(chatShareHandler, /id: randomUUID\(\)/);
+  assert.match(chatShareHandler, /tx\.reel_shares\.createMany/);
+  assert.match(chatShareHandler, /skipDuplicates: true/);
+  assert.match(chatShareHandler, /sharesCount: \{ increment: 1 \}/);
+  assert.match(chatShareHandler, /createdShare && reel\.authorId !== userId/);
 
   assert.match(commentHandler, /prisma\.\$transaction/);
   assert.match(commentHandler, /tx\.reel_comments\.create/);

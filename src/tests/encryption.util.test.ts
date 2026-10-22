@@ -14,17 +14,17 @@ const {
   decryptToken,
   decryptTokenWithMetadata,
   encryptToken,
-} = require('../utils/encryption.util') as typeof import('../utils/encryption.util');
+} = require('../infrastructure/security/encryption.util') as typeof import('../infrastructure/security/encryption.util');
 const {
   inspectAdminTwoFactorSecret,
   reencryptAdminTwoFactorSecret,
   reencryptStoredSecret,
-} = require('../services/encryption-rotation.service') as typeof import('../services/encryption-rotation.service');
+} = require('../infrastructure/security/encryption-rotation.service') as typeof import('../infrastructure/security/encryption-rotation.service');
 const {
   listIdentityEvidenceStorageKeys,
   readEncryptedIdentityEvidenceWithMetadata,
   rotateEncryptedIdentityEvidence,
-} = require('../services/identity-evidence.service') as typeof import('../services/identity-evidence.service');
+} = require('../modules/identity/services/identity-evidence.service') as typeof import('../modules/identity/services/identity-evidence.service');
 
 function encryptV2WithKey(plaintext: string, keyHex: string): string {
   const iv = crypto.randomBytes(12);

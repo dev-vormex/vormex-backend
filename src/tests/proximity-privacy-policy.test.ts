@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { canonicalPair, pairHash, pairPartition } from '../infrastructure/proximity/redis-keys';
-import { displaceMarker } from '../services/proximity-privacy.service';
+import { displaceMarker } from '../modules/proximity/services/proximity-privacy.service';
 
 function distanceM(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }): number {
   const radians = Math.PI / 180;

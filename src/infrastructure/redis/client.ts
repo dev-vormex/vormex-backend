@@ -1,5 +1,6 @@
+import { parsePositiveInt } from "../../config/env.util";
 import Redis from 'ioredis';
-import { logger } from '../../lib/logger';
+import { logger } from '../logging/logger';
 
 export type RedisRole = 'critical' | 'cache';
 
@@ -66,10 +67,7 @@ if (CACHE_REDIS_REQUIRED && !CACHE_REDIS_URL) {
   throw new Error('Missing required environment variable: CACHE_REDIS_URL (or REDIS_URL)');
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+
 
 function summarizeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

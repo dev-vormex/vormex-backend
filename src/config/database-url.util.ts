@@ -12,8 +12,23 @@ export interface DatabasePoolConfig {
   warnings: string[];
 }
 
-const DEFAULT_CONNECTION_LIMIT = '3';
-const DEFAULT_READ_CONNECTION_LIMIT = '3';
+/*
+ * Prisma's own default is `num_cpus * 2 + 1`, which lands on 3 for the half-CPU
+ * instances this runs on. That formula assumes the pool is protecting a real
+ * Postgres backend, but these URLs point at Neon's transaction pooler, which
+ * multiplexes and does not care how many client-side slots Prisma keeps.
+ *
+ * Three slots is a hard concurrency ceiling: a single feed build issues dozens
+ * of sequential queries, so it holds a slot for its whole duration and the
+ * fourth concurrent request waits on the pool rather than on the database. The
+ * workload is almost entirely I/O wait, so the extra slots cost the instance
+ * very little CPU.
+ *
+ * Tune with PRISMA_CONNECTION_LIMIT / PRISMA_READ_CONNECTION_LIMIT and watch the
+ * `vormex_db_connections` gauge plus Neon's own connection count.
+ */
+const DEFAULT_CONNECTION_LIMIT = '10';
+const DEFAULT_READ_CONNECTION_LIMIT = '10';
 
 function boolEnv(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === '') return fallback;

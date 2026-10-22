@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import path from 'node:path';
 import test from 'node:test';
 import {
@@ -7,7 +7,7 @@ import {
   createStorageUploadIntent,
   validateFinalizedStreamMedia,
   validateFinalizedStorageMedia,
-} from '../utils/direct-media-upload.util';
+} from '../modules/content/utils/direct-media-upload.util';
 
 async function withUploadEnv<T>(fn: () => T | Promise<T>): Promise<T> {
   const original = {
@@ -39,24 +39,21 @@ async function withUploadEnv<T>(fn: () => T | Promise<T>): Promise<T> {
   }
 }
 
-test('storage upload flow issues a scoped credential', async () => {
+test('storage upload flow never discloses the Bunny zone credential', async () => {
   await withUploadEnv(() => {
-    const credential = createStorageUploadIntent({
-      userId: 'user-1',
-      purpose: 'post_media',
-      mimeType: 'image/jpeg',
-      sizeBytes: 1024,
-    });
-
-    assert.match(credential.objectKey, /^posts\/images\/user-1-/);
-    assert.equal(credential.headers['Content-Type'], 'image/jpeg');
-    assert.ok('AccessKey' in credential.headers);
-    assert.equal(credential.intent.userId, 'user-1');
-    assert.equal(credential.intent.maxBytes, 10 * 1024 * 1024);
+    assert.throws(
+      () => createStorageUploadIntent({
+        userId: 'user-1',
+        purpose: 'post_media',
+        mimeType: 'image/jpeg',
+        sizeBytes: 1024,
+      }),
+      /disabled/
+    );
   });
 });
 
-test('oversized and disallowed storage uploads are rejected at credential issuance', async () => {
+test('all storage direct-upload credential requests fail closed', async () => {
   await withUploadEnv(() => {
     assert.throws(
       () => createStorageUploadIntent({
@@ -65,7 +62,7 @@ test('oversized and disallowed storage uploads are rejected at credential issuan
         mimeType: 'image/jpeg',
         sizeBytes: 11 * 1024 * 1024,
       }),
-      /too large/
+      /disabled/
     );
 
     assert.throws(
@@ -75,51 +72,22 @@ test('oversized and disallowed storage uploads are rejected at credential issuan
         mimeType: 'application/x-msdownload',
         sizeBytes: 1024,
       }),
-      /Unsupported/
+      /disabled/
     );
   });
 });
 
-test('finalize rejects mismatched owner, size, and type before trusting object keys', async () => {
+test('storage finalize rejects previously issued client credentials', async () => {
   await withUploadEnv(async () => {
-    const credential = createStorageUploadIntent({
-      userId: 'user-1',
-      purpose: 'post_media',
-      mimeType: 'image/png',
-      sizeBytes: 2048,
-    });
-
     await assert.rejects(
       validateFinalizedStorageMedia({
         userId: 'user-2',
-        token: credential.token,
-        objectKey: credential.objectKey,
+        token: 'previously-issued-token',
+        objectKey: 'posts/images/user-1-object.png',
         mimeType: 'image/png',
         sizeBytes: 2048,
       }),
-      /another user/
-    );
-
-    await assert.rejects(
-      validateFinalizedStorageMedia({
-        userId: 'user-1',
-        token: credential.token,
-        objectKey: credential.objectKey,
-        mimeType: 'image/jpeg',
-        sizeBytes: 2048,
-      }),
-      /type mismatch/
-    );
-
-    await assert.rejects(
-      validateFinalizedStorageMedia({
-        userId: 'user-1',
-        token: credential.token,
-        objectKey: credential.objectKey,
-        mimeType: 'image/png',
-        sizeBytes: 99 * 1024 * 1024,
-      }),
-      /size mismatch/
+      /disabled/
     );
   });
 });
@@ -160,8 +128,8 @@ test('Bunny Stream credential validates video ownership and size', async () => {
 
 test('default post and reel direct-upload routes do not install memory multer before finalize', () => {
   const root = process.cwd();
-  const postRoutes = readFileSync(path.join(root, 'src/routes/post.routes.ts'), 'utf8');
-  const reelRoutes = readFileSync(path.join(root, 'src/routes/reels.routes.ts'), 'utf8');
+  const postRoutes = readFileSync(path.join(root, 'src/modules/content/routes/post.routes.ts'), 'utf8');
+  const reelRoutes = readFileSync(path.join(root, 'src/modules/content/routes/reels.routes.ts'), 'utf8');
 
   assert.match(postRoutes, /router\.post\('\/upload-url', mediaWriteLimit, getPostUploadUrl\)/);
   assert.match(postRoutes, /router\.post\('\/finalize-upload', mediaWriteLimit, finalizePostUpload\)/);

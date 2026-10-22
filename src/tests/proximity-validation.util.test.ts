@@ -6,7 +6,7 @@ import {
   validateRadius,
   validateSample,
   validateSessionStart,
-} from '../utils/proximity-validation.util';
+} from '../modules/proximity/utils/proximity-validation.util';
 
 const now = Date.parse('2026-07-13T04:30:00.000Z');
 const validSample = {

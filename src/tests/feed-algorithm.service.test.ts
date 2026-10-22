@@ -7,7 +7,7 @@ import {
   rankFeedPage,
   rankFeed,
   recommendedFeedCandidateLimit,
-} from '../services/feed-algorithm.service';
+} from '../modules/discovery/services/feed-algorithm.service';
 
 const now = new Date('2026-05-15T10:00:00.000Z').getTime();
 

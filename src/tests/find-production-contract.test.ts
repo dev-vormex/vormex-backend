@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -15,7 +15,7 @@ function functionBlock(text: string, exportName: string): string {
 }
 
 test('global browse uses a stable database boundary before in-page premium ordering', () => {
-  const block = functionBlock(source('src/controllers/people.controller.ts'), 'getPeople');
+  const block = functionBlock(source('src/modules/discovery/controllers/people.controller.ts'), 'getPeople');
   assert.match(block, /applyDefaultLocalScope: false/);
   assert.match(block, /take: limit \+ 1/);
   assert.ok(block.indexOf('databaseOrderedPage') < block.indexOf('sortByPremiumVisibility'));
@@ -24,7 +24,7 @@ test('global browse uses a stable database boundary before in-page premium order
 });
 
 test('indexed search binds signed cursors to normalized query and excludes unsafe users', () => {
-  const controller = source('src/controllers/people.controller.ts');
+  const controller = source('src/modules/discovery/controllers/people.controller.ts');
   const block = functionBlock(controller, 'searchPeople');
   assert.match(controller, /peopleSearchScope = \(query: string\)/);
   assert.match(block, /decodePeopleSearchCursor\(req\.query\.cursor, normalizedQuery\)/);
@@ -37,8 +37,8 @@ test('indexed search binds signed cursors to normalized query and excludes unsaf
 });
 
 test('person cards and mutations expose canonical relationship state', () => {
-  const people = source('src/controllers/people.controller.ts');
-  const connections = source('src/controllers/connection.controller.ts');
+  const people = source('src/modules/discovery/controllers/people.controller.ts');
+  const connections = source('src/modules/connections/controllers/connection.controller.ts');
   assert.match(people, /relationship: \{\s*status: connectionStatus,\s*connectionId/s);
   assert.match(connections, /canonicalRelationship\('pending_sent', connection\.id\)/);
   assert.match(connections, /canonicalRelationship\('connected', connection\.id\)/);
@@ -47,8 +47,8 @@ test('person cards and mutations expose canonical relationship state', () => {
 });
 
 test('withdrawing a request settles the relationship instead of failing on a stale id', () => {
-  const connections = source('src/controllers/connection.controller.ts');
-  const routes = source('src/routes/connection.routes.ts');
+  const connections = source('src/modules/connections/controllers/connection.controller.ts');
+  const routes = source('src/modules/connections/routes/connection.routes.ts');
   const block = connections.slice(
     connections.indexOf('const withdrawSentRequest'),
     connections.indexOf('export const cancelConnectionRequest')
@@ -86,8 +86,8 @@ test('withdrawing a request settles the relationship instead of failing on a sta
 });
 
 test('profile sections remain separate from feed and activity endpoints', () => {
-  const service = source('src/services/profile.service.ts');
-  const routes = source('src/routes/profile.routes.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
+  const routes = source('src/modules/profiles/routes/profile.routes.ts');
   const block = service.slice(
     service.indexOf('export async function getProfileSections'),
     service.indexOf('/**\n * Get full profile', service.indexOf('export async function getProfileSections'))

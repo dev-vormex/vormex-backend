@@ -4,8 +4,8 @@ import {
   generateSocketTicket,
   getSocketTicketTtlSeconds,
   verifyToken,
-} from '../utils/jwt.util';
-import { verifyAccessToken } from '../middleware/auth.middleware';
+} from '../modules/auth/utils/jwt.util';
+import { verifyAccessToken } from '../shared/middleware/auth.middleware';
 
 test('socket tickets are short-lived, purpose-bound, and rejected as REST access tokens', async () => {
   const previousSecret = process.env.JWT_SECRET;

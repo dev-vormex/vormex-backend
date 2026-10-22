@@ -1,0 +1,23 @@
+import { Router } from 'express';
+import { authenticate } from '../../../shared/middleware/auth.middleware';
+import { createAIRateLimitMiddleware } from '../../../shared/middleware/ai-rate-limit.middleware';
+import { getConversationStarters, getRevivalSuggestions, fixGrammar, getSmartReplies, changeTone, translateMessage, expandMessage, assistantChat, careerChat } from '../controllers/ai-chat.controller';
+
+const router = Router();
+const helperRateLimit = createAIRateLimitMiddleware('helper');
+const careerRateLimit = createAIRateLimitMiddleware('career-chat');
+const assistantRateLimit = createAIRateLimitMiddleware('talk');
+
+router.use(authenticate);
+
+router.post('/conversation-starters', helperRateLimit, getConversationStarters);
+router.post('/revival-suggestions', helperRateLimit, getRevivalSuggestions);
+router.post('/fix-grammar', helperRateLimit, fixGrammar);
+router.post('/smart-replies', helperRateLimit, getSmartReplies);
+router.post('/change-tone', helperRateLimit, changeTone);
+router.post('/translate', helperRateLimit, translateMessage);
+router.post('/expand', helperRateLimit, expandMessage);
+router.post('/assistant', assistantRateLimit, assistantChat);
+router.post('/career-chat', careerRateLimit, careerChat);
+
+export default router;

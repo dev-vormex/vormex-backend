@@ -13,12 +13,12 @@ import {
   scoreRecommendationCandidate,
   sourceQuotaCounts,
   type RecommendationCandidate,
-} from '../services/recommendation-engine.service';
+} from '../modules/discovery/services/recommendation-engine.service';
 import {
   decodeRecommendationCursor,
   encodeRecommendationCursor,
-} from '../services/recommendation-platform.service';
-import { blendRecommendationPreferenceVector } from '../services/recommendation-embedding.service';
+} from '../modules/discovery/services/recommendation-platform.service';
+import { blendRecommendationPreferenceVector } from '../modules/discovery/services/recommendation-embedding.service';
 
 function candidate(id: string, overrides: Partial<RecommendationCandidate> = {}): RecommendationCandidate {
   return {

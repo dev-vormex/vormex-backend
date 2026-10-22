@@ -5,7 +5,7 @@ import {
   getPremiumProfileCustomizationFields,
   hasPremiumEntitlement,
   hasPremiumProfileCustomizationUpdate,
-} from '../services/premium-feature-gates.service';
+} from '../modules/premium/services/premium-feature-gates.service';
 
 test('hasPremiumEntitlement allows premium, creator pro, and admin users', () => {
   assert.equal(

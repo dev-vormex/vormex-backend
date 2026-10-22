@@ -4,7 +4,7 @@ import {
   canViewerSeeReadReceipt,
   maskReadReceiptForViewer,
   shouldNotifySenderAboutReadReceipt,
-} from '../services/chat-read-receipts.service';
+} from '../modules/chat/services/chat-read-receipts.service';
 
 test('free senders do not see read receipts for their own messages', () => {
   const message = maskReadReceiptForViewer(

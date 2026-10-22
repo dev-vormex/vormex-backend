@@ -5,7 +5,7 @@ import {
   EmailServiceConfigurationError,
   ensureEmailServiceReady,
   toPublicEmailDeliveryFailure,
-} from '../utils/email.util';
+} from '../infrastructure/email/email.util';
 
 test('missing email configuration fails before a request can claim an email was sent', async () => {
   const previousApiKey = process.env.RESEND_API_KEY;

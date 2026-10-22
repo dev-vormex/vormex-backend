@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -17,7 +17,7 @@ function functionBlock(text: string, exportName: string): string {
 }
 
 test('home feed merges the keyset cursor into the visibility gate instead of replacing it', () => {
-  const block = functionBlock(source('src/controllers/post.controller.ts'), 'getFeed');
+  const block = functionBlock(source('src/modules/content/controllers/post.controller.ts'), 'getFeed');
 
   /*
    * buildPostVisibilityWhere returns its gate under an `AND` key, so spreading
@@ -34,7 +34,7 @@ test('home feed merges the keyset cursor into the visibility gate instead of rep
 });
 
 test('every post read path gates on the shared visibility helpers', () => {
-  const controller = source('src/controllers/post.controller.ts');
+  const controller = source('src/modules/content/controllers/post.controller.ts');
 
   for (const exportName of ['getPost', 'getComments', 'getLikes', 'sharePost']) {
     assert.match(
@@ -47,7 +47,7 @@ test('every post read path gates on the shared visibility helpers', () => {
   // Saved rows outlive the visibility they were saved under, so the audience is
   // re-checked at read time rather than trusted from when the save happened.
   assert.match(
-    functionBlock(source('src/controllers/saved.controller.ts'), 'getSaved'),
+    functionBlock(source('src/modules/content/controllers/saved.controller.ts'), 'getSaved'),
     /canViewPost\(item\.posts, userId\)/
   );
 
@@ -60,7 +60,7 @@ test('every post read path gates on the shared visibility helpers', () => {
 });
 
 test('mention notifications never carry a post body past its own audience', () => {
-  const block = functionBlock(source('src/controllers/post.controller.ts'), 'createPost');
+  const block = functionBlock(source('src/modules/content/controllers/post.controller.ts'), 'createPost');
 
   // The notification preview is the raw post body, so a recipient who cannot
   // open the post must not be told about it at all.
@@ -77,7 +77,7 @@ test('mention notifications never carry a post body past its own audience', () =
 });
 
 test('post creation fans out only to the selected audience', () => {
-  const block = functionBlock(source('src/controllers/post.controller.ts'), 'createPost');
+  const block = functionBlock(source('src/modules/content/controllers/post.controller.ts'), 'createPost');
 
   assert.match(block, /if \(visibility === 'public'\)[\s\S]{0,200}?rooms: \[FEED_REALTIME_ROOM\]/);
   assert.match(block, /visibility === 'connections'[\s\S]{0,200}?users: \[userId, \.\.\.peerIds\]/);
@@ -86,7 +86,7 @@ test('post creation fans out only to the selected audience', () => {
 });
 
 test('profile feed applies the viewer visibility gate and keys its cache per viewer', () => {
-  const service = source('src/services/profile.service.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
 
   // Posts and articles are queried separately; both need the gate.
   assert.equal((service.match(/buildPostVisibilityWhere\(requestingUserId\)/g) || []).length, 2);
@@ -95,7 +95,7 @@ test('profile feed applies the viewer visibility gate and keys its cache per vie
 });
 
 test('the visibility gate itself only widens for the author, connections and collaborators', () => {
-  const util = source('src/utils/access-control.util.ts');
+  const util = source('src/shared/utils/access-control.util.ts');
   const block = util.slice(
     util.indexOf('export async function buildPostVisibilityWhere'),
     util.indexOf('export async function canViewPost')

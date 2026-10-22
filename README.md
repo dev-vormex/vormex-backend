@@ -1,5 +1,7 @@
 # Vormex Backend API
 
+Architecture and maintenance rules: [backend architecture](docs/architecture/README.md) and [AGENTS.md](AGENTS.md).
+
 Professional social networking platform for students - LinkedIn + Instagram reels + GitHub profile + LeetCode stats style.
 
 ## 🚀 Quick Start

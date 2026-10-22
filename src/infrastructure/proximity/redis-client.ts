@@ -1,14 +1,12 @@
+import { parsePositiveInt as positiveInt } from "../../config/env.util";
 import Redis from 'ioredis';
-import { logger } from '../../lib/logger';
+import { logger } from '../logging/logger';
 
 const url = process.env.PROXIMITY_REDIS_URL || (process.env.NODE_ENV === 'production' ? undefined : process.env.REDIS_URL);
 let lastError: string | null = url ? null : 'PROXIMITY_REDIS_URL is not configured';
 let lastErrorLoggedAt = 0;
 
-function positiveInt(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+
 
 function create(label: string): Redis | null {
   if (!url) return null;

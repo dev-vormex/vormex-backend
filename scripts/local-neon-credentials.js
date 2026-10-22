@@ -31,6 +31,10 @@ function readCredentialRecord(filePath, expectedRole) {
 
 function unprotectCredential(ciphertext) {
   const command =
+    '$ErrorActionPreference="Stop";' +
+    // pwsh can pass its PSModulePath to Windows PowerShell. Load the matching
+    // Windows module explicitly instead of autoloading an incompatible one.
+    'Import-Module (Join-Path $PSHOME "Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1");' +
     '$e=[Console]::In.ReadToEnd();' +
     '$s=ConvertTo-SecureString -String $e;' +
     '$p=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s);' +

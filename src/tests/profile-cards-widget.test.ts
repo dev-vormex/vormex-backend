@@ -4,7 +4,7 @@ import {
   MCP_APP_MIME_TYPE,
   PROFILE_CARDS_HTML,
   PROFILE_CARDS_RESOURCE_URI,
-} from '../mcp/profile-cards.widget';
+} from '../http/mcp/profile-cards.widget';
 
 test('profile card widget uses the MCP Apps resource contract', () => {
   assert.equal(MCP_APP_MIME_TYPE, 'text/html;profile=mcp-app');

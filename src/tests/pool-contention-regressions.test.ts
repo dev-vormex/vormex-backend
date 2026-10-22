@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 
 function source(path: string): string {
@@ -8,7 +8,7 @@ function source(path: string): string {
 }
 
 test('global and route authentication share one resolved request state', () => {
-  const auth = source('src/middleware/auth.middleware.ts');
+  const auth = source('src/shared/middleware/auth.middleware.ts');
   const resolver = auth.slice(
     auth.indexOf('async function resolveRequestAuth'),
     auth.indexOf('/**\n * Authentication middleware')
@@ -23,8 +23,8 @@ test('global and route authentication share one resolved request state', () => {
 });
 
 test('profile defaults to core and keeps the legacy bundle behind include=all', () => {
-  const controller = source('src/controllers/profile.controller.ts');
-  const service = source('src/services/profile.service.ts');
+  const controller = source('src/modules/profiles/controllers/profile.controller.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
   const core = service.slice(
     service.indexOf('export async function getCoreProfile'),
     service.indexOf('/**\n * Load the independently cacheable lower profile sections')
@@ -38,7 +38,7 @@ test('profile defaults to core and keeps the legacy bundle behind include=all', 
 });
 
 test('sending a connection request batches its independent reads', () => {
-  const controller = source('src/controllers/connection.controller.ts');
+  const controller = source('src/modules/connections/controllers/connection.controller.ts');
   const send = controller.slice(
     controller.indexOf('export const sendConnectionRequest'),
     controller.indexOf('export const acceptConnectionRequest')
@@ -58,7 +58,7 @@ test('sending a connection request batches its independent reads', () => {
 });
 
 test('connection mutations answer before evicting discovery caches', () => {
-  const controller = source('src/controllers/connection.controller.ts');
+  const controller = source('src/modules/connections/controllers/connection.controller.ts');
 
   // Tag invalidation fans out across every discovery list both users appear in
   // and the write is already durable, so the caller gained nothing by waiting.
@@ -81,13 +81,13 @@ test('connection mutations answer before evicting discovery caches', () => {
 });
 
 test('connection acceptance only updates state and writes a transactional outbox event', () => {
-  const controller = source('src/controllers/connection.controller.ts');
+  const controller = source('src/modules/connections/controllers/connection.controller.ts');
   const accept = controller.slice(
     controller.indexOf('export const acceptConnectionRequest'),
     controller.indexOf('export const rejectConnectionRequest')
   );
-  const workers = source('src/workers/index.ts');
-  const sideEffects = source('src/services/connection-accepted-side-effects.service.ts');
+  const workers = source('src/jobs/workers/index.ts');
+  const sideEffects = source('src/modules/connections/services/connection-accepted-side-effects.service.ts');
 
   assert.match(accept, /enqueueOutboxEvent\(tx/);
   assert.match(accept, /connectionSideEffects/);

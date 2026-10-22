@@ -5,7 +5,7 @@ import {
   type GooglePlayPremiumConfig,
   type GooglePlaySubscriptionPurchaseV2,
   validateGooglePlayPremiumPurchase,
-} from '../services/google-play-premium.service';
+} from '../modules/premium/services/google-play-premium.service';
 
 const config: GooglePlayPremiumConfig = {
   packageName: 'com.vormex.android',

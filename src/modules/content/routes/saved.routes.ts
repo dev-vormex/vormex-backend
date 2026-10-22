@@ -1,0 +1,15 @@
+import { Router } from 'express';
+import { authenticate } from '../../../shared/middleware/auth.middleware';
+import { getSaved, getSavedProfiles, toggleSave, savePost, unsavePost, checkSaved } from '../controllers/saved.controller';
+
+const router = Router();
+router.use(authenticate);
+
+router.get('/', getSaved);
+router.get('/profiles', getSavedProfiles);
+router.get('/:postId/check', checkSaved);
+router.post('/:postId/toggle', toggleSave);
+router.post('/:postId', savePost);
+router.delete('/:postId', unsavePost);
+
+export default router;

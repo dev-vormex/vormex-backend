@@ -1,0 +1,269 @@
+import {
+  getNotificationPreferences,
+  updateNotificationPreferences,
+  legacyNotificationSettings,
+} from '../services/preferences.service';
+import type { AuthenticatedRequest as AuthRequest } from '../../../shared/types/authenticated-request';
+import { Response } from 'express';
+import { prisma } from '../../../config/prisma';
+import { ensureString } from '../../../shared/utils/request.util';
+import { collapseInboxNotifications, notificationService } from '../services/notification.service';
+import { getBlockedUserIds } from '../../safety/services/trust-safety.service';
+import {
+  clampPageSize,
+  createdAtDescKeysetWhere,
+  dateAscKeysetWhere,
+  decodeKeysetCursor,
+  decodeLegacyDateCursor,
+  encodeKeysetCursor,
+} from '../../../shared/utils/keyset-pagination.util';
+
+const notificationInclude = {
+  users_notifications_actorIdTousers: {
+    select: {
+      id: true,
+      username: true,
+      name: true,
+      profileImage: true,
+      isVerified: true,
+      profileBadgeStyle: true,
+    },
+  },
+  posts: {
+    select: {
+      id: true,
+      content: true,
+      mediaUrls: true,
+    },
+  },
+  reels: {
+    select: {
+      id: true,
+      title: true,
+      thumbnailUrl: true,
+    },
+  },
+};
+
+const formatNotification = (notification: any) => ({
+  id: notification.id,
+  type: notification.type,
+  title: notification.title,
+  body: notification.body,
+  actor: notification.users_notifications_actorIdTousers,
+  post: notification.posts,
+  reel: notification.reels,
+  data: notification.data,
+  isRead: notification.isRead,
+  readAt: notification.readAt?.toISOString() || null,
+  createdAt: notification.createdAt.toISOString(),
+});
+
+// Get notifications with pagination
+export const getNotifications = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const cursorValue = ensureString(req.query.cursor);
+    const cursor = decodeKeysetCursor(cursorValue, 'notifications');
+    const afterCursorValue = ensureString(req.query.afterCursor);
+    const afterCursor = decodeKeysetCursor(afterCursorValue, 'notifications');
+    const legacyCursorDate = cursor ? null : decodeLegacyDateCursor(cursorValue);
+    const limit = clampPageSize(req.query.limit, 20, 50);
+    const unreadOnly = req.query.unreadOnly === 'true';
+
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const whereClause: any = {
+      userId,
+      AND: blockedUserIds.length > 0 ? [{ OR: [{ actorId: null }, { actorId: { notIn: blockedUserIds } }] }] : [],
+    };
+
+    if (unreadOnly) {
+      whereClause.isRead = false;
+    }
+
+    const newerWhere = dateAscKeysetWhere(afterCursor, 'createdAt');
+    const cursorWhere = createdAtDescKeysetWhere(cursor);
+    if (newerWhere) {
+      whereClause.AND.push(newerWhere);
+    } else if (cursorWhere) {
+      whereClause.AND.push(cursorWhere);
+    } else if (legacyCursorDate) {
+      whereClause.createdAt = { lt: legacyCursorDate };
+    }
+
+    const rawTake = Math.min(limit * 3, 150) + 1;
+    const isIncrementalRequest = !!newerWhere;
+    const notifications = await prisma.notifications.findMany({
+      where: whereClause,
+      include: notificationInclude,
+      orderBy: isIncrementalRequest ? [{ createdAt: 'asc' }, { id: 'asc' }] : [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: rawTake,
+    });
+
+    const collapsedNotifications = collapseInboxNotifications(notifications);
+    const hasMore = collapsedNotifications.length > limit;
+    const pageResults = hasMore ? collapsedNotifications.slice(0, limit) : collapsedNotifications;
+    const results = isIncrementalRequest ? pageResults.reverse() : pageResults;
+    const formatted = results.map(formatNotification);
+
+    res.json({
+      notifications: formatted,
+      latestCursor:
+        results.length > 0
+          ? encodeKeysetCursor({
+              scope: 'notifications',
+              t: results[0].createdAt.toISOString(),
+              id: results[0].id,
+            })
+          : null,
+      nextCursor:
+        !isIncrementalRequest && hasMore && results.length > 0
+          ? encodeKeysetCursor({
+              scope: 'notifications',
+              t: results[results.length - 1].createdAt.toISOString(),
+              id: results[results.length - 1].id,
+            })
+          : null,
+      hasMore: !isIncrementalRequest && hasMore,
+      hasMoreNewer: isIncrementalRequest && hasMore,
+    });
+  } catch (error) {
+    console.error('Failed to fetch notifications:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+};
+
+// Get unread count
+export const getUnreadCount = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const blockedUserIds = await getBlockedUserIds(userId);
+    const count = await prisma.notifications.count({
+      where: {
+        userId,
+        isRead: false,
+        ...(blockedUserIds.length > 0 ? { OR: [{ actorId: null }, { actorId: { notIn: blockedUserIds } }] } : {}),
+      },
+    });
+    res.json({ count });
+  } catch (error) {
+    console.error('Failed to fetch unread count:', error);
+    res.status(500).json({ error: 'Failed to fetch unread count' });
+  }
+};
+
+// Mark notifications as read
+export const markAsRead = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { notificationIds } = req.body;
+
+    if (!Array.isArray(notificationIds) || notificationIds.length === 0) {
+      res.status(400).json({ error: 'notificationIds must be a non-empty array' });
+      return;
+    }
+
+    await notificationService.markAsRead(userId, notificationIds);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Failed to mark notifications as read:', error);
+    res.status(500).json({ error: 'Failed to mark notifications as read' });
+  }
+};
+
+// Mark all notifications as read
+export const markAllAsRead = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    await notificationService.markAllAsRead(userId);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Failed to mark all notifications as read:', error);
+    res.status(500).json({ error: 'Failed to mark all notifications as read' });
+  }
+};
+
+// Delete a notification
+export const deleteNotification = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const notificationId = ensureString(req.params.notificationId);
+    if (!notificationId) {
+      res.status(400).json({ error: 'Notification ID is required' });
+      return;
+    }
+
+    await prisma.notifications.deleteMany({
+      where: {
+        id: notificationId,
+        userId,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Failed to delete notification:', error);
+    res.status(500).json({ error: 'Failed to delete notification' });
+  }
+};
+
+// Durable per-user settings; legacy flag names remain available to other clients.
+export const getSettings = async (
+  req: AuthRequest,
+  res: Response,
+  next: import('express').NextFunction
+): Promise<void> => {
+  if (!req.user?.userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  try {
+    res.json({ settings: legacyNotificationSettings(await getNotificationPreferences(String(req.user.userId))) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateSettings = async (
+  req: AuthRequest,
+  res: Response,
+  next: import('express').NextFunction
+): Promise<void> => {
+  if (!req.user?.userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  try {
+    res.json({
+      success: true,
+      settings: legacyNotificationSettings(await updateNotificationPreferences(String(req.user.userId), req.body)),
+    });
+  } catch (error) {
+    next(error);
+  }
+};

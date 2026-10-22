@@ -3,7 +3,7 @@ import test from 'node:test';
 import {
   PushNotificationService,
   resolvePushNotificationMode,
-} from '../services/push-notification.service';
+} from '../modules/notifications/services/push-notification.service';
 
 const ENV_KEYS = [
   'NODE_ENV',

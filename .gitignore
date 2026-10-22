@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 # Prisma
 # Keep migrations directory in version control
 !prisma/migrations/
+
+# macOS Finder metadata
+.DS_Store

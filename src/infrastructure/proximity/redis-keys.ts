@@ -1,10 +1,9 @@
 import { createHash } from 'crypto';
-import type { ProximityMode } from '../../types/proximity.types';
+import type { ProximityMode } from '../../modules/proximity/types/proximity.types';
 
 export const PROXIMITY_EVENT_TTL_SECONDS = 360;
 export const PROXIMITY_PUBLIC_TTL_SECONDS = 600;
 export const PROXIMITY_IDEMPOTENCY_TTL_SECONDS = 600;
-export const PROXIMITY_FLUSH_TTL_SECONDS = 86_400;
 // Keep pagination snapshots brief enough for two newly active nearby users to
 // discover each other on the next client refresh while retaining cursor stability.
 export const PROXIMITY_LIVE_SNAPSHOT_TTL_SECONDS = 15;

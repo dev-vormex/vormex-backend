@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { register } from '../infrastructure/metrics/registry';
-import { installProcessErrorHandlers } from '../utils/process-error-handlers.util';
+import { installProcessErrorHandlers } from '../bootstrap/process-error-handlers.util';
 
 function waitForMicrotasks(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));

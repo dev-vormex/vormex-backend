@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
@@ -14,7 +14,7 @@ import {
   safetyErrorResponse,
   trustLevelRank,
   verificationBadgesForTrustLevel,
-} from '../services/trust-safety.service';
+} from '../modules/safety/services/trust-safety.service';
 
 const source = (path: string) => readFileSync(join(process.cwd(), path), 'utf8');
 
@@ -31,7 +31,9 @@ test('classifies block enforcement errors as terminal structured failures', () =
       retryAfterSeconds: undefined,
     },
   });
-  assert.equal(safetyErrorResponse(unavailable).body.retryable, false);
+  const response = safetyErrorResponse(unavailable);
+  assert.ok(response);
+  assert.equal(response.body.retryable, false);
 });
 
 test('normalizes E.164 phone numbers and rejects invalid values', () => {
@@ -73,7 +75,7 @@ test('normalizes and hashes install codes without exposing raw values', () => {
 });
 
 test('profile reads enforce bilateral blocks before cached profile service reads', () => {
-  const controller = source('src/controllers/profile.controller.ts');
+  const controller = source('src/modules/profiles/controllers/profile.controller.ts');
   const getProfile = controller.slice(
     controller.indexOf('export const getProfile ='),
     controller.indexOf('export const getProfileSections =')
@@ -90,7 +92,7 @@ test('profile reads enforce bilateral blocks before cached profile service reads
 });
 
 test('story interaction denials use privacy-safe terminal errors', () => {
-  const controller = source('src/controllers/stories.controller.ts');
+  const controller = source('src/modules/content/controllers/stories.controller.ts');
   const react = controller.slice(
     controller.indexOf('export const reactToStory ='),
     controller.indexOf('export const removeStoryReaction =')
@@ -107,7 +109,7 @@ test('story interaction denials use privacy-safe terminal errors', () => {
 });
 
 test('block cleanup stays bounded for device-linked accounts', () => {
-  const service = source('src/services/trust-safety.service.ts');
+  const service = source('src/modules/safety/services/trust-safety.service.ts');
   const blockOperation = service.slice(
     service.indexOf('export async function createUserBlockWithDeviceScope'),
     service.indexOf('export async function findBlockBetween')

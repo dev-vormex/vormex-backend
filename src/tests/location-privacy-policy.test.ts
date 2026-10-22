@@ -1,15 +1,15 @@
+import { readImplementationFile } from './helpers/implementation-source';
 ﻿import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
-const locationControllerPath = path.join(process.cwd(), 'src/controllers/location.controller.ts');
-const discoveryPowerPath = path.join(process.cwd(), 'src/services/discovery-power.service.ts');
+const locationControllerPath = path.join(process.cwd(), 'src/modules/proximity/controllers/location.controller.ts');
+const discoveryPowerPath = path.join(process.cwd(), 'src/modules/discovery/services/discovery-power.service.ts');
 
 // These tests slice source text with "\n"-based markers; normalize CRLF so
 // they behave the same on Windows working trees as on CI.
 const readSource = (filePath: string): string =>
-  fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+  readImplementationFile(filePath, 'utf8').replace(/\r\n/g, '\n');
 const migrationPath = path.join(
   process.cwd(),
   'prisma/migrations/20260608160000_make_location_public_opt_in/migration.sql',

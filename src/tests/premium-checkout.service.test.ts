@@ -6,7 +6,7 @@ import {
   validatePremiumCheckoutPayment,
   verifyRazorpaySignature,
   verifyRazorpayWebhookSignature,
-} from '../services/premium-checkout.service';
+} from '../modules/premium/services/premium-checkout.service';
 
 const baseConfig: PremiumPlanConfig = {
   amountMinor: 19900,

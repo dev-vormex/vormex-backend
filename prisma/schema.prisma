@@ -1,5 +1,11 @@
 generator client {
   provider = "prisma-client-js"
+  // Without this, every `include` is a separate query: one page of feed with
+  // six included relations is seven round trips to Neon. Enabling the feature
+  // does not change any existing query — the default load strategy stays
+  // `query`. Reads opt in individually with `relationLoadStrategy: 'join'`, so
+  // wide fan-outs (where a join multiplies rows) can keep the old behaviour.
+  previewFeatures = ["relationJoins"]
 }
 
 datasource db {
@@ -9,6 +15,9 @@ datasource db {
 }
 
 model User {
+  notification_preferences notification_preferences?
+  authored_group_posts group_posts[]
+  group_post_likes group_post_likes[]
   id                                                       String                                 @id @default(uuid())
   email                                                    String                                 @unique
   emailHash                                                String?                                @unique
@@ -55,6 +64,8 @@ model User {
   username                                                 String                                 @unique
   adminTwoFactorEnabled                                    Boolean                                @default(false)
   adminTwoFactorSecret                                     String?
+  adminTwoFactorPendingSecret                              String?
+  adminTwoFactorPendingAt                                  DateTime?
   currentCity                                              String?
   isAdmin                                                  Boolean                                @default(false)
   isBanned                                                 Boolean                                @default(false)
@@ -682,15 +693,30 @@ model PostPollVote {
   @@map("post_poll_votes")
 }
 
+/// Viewer-reported feed impressions. One row per (viewer, post); repeat views bump
+/// `seenCount`/`seenAt` and accumulate `dwellMs` rather than inserting duplicates.
+/// The extra ranking columns are written best-effort by the client and are used only
+/// for offline tuning and behavioural signals — they are never returned to clients.
 model feed_impressions {
-  id     String   @id @default(uuid())
-  userId String
-  postId String
-  seenAt DateTime @default(now())
+  id              String    @id @default(uuid())
+  userId          String
+  postId          String
+  seenAt          DateTime  @default(now())
+  creatorId       String?
+  feedSessionId   String?
+  position        Int?
+  candidateSource String?
+  rankingScore    Float?
+  rankingVersion  String?
+  seenCount       Int       @default(1)
+  firstSeenAt     DateTime?
+  dwellMs         Int?
 
   @@unique([userId, postId])
   @@index([userId, seenAt])
   @@index([seenAt])
+  @@index([userId, creatorId, seenAt])
+  @@index([feedSessionId])
 }
 
 model reward_card_events {
@@ -1061,7 +1087,7 @@ model college_communities {
   description      String?
   groupId          String                      @unique
   emailDomains     String[]
-  verificationMode String                      @default("profile_college")
+  verificationMode String                      @default("student_email_otp")
   memberCount      Int                         @default(0)
   createdById      String?
   createdAt        DateTime                    @default(now())
@@ -1090,8 +1116,8 @@ model college_student_verifications {
   userId       String
   college      String
   studentEmail String?
-  status       String    @default("verified")
-  method       String    @default("profile_college")
+  status       String    @default("pending")
+  method       String    @default("manual_review")
   verifiedAt   DateTime?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
@@ -1196,6 +1222,7 @@ model conversations {
   lastMessageAt                             DateTime?
   createdAt                                 DateTime             @default(now())
   updatedAt                                 DateTime             @updatedAt
+  hiddenForUserIds                          String[]             @default([])
   users_conversations_participant1IdTousers User                 @relation("conversations_participant1IdTousers", fields: [participant1Id], references: [id], onDelete: Cascade)
   users_conversations_participant2IdTousers User                 @relation("conversations_participant2IdTousers", fields: [participant2Id], references: [id], onDelete: Cascade)
   messages                                  messages[]
@@ -1671,6 +1698,7 @@ model group_messages {
 }
 
 model groups {
+  group_posts group_posts[]
   id                   String                @id
   name                 String
   slug                 String?               @unique
@@ -1752,6 +1780,7 @@ model messages {
   readAt            DateTime?
   editedAt          DateTime?
   isDeleted         Boolean             @default(false)
+  hiddenForUserIds  String[]             @default([])
   replyToId         String?
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
@@ -3082,4 +3111,41 @@ enum TriviaCategory {
   CYBERSECURITY
   DEVOPS
   GENERAL
+}
+
+model notification_preferences {
+  userId String @id
+  settings Json @default("{}")
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model group_posts {
+  id String @id @default(uuid())
+  groupId String
+  authorId String
+  content String
+  mediaUrls String[]
+  mediaType String?
+  likesCount Int @default(0)
+  commentsCount Int @default(0)
+  isPinned Boolean @default(false)
+  isApproved Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  group groups @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  likes group_post_likes[]
+  @@index([groupId, createdAt, id])
+  @@index([authorId])
+}
+
+model group_post_likes {
+  postId String
+  userId String
+  createdAt DateTime @default(now())
+  post group_posts @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([postId, userId])
+  @@index([userId])
 }

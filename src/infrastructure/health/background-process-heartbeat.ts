@@ -1,7 +1,8 @@
+import { parsePositiveInt } from "../../config/env.util";
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { isCriticalRedisEnabled, redisCommand } from '../redis/client';
-import { logger } from '../../lib/logger';
+import { logger } from '../logging/logger';
 
 export type BackgroundProcessRole = 'worker' | 'scheduler';
 export type BackgroundProcessStatus = 'healthy' | 'missing' | 'stale' | 'unavailable';
@@ -27,10 +28,7 @@ export interface BackgroundProcessesHealth {
   roles: Record<BackgroundProcessRole, BackgroundRoleHealth>;
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+
 
 const HEARTBEAT_INTERVAL_MS = parsePositiveInt(
   process.env.BACKGROUND_HEARTBEAT_INTERVAL_MS,
@@ -114,7 +112,7 @@ export async function startBackgroundProcessHeartbeat(
       startedAt,
       lastSeenAt: new Date().toISOString(),
     };
-    await redisCommand.set(
+    await redisCommand!.set(
       heartbeatKey(role),
       JSON.stringify(heartbeat),
       'EX',

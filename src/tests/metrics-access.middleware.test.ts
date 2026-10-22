@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from 'express';
 import {
   isMetricsIpAllowed,
   requireMetricsIpAllowList,
-} from '../middleware/metrics.middleware';
+} from '../shared/middleware/metrics.middleware';
 
 function buildResponse() {
   const response = {

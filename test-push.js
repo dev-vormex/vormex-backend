@@ -12,7 +12,11 @@ if (!admin.apps.length) {
   });
 }
 
-const token = 'fxvw9agYSwGFC9nHCb_8uy:APA91bEkCDljZj81fFjQL4cQYqcQMm2gQ7D-SjdXammJlXICj31R2VXdthB8RKb0UlSVXYoFEOFWDo23GSG5icwKdPRnQjOSPJJZyT88mnyx7LzP5Y9w09w';
+const token = process.env.TEST_PUSH_TOKEN;
+if (!token) {
+  console.error('Set TEST_PUSH_TOKEN to the target device FCM token before running this tool.');
+  process.exit(1);
+}
 
 const message = {
   data: {

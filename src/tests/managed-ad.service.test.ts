@@ -5,7 +5,7 @@ import {
   isManagedAdCtaAllowed,
   managedAdSlotsForItemCount,
   matchesManagedAdTargeting,
-} from '../services/managed-ad.service';
+} from '../modules/ads/services/managed-ad.service';
 
 const baseProfile = {
   colleges: ['vormex university'],

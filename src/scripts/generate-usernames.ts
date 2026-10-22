@@ -10,7 +10,7 @@
  */
 
 import { PrismaClient } from '@prisma/client';
-import { generateUsernameFromName, normalizeUsername } from '../utils/username.util';
+import { generateUsernameFromName, normalizeUsername } from '../shared/utils/username.util';
 
 const prisma = new PrismaClient();
 

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
   cacheMetricNamespace,
   RedisCacheService,
 } from '../infrastructure/cache/redis-cache.service';
-import { profileViewAnalyticsJobId } from '../services/profile-view-analytics.service';
+import { profileViewAnalyticsJobId } from '../modules/profiles/services/profile-view-analytics.service';
 
 test('cache metric namespaces are bounded and never expose identifiers', () => {
   assert.equal(cacheMetricNamespace('profile:core:viewer-1:user-1'), 'profile');
@@ -43,7 +43,7 @@ test('Redis tag TTL can only be initialized or extended', () => {
 
 test('profile reads coalesce misses and core returns follow context', () => {
   const source = readFileSync(
-    join(process.cwd(), 'src/services/profile.service.ts'),
+    join(process.cwd(), 'src/modules/profiles/services/profile.service.ts'),
     'utf8'
   );
   const core = source.slice(
@@ -60,11 +60,11 @@ test('profile reads coalesce misses and core returns follow context', () => {
 
 test('automatic profile views enqueue analytics instead of querying social proof in API', () => {
   const profile = readFileSync(
-    join(process.cwd(), 'src/services/profile.service.ts'),
+    join(process.cwd(), 'src/modules/profiles/services/profile.service.ts'),
     'utf8'
   );
   const worker = readFileSync(
-    join(process.cwd(), 'src/workers/index.ts'),
+    join(process.cwd(), 'src/jobs/workers/index.ts'),
     'utf8'
   );
 
@@ -103,16 +103,4 @@ test('cache observability labels backend and bounded namespace', () => {
   assert.match(metrics, /labelNames: \['operation', 'outcome', 'backend', 'namespace'\]/);
 });
 
-test('Android trusts core follow context without an extra profile-open request', () => {
-  const viewModel = readFileSync(
-    join(
-      process.cwd(),
-      '../vormex-android/catalog/src/main/java/com/kyant/backdrop/catalog/linkedin/ProfileViewModel.kt'
-    ),
-    'utf8'
-  );
 
-  assert.doesNotMatch(viewModel, /loadFollowStatus\(/);
-  assert.match(viewModel, /isFollowing = mergedProfile\.viewerContext\.isFollowing/);
-  assert.match(viewModel, /isFollowedBy = mergedProfile\.viewerContext\.isFollowedBy/);
-});

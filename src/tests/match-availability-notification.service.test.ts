@@ -3,10 +3,10 @@ import test from 'node:test';
 import {
   buildMatchAvailabilityCopy,
   scoreMatchRecommendation,
-} from '../services/match-availability-notification.service';
+} from '../modules/notifications/services/match-availability-notification.service';
 import {
   scoreUserMatch,
-} from '../services/matching-engine.service';
+} from '../modules/discovery/services/matching-engine.service';
 
 function createUser(overrides: Record<string, any> = {}) {
   return {

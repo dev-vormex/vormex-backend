@@ -1,4 +1,4 @@
-import { assertUsableAuthSecret, isWeakAuthSecret } from '../utils/jwt.util';
+import { assertUsableAuthSecret, isWeakAuthSecret } from '../modules/auth/utils/jwt.util';
 
 const PUBLIC_ENV_PREFIXES = ['NEXT_PUBLIC_', 'VITE_', 'PUBLIC_'];
 const SENSITIVE_PUBLIC_ENV_PATTERN =

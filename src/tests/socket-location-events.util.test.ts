@@ -6,7 +6,7 @@ import {
   buildSocketLocationEventPayload,
   shouldThrottleSocketLocationUpdate,
   validateSocketLocationPayload,
-} from '../utils/socket-location-events.util';
+} from '../modules/proximity/utils/socket-location-events.util';
 
 function assertNoCoordinates(value: unknown): void {
   if (value === null || value === undefined) return;

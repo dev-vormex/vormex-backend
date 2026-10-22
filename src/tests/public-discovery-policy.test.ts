@@ -6,8 +6,8 @@ import {
   normalizeDiscoveryList,
   normalizeDiscoveryText,
   tokenizeDiscoveryIntent,
-} from '../services/public-discovery.service';
-import { tokenizePublicPostQuery } from '../services/public-content-discovery.service';
+} from '../modules/discovery/services/public-discovery.service';
+import { tokenizePublicPostQuery } from '../modules/discovery/services/public-content-discovery.service';
 
 const eligibleUser = {
   isBanned: false,

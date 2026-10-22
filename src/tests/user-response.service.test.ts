@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildProfileCustomizationResponseFields } from '../services/user-response.service';
+import { buildProfileCustomizationResponseFields } from '../modules/profiles/services/user-response.service';
 
 test('profile customization response fields are preserved for entitled users', () => {
   assert.deepEqual(

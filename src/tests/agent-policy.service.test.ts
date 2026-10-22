@@ -3,8 +3,8 @@ import test from 'node:test';
 import {
   evaluateToolExecutionPolicy,
   resolveAgentAutonomyPolicy,
-} from '../agent/action-policy.service';
-import { evaluateAgentUserInputSafety } from '../agent/safety.service';
+} from '../modules/agent/services/action-policy.service';
+import { evaluateAgentUserInputSafety } from '../modules/agent/services/safety.service';
 
 const baseCtx = {
   userId: 'user-1',

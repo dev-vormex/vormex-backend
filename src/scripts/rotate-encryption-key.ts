@@ -1,17 +1,8 @@
 import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import { hasPreviousEncryptionKey } from '../config/encryption-keyring';
-import {
-  inspectAdminTwoFactorSecret,
-  inspectStoredSecret,
-  reencryptAdminTwoFactorSecret,
-  reencryptStoredSecret,
-  StoredSecretInspection,
-} from '../services/encryption-rotation.service';
-import {
-  listIdentityEvidenceStorageKeys,
-  rotateEncryptedIdentityEvidence,
-} from '../services/identity-evidence.service';
+import { inspectAdminTwoFactorSecret, inspectStoredSecret, reencryptAdminTwoFactorSecret, reencryptStoredSecret, StoredSecretInspection } from '../infrastructure/security/encryption-rotation.service';
+import { listIdentityEvidenceStorageKeys, rotateEncryptedIdentityEvidence } from '../modules/identity/services/identity-evidence.service';
 
 type Mode = 'dry-run' | 'apply' | 'verify';
 type UserSecretField = 'githubAccessToken' | 'phoneEncrypted' | 'adminTwoFactorSecret';

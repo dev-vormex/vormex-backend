@@ -5,7 +5,7 @@ import {
   executeWithCircuitBreaker,
   isThirdPartyHttpError,
   resetHttpCircuitBreakersForTests,
-} from '../utils/http-client-with-breaker.util';
+} from '../infrastructure/http/http-client-with-breaker.util';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

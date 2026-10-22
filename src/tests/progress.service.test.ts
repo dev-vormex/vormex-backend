@@ -4,7 +4,7 @@ import {
   calculateLevelProgress,
   isMeaningfulActivity,
   xpForLevel,
-} from '../services/progress.service';
+} from '../modules/engagement/services/progress.service';
 
 test('xpForLevel uses an open-ended level curve with level 1 at zero XP', () => {
   assert.equal(xpForLevel(1), 0);

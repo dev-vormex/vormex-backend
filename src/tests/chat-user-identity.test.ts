@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildChatUserIdentity } from '../controllers/chat.controller';
+import { buildChatUserIdentity } from '../modules/chat/controllers/chat.controller';
 
 test('chat user identity exposes premium badge state for premium users', () => {
   const user = buildChatUserIdentity(

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import test from 'node:test';
 
 const {
@@ -17,6 +18,12 @@ const {
     requirePooler: boolean
   ) => string;
 };
+
+test('credential recovery loads the Windows PowerShell security module explicitly', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/local-neon-credentials.js'), 'utf8');
+  assert.match(source, /Import-Module \(Join-Path \$PSHOME/);
+  assert.match(source, /\$ErrorActionPreference="Stop"/);
+});
 
 test('protected local credentials replace stale URL authentication without changing hosts', () => {
   const env: NodeJS.ProcessEnv = {

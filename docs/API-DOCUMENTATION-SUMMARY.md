@@ -88,7 +88,7 @@ npm install
 This installs:
 - `swagger-ui-express` - Swagger UI
 - `swagger-jsdoc` - JSDoc to OpenAPI
-- `swagger-cli` - OpenAPI validation
+- `@apidevtools/swagger-parser` - OpenAPI validation and bundling
 - `js-yaml` - YAML parsing
 
 ### Start Server

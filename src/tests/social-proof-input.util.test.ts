@@ -5,7 +5,7 @@ import {
   normalizeOptionalTrackingText,
   normalizeRequiredTrackingId,
   normalizeSocialProofMetadata,
-} from '../utils/social-proof-input.util';
+} from '../shared/utils/social-proof-input.util';
 
 test('social proof tracking ids are required, trimmed, and structurally safe', () => {
   assert.deepEqual(normalizeRequiredTrackingId(' user-123 ', 'viewedId'), {

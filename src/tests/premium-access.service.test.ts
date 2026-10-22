@@ -12,7 +12,7 @@ import {
   isLegacyTestPremiumSubscription,
   isPremiumSubscriptionActive,
   LEGACY_TEST_PREMIUM_PROVIDER,
-} from '../services/premium-access.service';
+} from '../modules/premium/services/premium-access.service';
 
 test('getPremiumPeriodEnd returns a date 31 days after the start date by default', () => {
   const start = new Date('2026-04-01T00:00:00.000Z');

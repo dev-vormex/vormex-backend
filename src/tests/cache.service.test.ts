@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
-import { cacheService } from '../services/cache.service';
+import { cacheService } from '../infrastructure/cache/cache.service';
 import { redisCacheService } from '../infrastructure/cache/redis-cache.service';
 import { register } from '../infrastructure/metrics/registry';
 
@@ -142,7 +142,7 @@ test('cacheService releases single-flight state after compute failure', async ()
 });
 
 test('reels webhook invalidates feed and reel cache tags after Bunny status changes', () => {
-  const source = readFileSync(join(process.cwd(), 'src/controllers/reels.controller.ts'), 'utf8');
+  const source = readFileSync(join(process.cwd(), 'src/modules/content/controllers/reels.controller.ts'), 'utf8');
   const helper = source.slice(
     source.indexOf('function invalidateReelCacheTags'),
     source.indexOf('function applyDateCursor')

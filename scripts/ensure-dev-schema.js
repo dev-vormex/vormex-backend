@@ -4,6 +4,8 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const projectRoot = path.join(__dirname, '..');
+require('dotenv').config({ path: path.join(projectRoot, '.env') });
+require('./local-neon-credentials').loadProtectedLocalDatabaseCredentials();
 const prismaCliPath = path.join(
   projectRoot,
   'node_modules',
@@ -13,6 +15,11 @@ const prismaCliPath = path.join(
 );
 
 const sqlFiles = [
+  // Keep new runtime columns available before the API accepts requests.
+  path.join(projectRoot, 'prisma/migrations/20260814120000_add_personalized_home_feed/migration.sql'),
+  // Only schema here: the full security migration also changes verification
+  // records and coin balances, which must not run on every development boot.
+  path.join(projectRoot, 'scripts/sql/ensure-runtime-columns.sql'),
   path.join(
     projectRoot,
     'prisma',

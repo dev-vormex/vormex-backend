@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { validateRequestInput } from '../middleware/input-validation.middleware';
-import { sanitizeInputTree } from '../utils/input-security.util';
+import { validateRequestInput } from '../shared/middleware/input-validation.middleware';
+import { sanitizeInputTree } from '../shared/utils/input-security.util';
 
 test('URL fields reject localhost unless explicitly allowed', () => {
   const defaultResult = sanitizeInputTree(
@@ -67,4 +67,47 @@ test('other routes still reject localhost URL fields through middleware', () => 
     error: 'Invalid request input',
     message: 'URL host is not allowed',
   });
+});
+
+/*
+ * Pagination cursors are base64url, which legitimately produces runs like "--".
+ * Treating them as 'structural' made the SQL-comment rule reject roughly 1 in
+ * 170 signed cursors, breaking infinite scroll intermittently with an error
+ * that pointed nowhere near the cause.
+ */
+test('signed base64url pagination cursors survive query sanitisation', () => {
+  const cursorsWithSqlCommentRun = [
+    'eyJ2IjoxLCJzaWQiOiJhLS1iIn0.c2ln--bmF0dXJl',
+    'eyJ2IjoxfQ.abc--def_ghi-jkl',
+    'rec:root:20:m4x9k2',
+  ];
+
+  for (const cursor of cursorsWithSqlCommentRun) {
+    const result = sanitizeInputTree({ cursor }, { location: 'query', maxStringLength: 512 });
+    assert.equal(result.ok, true, `cursor rejected: ${cursor} (${result.error})`);
+    assert.deepEqual(result.value, { cursor });
+  }
+});
+
+test('cursors are still held to a strict opaque-token alphabet', () => {
+  for (const cursor of [
+    "abc' OR '1'='1",
+    'abc<script>alert(1)</script>',
+    'abc;DROP TABLE posts',
+    'abc|whoami',
+    'abc def',
+    'abc`id`',
+  ]) {
+    const result = sanitizeInputTree({ cursor }, { location: 'query', maxStringLength: 512 });
+    assert.equal(result.ok, false, `unsafe cursor accepted: ${cursor}`);
+  }
+});
+
+test('non-cursor structural query params keep the injection rules', () => {
+  const result = sanitizeInputTree(
+    { postId: "1' UNION SELECT * FROM users --" },
+    { location: 'query', maxStringLength: 512 },
+  );
+
+  assert.equal(result.ok, false);
 });

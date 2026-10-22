@@ -6,7 +6,7 @@ import {
   normalizeIntentValues,
   sanitizeSavedSearchFilters,
   searchVariants,
-} from '../services/discovery-power.service';
+} from '../modules/discovery/services/discovery-power.service';
 
 test('hasPremiumPeopleDiscoveryFilters allows basic free filters', () => {
   assert.equal(

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readImplementationFile as readFileSync } from './helpers/implementation-source';
 import { join } from 'node:path';
 import {
   normalizeProfileCacheIdentifier,
   profileResponseCacheKey,
-} from '../services/profile.service';
+} from '../modules/profiles/services/profile.service';
 
 function source(path: string): string {
   return readFileSync(join(process.cwd(), path), 'utf8').replace(/\r\n/g, '\n');
@@ -33,7 +33,7 @@ test('profile cache aliases normalize username, at-prefix, and viewer scope', ()
 });
 
 test('core and full profile check the requested cache alias before querying user', () => {
-  const service = source('src/services/profile.service.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
   const core = between(service, 'export async function getCoreProfile', '/**\n * Get full profile');
   const full = service.slice(service.indexOf('export async function getFullProfile'));
 
@@ -44,7 +44,7 @@ test('core and full profile check the requested cache alias before querying user
 });
 
 test('full profile relies on maintained counters instead of recounting on every open', () => {
-  const service = source('src/services/profile.service.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
   const full = service.slice(service.indexOf('export async function getFullProfile'));
 
   assert.doesNotMatch(full, /prisma\.post\.groupBy/);
@@ -53,7 +53,7 @@ test('full profile relies on maintained counters instead of recounting on every 
 });
 
 test('profile-view analytics are deferred outside profile read latency', () => {
-  const service = source('src/services/profile.service.ts');
+  const service = source('src/modules/profiles/services/profile.service.ts');
 
   assert.match(service, /function trackProfileViewLater/);
   assert.match(service, /setImmediate\(\(\) =>/);

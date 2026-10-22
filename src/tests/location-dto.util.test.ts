@@ -3,7 +3,7 @@ import test from 'node:test';
 import {
   bucketDistanceKm,
   serializeCoarseLocation,
-} from '../utils/location-dto.util';
+} from '../modules/profiles/utils/location-dto.util';
 
 function assertNoCoordinateFields(value: unknown): void {
   if (value === null || value === undefined) return;
